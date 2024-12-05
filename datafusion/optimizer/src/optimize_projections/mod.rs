@@ -252,7 +252,7 @@ fn optimize_projections(
                 projected_schema,
             } = table_scan;
 
-            let indices = indices.with_exprs(&projected_schema, &filters)?;
+            let indices = indices.with_exprs(&projected_schema, &filters);
 
             // Get indices referred to in the original (schema with all fields)
             // given projected indices.
