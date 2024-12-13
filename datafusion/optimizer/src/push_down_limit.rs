@@ -129,11 +129,15 @@ impl OptimizerRule for PushDownLimit {
                     Some(sort.fetch.map(|f| f.min(sort_fetch)).unwrap_or(sort_fetch))
                 };
                 if new_fetch == sort.fetch {
+                    original_limit(skip, fetch, LogicalPlan::Sort(sort))
+                    // NOTE: do not remove the limit
+                    /*
                     if skip > 0 {
                         original_limit(skip, fetch, LogicalPlan::Sort(sort))
                     } else {
                         Ok(Transformed::yes(LogicalPlan::Sort(sort)))
                     }
+                    */
                 } else {
                     sort.fetch = new_fetch;
                     limit.input = Arc::new(LogicalPlan::Sort(sort));
