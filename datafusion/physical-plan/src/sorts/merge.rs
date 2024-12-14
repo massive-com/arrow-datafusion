@@ -273,6 +273,16 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
 
             self.produced += self.in_progress.len();
 
+            // Only return up to the fetch limit
+            if self.aborted && self.fetch.is_some() {
+                let batch = match self.in_progress.build_record_batch() {
+                    Ok(Some(b)) => b,
+                    Ok(None) | Err(_) => return Poll::Ready(None),
+                };
+                let slice = batch.slice(0, self.fetch.unwrap());
+                return Poll::Ready(Some(Ok(slice)));
+            }
+
             return Poll::Ready(self.in_progress.build_record_batch().transpose());
         }
     }
