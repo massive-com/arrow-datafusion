@@ -1275,7 +1275,7 @@ fn ensure_distribution(
                         child = add_sort_above_with_check(
                             child,
                             required_input_ordering.clone(),
-                            None,
+                            Some(10),
                         );
                     }
                 }
