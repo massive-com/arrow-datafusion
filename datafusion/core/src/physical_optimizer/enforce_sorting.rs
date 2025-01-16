@@ -399,7 +399,10 @@ fn analyze_immediate_sort_removal(
             {
                 // Replace the sort with a sort-preserving merge:
                 let expr = LexOrdering::new(sort_exec.expr().to_vec());
-                Arc::new(SortPreservingMergeExec::new(expr, sort_input.clone())) as _
+                Arc::new(
+                    SortPreservingMergeExec::new(expr, sort_input.clone())
+                        .with_fetch(sort_exec.fetch()),
+                ) as _
             } else {
                 // Remove the sort:
                 node.children = node.children.swap_remove(0).children;
