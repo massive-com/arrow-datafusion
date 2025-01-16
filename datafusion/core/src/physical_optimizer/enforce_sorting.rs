@@ -288,6 +288,8 @@ fn parallelize_sorts(
         // deals with the children and their children and so on.
         requirements = requirements.children.swap_remove(0);
 
+        println!("XXXXXX Point 1 with fetch to {:?}", fetch);
+
         requirements = add_sort_above_with_check(requirements, sort_reqs, fetch);
 
         let spm = SortPreservingMergeExec::new(sort_exprs, requirements.plan.clone());
@@ -399,6 +401,7 @@ fn analyze_immediate_sort_removal(
             {
                 // Replace the sort with a sort-preserving merge:
                 let expr = LexOrdering::new(sort_exec.expr().to_vec());
+                println!("XXXXXX Point 2 with fetch to {:?}", fetch);
                 Arc::new(
                     SortPreservingMergeExec::new(expr, sort_input.clone())
                         .with_fetch(sort_exec.fetch()),
@@ -622,6 +625,7 @@ fn remove_corresponding_sort_from_sub_plan(
         // `SortPreservingMergeExec` instead of a `CoalescePartitionsExec`.
         let plan = node.plan.clone();
         let plan = if let Some(ordering) = plan.output_ordering() {
+            println!("XXXXXX Point 3 with fetch to {:?}", node.plan.fetch());
             Arc::new(
                 SortPreservingMergeExec::new(LexOrdering::new(ordering.to_vec()), plan)
                     .with_fetch(node.plan.fetch()),

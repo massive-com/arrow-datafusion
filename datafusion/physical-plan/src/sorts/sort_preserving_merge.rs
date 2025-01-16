@@ -103,6 +103,7 @@ impl SortPreservingMergeExec {
 
     /// Sets the number of rows to fetch
     pub fn with_fetch(mut self, fetch: Option<usize>) -> Self {
+        println!("XXXXXX We set fetch to {:?}", fetch);
         self.fetch = fetch;
         self
     }
