@@ -622,10 +622,10 @@ fn remove_corresponding_sort_from_sub_plan(
         // `SortPreservingMergeExec` instead of a `CoalescePartitionsExec`.
         let plan = node.plan.clone();
         let plan = if let Some(ordering) = plan.output_ordering() {
-            Arc::new(SortPreservingMergeExec::new(
-                LexOrdering::new(ordering.to_vec()),
-                plan,
-            )) as _
+            Arc::new(
+                SortPreservingMergeExec::new(LexOrdering::new(ordering.to_vec()), plan)
+                    .with_fetch(node.plan.fetch()),
+            ) as _
         } else {
             Arc::new(CoalescePartitionsExec::new(plan)) as _
         };
