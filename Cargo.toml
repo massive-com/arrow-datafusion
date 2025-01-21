@@ -140,8 +140,8 @@ parquet = { version = "53.3.0", default-features = false, features = [
 ] }
 pbjson = { version = "0.7.0" }
 # Should match arrow-flight's version of prost.
-prost = "0.12.3"
-prost-derive = "0.12.3"
+prost = "0.13.4"
+prost-derive = "0.13.4"
 rand = "0.8"
 recursive = "0.1.1"
 regex = "1.8"
