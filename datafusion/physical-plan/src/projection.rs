@@ -120,9 +120,18 @@ impl ProjectionExec {
         schema: SchemaRef,
     ) -> Result<PlanProperties> {
         // Calculate equivalence properties:
+        dbg!(&projection_mapping);
         let mut input_eq_properties = input.equivalence_properties().clone();
+        dbg!(&input_eq_properties.eq_group.classes);
         input_eq_properties.substitute_oeq_class(projection_mapping)?;
-        let eq_properties = input_eq_properties.project(projection_mapping, schema);
+        dbg!(&input_eq_properties);
+        for ordering in input_eq_properties.normalized_oeq_class().iter() {
+            if let Err(e) = input_eq_properties.discover_new_orderings(&ordering[0].expr) {
+                log::debug!("error discovering new orderings: {e}");
+            }
+        }
+        let mut eq_properties = input_eq_properties.project(projection_mapping, schema);
+        dbg!(&eq_properties);
 
         // Calculate output partitioning, which needs to respect aliases:
         let input_partition = input.output_partitioning();

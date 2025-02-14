@@ -321,7 +321,8 @@ fn parallelize_sorts(
 fn ensure_sorting(
     mut requirements: PlanWithCorrespondingSort,
 ) -> Result<Transformed<PlanWithCorrespondingSort>> {
-    requirements = update_sort_ctx_children(requirements, false)?;
+    let data = is_sort(&requirements.plan);
+    requirements = update_sort_ctx_children(requirements, data)?;
 
     // Perform naive analysis at the beginning -- remove already-satisfied sorts:
     if requirements.children.is_empty() {
@@ -395,6 +396,8 @@ fn analyze_immediate_sort_removal(
     if let Some(sort_exec) = node.plan.as_any().downcast_ref::<SortExec>() {
         let sort_input = sort_exec.input();
         // If this sort is unnecessary, we should remove it:
+        dbg!(sort_input.equivalence_properties());
+        dbg!(&sort_exec.properties().output_ordering());
         if sort_input.equivalence_properties().ordering_satisfy(
             sort_exec
                 .properties()

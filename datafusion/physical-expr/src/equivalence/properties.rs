@@ -332,7 +332,7 @@ impl EquivalenceProperties {
     // When constants or equivalence classes are changed, there may be new orderings
     // that can be discovered with the new equivalence properties.
     // For a discussion, see: https://github.com/apache/datafusion/issues/9812
-    fn discover_new_orderings(&mut self, expr: &Arc<dyn PhysicalExpr>) -> Result<()> {
+    pub fn discover_new_orderings(&mut self, expr: &Arc<dyn PhysicalExpr>) -> Result<()> {
         let normalized_expr = self.eq_group().normalize_expr(Arc::clone(expr));
         let eq_class = self
             .eq_group

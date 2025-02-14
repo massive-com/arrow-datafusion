@@ -506,7 +506,9 @@ impl EquivalenceGroup {
     ) -> Option<Arc<dyn PhysicalExpr>> {
         // First, we try to project expressions with an exact match. If we are
         // unable to do this, we consult equivalence classes.
+        dbg!(expr);
         if let Some(target) = mapping.target_expr(expr) {
+            dbg!(&target);
             // If we match the source, we can project directly:
             return Some(target);
         } else {
@@ -520,6 +522,7 @@ impl EquivalenceGroup {
                     .get_equivalence_class(source)
                     .is_some_and(|group| group.contains(expr))
                 {
+                    dbg!(&target);
                     return Some(Arc::clone(target));
                 }
             }
@@ -540,10 +543,12 @@ impl EquivalenceGroup {
     /// Projects this equivalence group according to the given projection mapping.
     pub fn project(&self, mapping: &ProjectionMapping) -> Self {
         let projected_classes = self.iter().filter_map(|cls| {
+            dbg!(cls);
             let new_class = cls
                 .iter()
                 .filter_map(|expr| self.project_expr(mapping, expr))
                 .collect::<Vec<_>>();
+            dbg!(&new_class);
             (new_class.len() > 1).then_some(EquivalenceClass::new(new_class))
         });
         // the key is the source expression and the value is the EquivalenceClass that contains the target expression of the source expression.
