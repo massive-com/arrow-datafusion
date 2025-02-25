@@ -227,7 +227,7 @@ impl SchemaAdapterFactory for DefaultSchemaAdapterFactory {
 /// This SchemaAdapter requires both the table schema and the projected table
 /// schema. See  [`SchemaMapping`] for more details
 #[derive(Clone, Debug)]
-pub(crate) struct DefaultSchemaAdapter {
+pub struct DefaultSchemaAdapter {
     /// The schema for the table, projected to include only the fields being output (projected) by the
     /// associated ParquetExec
     projected_table_schema: SchemaRef,
