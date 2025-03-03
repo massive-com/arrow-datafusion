@@ -86,7 +86,24 @@ impl OptimizerRule for OptimizeProjections {
     ) -> Result<Transformed<LogicalPlan>> {
         // All output fields are necessary:
         let indices = RequiredIndices::new_for_all_exprs(&plan);
-        optimize_projections(plan, config, indices)
+        // If the plan is a projection, we should keep it
+        // Because we may extend output schema of table scan during physical phase
+        if let LogicalPlan::Projection(p) = &plan {
+            let top_projection = p.clone();
+            let res = optimize_projections(plan, config, indices)?;
+            if !matches!(res.data, LogicalPlan::Projection(_)) {
+                // Add back the projection if it was removed
+                Ok(Transformed::new(
+                    LogicalPlan::Projection(top_projection),
+                    res.transformed,
+                    res.tnr,
+                ))
+            } else {
+                Ok(res)
+            }
+        } else {
+            optimize_projections(plan, config, indices)
+        }
     }
 }
 
