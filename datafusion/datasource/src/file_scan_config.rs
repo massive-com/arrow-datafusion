@@ -1009,7 +1009,7 @@ fn get_projected_output_ordering(
         if new_ordering.is_empty() {
             continue;
         }
-
+        /*
         // Check if any file groups are not sorted
         if base_config.file_groups.iter().any(|group| {
             if group.len() <= 1 {
@@ -1040,7 +1040,7 @@ fn get_projected_output_ordering(
             );
             continue;
         }
-
+        */
         all_orderings.push(new_ordering);
     }
     all_orderings
