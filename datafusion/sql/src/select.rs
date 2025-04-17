@@ -94,6 +94,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         // Having and group by clause may reference aliases defined in select projection
         let projected_plan = self.project(base_plan.clone(), select_exprs.clone())?;
+        let mut select_exprs = vec![];
+        if let LogicalPlan::Projection(_) = &projected_plan {
+            select_exprs = projected_plan.expressions();
+        }
 
         // Place the fields of the base plan at the front so that when there are references
         // with the same name, the fields of the base plan will be searched first.
@@ -296,6 +300,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         input: LogicalPlan,
         select_exprs: Vec<Expr>,
     ) -> Result<LogicalPlan> {
+        if select_exprs.is_empty() {
+            return Ok(input);
+        }
         // Try process group by unnest
         let input = self.try_process_aggregate_unnest(input)?;
 

@@ -2626,7 +2626,11 @@ impl TableScan {
         Ok(Self {
             table_name,
             source: table_source,
-            projection,
+            projection: if projection.is_none() {
+                Some((0..schema.fields.len()).collect())
+            } else {
+                projection
+            },
             projected_schema,
             filters,
             fetch,

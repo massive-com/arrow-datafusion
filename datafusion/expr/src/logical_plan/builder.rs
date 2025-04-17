@@ -58,6 +58,7 @@ use datafusion_common::{
 };
 use datafusion_expr_common::type_coercion::binary::type_union_resolution;
 
+use crate::Expr::Wildcard;
 use indexmap::IndexSet;
 
 /// Default table name for unnamed table
@@ -1658,7 +1659,28 @@ pub fn project(
     plan: LogicalPlan,
     expr: impl IntoIterator<Item = impl Into<Expr>>,
 ) -> Result<LogicalPlan> {
-    project_with_validation(plan, expr.into_iter().map(|e| (e, true)))
+    // Collect expressions into a vector so we can check for the optimization case
+    let expr_vec: Vec<_> = expr.into_iter().map(|e| e.into()).collect();
+
+    // Optimization: If there's only one expression and it's a plain wildcard,
+    // return the input plan directly
+    if expr_vec.len() == 1
+        && !matches!(
+            plan,
+            LogicalPlan::Join(Join {
+                join_constraint: JoinConstraint::Using,
+                ..
+            })
+        )
+    {
+        if let Wildcard { qualifier, options } = &expr_vec[0] {
+            // Only optimize for the simple wildcard case with no options
+            if options.is_empty() & qualifier.is_none() {
+                return Ok(plan);
+            }
+        }
+    }
+    project_with_validation(plan, expr_vec.into_iter().map(|e| (e, true)))
 }
 
 /// Create Projection. Similar to project except that the expressions
@@ -1677,7 +1699,7 @@ fn project_with_validation(
         let e = e.into();
         match e {
             #[expect(deprecated)]
-            Expr::Wildcard { .. } => projected_expr.push(e),
+            Wildcard { .. } => projected_expr.push(e),
             _ => {
                 if validate {
                     projected_expr.push(columnize_expr(normalize_col(e, &plan)?, &plan)?)

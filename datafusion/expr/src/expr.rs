@@ -1039,6 +1039,15 @@ impl WildcardOptions {
             rename: self.rename,
         }
     }
+
+    /// Check if all wildcard options are None
+    pub fn is_empty(&self) -> bool {
+        self.ilike.is_none()
+            && self.exclude.is_none()
+            && self.except.is_none()
+            && self.replace.is_none()
+            && self.rename.is_none()
+    }
 }
 
 impl Display for WildcardOptions {
