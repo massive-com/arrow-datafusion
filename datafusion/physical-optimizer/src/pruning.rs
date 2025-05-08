@@ -28,6 +28,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::{RecordBatch, RecordBatchOptions},
 };
+use datafusion_physical_expr::expressions::Literal;
 use log::trace;
 
 use datafusion_common::error::{DataFusionError, Result};
@@ -747,6 +748,13 @@ fn is_always_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
         .unwrap_or_default()
 }
 
+fn is_always_false(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.as_any()
+        .downcast_ref::<phys_expr::Literal>()
+        .map(|l| matches!(l.value(), ScalarValue::Boolean(Some(false))))
+        .unwrap_or_default()
+}
+
 /// Describes which columns statistics are necessary to evaluate a
 /// [`PruningPredicate`].
 ///
@@ -1423,6 +1431,10 @@ fn build_predicate_expression(
     required_columns: &mut RequiredColumns,
     unhandled_hook: &Arc<dyn UnhandledPredicateHook>,
 ) -> Arc<dyn PhysicalExpr> {
+    if is_always_false(expr) {
+        // Shouldn't return `unhandled_hook.handle(expr)`, because it will transfer false to true.
+        return expr.clone();
+    }
     // predicate expression can only be a binary expression
     let expr_any = expr.as_any();
     if let Some(is_null) = expr_any.downcast_ref::<phys_expr::IsNullExpr>() {
@@ -1522,6 +1534,11 @@ fn build_predicate_expression(
             build_predicate_expression(&right, schema, required_columns, unhandled_hook);
         // simplify boolean expression if applicable
         let expr = match (&left_expr, op, &right_expr) {
+            (left, Operator::And, right)
+                if is_always_false(left) || is_always_false(right) =>
+            {
+                Arc::new(phys_expr::Literal::new(ScalarValue::Boolean(Some(false))))
+            }
             (left, Operator::And, _) if is_always_true(left) => right_expr,
             (_, Operator::And, right) if is_always_true(right) => left_expr,
             (left, Operator::Or, right)
@@ -1529,6 +1546,9 @@ fn build_predicate_expression(
             {
                 Arc::new(phys_expr::Literal::new(ScalarValue::Boolean(Some(true))))
             }
+            (left, Operator::Or, _) if is_always_false(left) => right_expr,
+            (_, Operator::Or, right) if is_always_false(right) => left_expr,
+
             _ => Arc::new(phys_expr::BinaryExpr::new(left_expr, op, right_expr)),
         };
         return expr;
