@@ -30,6 +30,7 @@ use crate::datasource::{
     physical_plan::FileSinkConfig,
 };
 use crate::execution::context::SessionState;
+use datafusion_catalog::memory::DataSourceExec;
 use datafusion_catalog::TableProvider;
 use datafusion_common::{config_err, DataFusionError, Result};
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
@@ -941,7 +942,8 @@ impl TableProvider for ListingTable {
         };
 
         // create the execution plan
-        self.options
+        let mut execution_plan = self
+            .options
             .format
             .create_physical_plan(
                 state,
@@ -960,7 +962,24 @@ impl TableProvider for ListingTable {
                 .build(),
                 filters.as_ref(),
             )
-            .await
+            .await?;
+        // Add partition filters' equivalence classes info to the execution plan if it's DataSourceExec
+        if let Some(exec) = execution_plan.as_any().downcast_ref::<DataSourceExec>() {
+            let partition_filter = conjunction(partition_filters);
+            if let Some(partition_filter) = partition_filter {
+                let table_df_schema = self.table_schema.as_ref().clone().to_dfschema()?;
+                let partition_physical_filter = create_physical_expr(
+                    &partition_filter,
+                    &table_df_schema,
+                    state.execution_props(),
+                )?;
+                execution_plan =
+                    Arc::new(exec.clone().add_partition_filter_equivalence_info(
+                        partition_physical_filter,
+                    )?);
+            }
+        }
+        Ok(execution_plan)
     }
 
     fn supports_filters_pushdown(

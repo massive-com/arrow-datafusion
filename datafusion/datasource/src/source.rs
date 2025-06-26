@@ -23,6 +23,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion_physical_plan::filter::collect_columns_from_predicate;
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::{
@@ -33,7 +34,7 @@ use crate::file_scan_config::FileScanConfig;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Constraints, Statistics};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
 /// Common behaviors in Data Sources for both from Files and Memory.
@@ -235,6 +236,18 @@ impl DataSourceExec {
     pub fn with_partitioning(mut self, partitioning: Partitioning) -> Self {
         self.cache = self.cache.with_partitioning(partitioning);
         self
+    }
+
+    /// Add partition filters' equivalence info
+    pub fn add_partition_filter_equivalence_info(
+        mut self,
+        partition_filter: Arc<dyn PhysicalExpr>,
+    ) -> datafusion_common::Result<Self> {
+        let (equal_pairs, _) = collect_columns_from_predicate(&partition_filter);
+        for (lhs, rhs) in equal_pairs {
+            self.cache.eq_properties.add_equal_conditions(lhs, rhs)?
+        }
+        Ok(self)
     }
 
     fn compute_properties(data_source: Arc<dyn DataSource>) -> PlanProperties {
