@@ -95,7 +95,7 @@ use async_trait::async_trait;
 use datafusion_datasource::file_groups::FileGroup;
 use futures::{StreamExt, TryStreamExt};
 use itertools::{multiunzip, Itertools};
-use log::{debug, trace};
+use log::{debug, info, trace};
 use sqlparser::ast::NullTreatment;
 use tokio::sync::Mutex;
 
@@ -1943,10 +1943,10 @@ impl DefaultPhysicalPlanner {
             OptimizationInvariantChecker::new(optimizer)
                 .check(&new_plan, before_schema)?;
 
-            trace!(
+            dbg!(
                 "Optimized physical plan by {}:\n{}\n",
                 optimizer.name(),
-                displayable(new_plan.as_ref()).indent(false)
+                displayable(new_plan.as_ref()).indent(false).to_string()
             );
             observer(new_plan.as_ref(), optimizer.as_ref())
         }

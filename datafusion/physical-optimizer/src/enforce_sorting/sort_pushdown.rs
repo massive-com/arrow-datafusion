@@ -28,7 +28,7 @@ use datafusion_common::{plan_err, HashSet, JoinSide, Result};
 use datafusion_expr::JoinType;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr::PhysicalSortRequirement;
+use datafusion_physical_expr::{Distribution, PhysicalSortRequirement};
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, LexRequirement};
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::utils::{
@@ -52,6 +52,7 @@ use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 pub struct ParentRequirements {
     ordering_requirement: Option<LexRequirement>,
     fetch: Option<usize>,
+    dist_requirement: Option<Distribution>,
 }
 
 pub type SortPushDown = PlanContext<ParentRequirements>;
@@ -59,12 +60,16 @@ pub type SortPushDown = PlanContext<ParentRequirements>;
 /// Assigns the ordering requirement of the root node to the its children.
 pub fn assign_initial_requirements(sort_push_down: &mut SortPushDown) {
     let reqs = sort_push_down.plan.required_input_ordering();
-    for (child, requirement) in sort_push_down.children.iter_mut().zip(reqs) {
+    let dist_reqs = sort_push_down.plan.required_input_distribution();
+    for ((child, requirement), dis_req) in
+        sort_push_down.children.iter_mut().zip(reqs).zip(dist_reqs)
+    {
         child.data = ParentRequirements {
             ordering_requirement: requirement,
             // If the parent has a fetch value, assign it to the children
             // Or use the fetch value of the child.
             fetch: child.plan.fetch(),
+            dist_requirement: Some(dis_req),
         };
     }
 }
@@ -88,6 +93,7 @@ fn pushdown_sorts_helper(
     mut sort_push_down: SortPushDown,
 ) -> Result<Transformed<SortPushDown>> {
     let plan = &sort_push_down.plan;
+    dbg!(plan.name());
     let parent_reqs = sort_push_down
         .data
         .ordering_requirement
@@ -100,6 +106,7 @@ fn pushdown_sorts_helper(
     if is_sort(plan) {
         let current_sort_fetch = plan.fetch();
         let parent_req_fetch = sort_push_down.data.fetch;
+        let dist_requirement = sort_push_down.data.dist_requirement.clone();
 
         let current_plan_reqs = plan
             .output_ordering()
@@ -131,6 +138,7 @@ fn pushdown_sorts_helper(
             sort_push_down.children[0].data = ParentRequirements {
                 ordering_requirement: Some(new_reqs),
                 fetch: current_sort_fetch,
+                dist_requirement,
             };
         } else {
             // Don't add a SortExec
@@ -143,6 +151,8 @@ fn pushdown_sorts_helper(
             // set the stricter fetch
             sort_push_down.data.fetch = min_fetch(current_sort_fetch, parent_req_fetch);
 
+            sort_push_down.data.dist_requirement = dist_requirement;
+
             // set the stricter ordering
             if current_is_stricter {
                 sort_push_down.data.ordering_requirement = Some(current_plan_reqs);
@@ -153,18 +163,16 @@ fn pushdown_sorts_helper(
             // recursive call to helper, so it doesn't transform_down and miss the new node (previous child of sort)
             return pushdown_sorts_helper(sort_push_down);
         }
-    } else if parent_reqs.is_empty() {
-        // note: this `satisfy_parent`, but we don't want to push down anything.
-        // Nothing to do.
-        return Ok(Transformed::no(sort_push_down));
     } else if satisfy_parent {
         // For non-sort operators which satisfy ordering:
         let reqs = plan.required_input_ordering();
         let parent_req_fetch = sort_push_down.data.fetch;
+        let parent_dist_requirement = sort_push_down.data.dist_requirement.clone();
 
         for (child, order) in sort_push_down.children.iter_mut().zip(reqs) {
             child.data.ordering_requirement = order;
             child.data.fetch = min_fetch(parent_req_fetch, child.data.fetch);
+            child.data.dist_requirement = parent_dist_requirement.clone();
         }
     } else if let Some(adjusted) = pushdown_requirement_to_children(plan, &parent_reqs)? {
         // For operators that can take a sort pushdown.
@@ -184,8 +192,20 @@ fn pushdown_sorts_helper(
             .ordering_requirement
             .clone()
             .unwrap_or_default();
+        // If distribution requirement is SinglePartition, we need to set preserve_partitioning to false
+        let preserve_partitioning = match sort_push_down.data.dist_requirement {
+            Some(Distribution::SinglePartition) => false,
+            _ => true,
+        };
         let fetch = sort_push_down.data.fetch;
         sort_push_down = add_sort_above(sort_push_down, sort_reqs, fetch);
+        if let Some(sort_exec) = sort_push_down.plan.as_any().downcast_ref::<SortExec>() {
+            sort_push_down.plan = Arc::new(
+                sort_exec
+                    .clone()
+                    .with_preserve_partitioning(false),
+            );
+        }
         assign_initial_requirements(&mut sort_push_down);
     }
 

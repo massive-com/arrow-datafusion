@@ -49,7 +49,7 @@ pub fn add_sort_above<T: Clone + Default>(
     });
     let mut new_sort = SortExec::new(sort_expr, Arc::clone(&node.plan)).with_fetch(fetch);
     if node.plan.output_partitioning().partition_count() > 1 {
-        new_sort = new_sort.with_preserve_partitioning(true);
+        new_sort = new_sort.with_preserve_partitioning(false);
     }
     PlanContext::new(Arc::new(new_sort), T::default(), vec![node])
 }
