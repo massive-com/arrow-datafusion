@@ -46,6 +46,7 @@ pub struct PlainAggregateWindowExpr {
     partition_by: Vec<Arc<dyn PhysicalExpr>>,
     order_by: Vec<PhysicalSortExpr>,
     window_frame: Arc<WindowFrame>,
+    is_constant_in_partition: bool,
 }
 
 impl PlainAggregateWindowExpr {
@@ -56,11 +57,14 @@ impl PlainAggregateWindowExpr {
         order_by: &[PhysicalSortExpr],
         window_frame: Arc<WindowFrame>,
     ) -> Self {
+        let is_constant_in_partition =
+            Self::is_window_constant_in_partition(order_by, &window_frame);
         Self {
             aggregate,
             partition_by: partition_by.to_vec(),
             order_by: order_by.to_vec(),
             window_frame,
+            is_constant_in_partition,
         }
     }
 
@@ -245,5 +249,9 @@ impl AggregateWindowExpr for PlainAggregateWindowExpr {
             }
             accumulator.evaluate()
         }
+    }
+
+    fn is_constant_in_partition(&self) -> bool {
+        self.is_constant_in_partition
     }
 }

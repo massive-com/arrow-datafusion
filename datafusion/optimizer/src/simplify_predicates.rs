@@ -43,8 +43,8 @@ pub(crate) fn simplify_predicates(predicates: Vec<Expr>) -> Result<Vec<Expr>> {
             {
                 let left_col = extract_column_from_expr(left);
                 let right_col = extract_column_from_expr(right);
-                let left_lit = left.is_literal();
-                let right_lit = right.is_literal();
+                let left_lit = left.as_literal().is_some();
+                let right_lit = right.as_literal().is_some();
                 if let (Some(col), true) = (&left_col, right_lit) {
                     column_predicates.entry(col.clone()).or_default().push(pred);
                 } else if let (true, Some(col)) = (left_lit, &right_col) {
@@ -80,7 +80,7 @@ fn simplify_column_predicates(predicates: Vec<Expr>) -> Result<Vec<Expr>> {
     for pred in predicates {
         match &pred {
             Expr::BinaryExpr(BinaryExpr { left: _, op, right }) => {
-                let right_is_literal = right.is_literal();
+                let right_is_literal = right.as_literal().is_some();
                 match (op, right_is_literal) {
                     (Operator::Gt, true)
                     | (Operator::Lt, false)
@@ -149,14 +149,11 @@ fn find_most_restrictive_predicate(
         if let Expr::BinaryExpr(BinaryExpr { left, op: _, right }) = pred {
             // Extract the literal value based on which side has it
             let mut scalar_value = None;
-            if right.is_literal() {
-                if let Expr::Literal(scalar, _) = right.as_ref() {
-                    scalar_value = Some(scalar.clone());
-                }
-            } else if left.is_literal() {
-                if let Expr::Literal(scalar, _) = left.as_ref() {
-                    scalar_value = Some(scalar.clone());
-                }
+            if let Some(scalar) = right.as_literal() {
+                scalar_value = Some(scalar.clone());
+            }
+            if let Some(scalar) = left.as_literal() {
+                scalar_value = Some(scalar.clone());
             }
 
             if let Some(scalar) = scalar_value {

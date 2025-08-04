@@ -284,13 +284,8 @@ pub enum Expr {
     Column(Column),
     /// A named reference to a variable in a registry.
     ScalarVariable(DataType, Vec<String>),
-<<<<<<< HEAD
-    /// A constant value along with associated metadata
-    Literal(ScalarValue, Option<BTreeMap<String, String>>),
-=======
     /// A constant value along with associated [`FieldMetadata`].
     Literal(ScalarValue, Option<FieldMetadata>),
->>>>>>> upstream/branch-49
     /// A binary expression such as "age > 21"
     BinaryExpr(BinaryExpr),
     /// LIKE expression

@@ -42,7 +42,6 @@ use datafusion_physical_expr::utils::map_columns_before_projection;
 use datafusion_physical_expr::{
     physical_exprs_equal, EquivalenceProperties, PhysicalExpr, PhysicalExprRef,
 };
-use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
 };
@@ -937,7 +936,7 @@ fn add_hash_on_top(
 ///
 /// Updated node with an execution plan, where desired single
 /// distribution is satisfied by adding [`SortPreservingMergeExec`].
-fn add_spm_on_top(
+fn add_merge_on_top(
     input: DistributionContext,
     fetch: &mut Option<usize>,
 ) -> DistributionContext {
@@ -949,19 +948,10 @@ fn add_spm_on_top(
         // - Preserving ordering is not helpful in terms of satisfying ordering requirements
         // - Usage of order preserving variants is not desirable
         // (determined by flag `config.optimizer.bounded_order_preserving_variants`)
-        let should_preserve_ordering = input.plan.output_ordering().is_some();
-
-        let new_plan = if should_preserve_ordering {
+        let new_plan = if let Some(ordering) = input.plan.output_ordering() {
             Arc::new(
-                SortPreservingMergeExec::new(
-                    input
-                        .plan
-                        .output_ordering()
-                        .unwrap_or(&LexOrdering::default())
-                        .clone(),
-                    Arc::clone(&input.plan),
-                )
-                .with_fetch(fetch.take()),
+                SortPreservingMergeExec::new(ordering.clone(), Arc::clone(&input.plan))
+                    .with_fetch(fetch.take()),
             ) as _
         } else {
             Arc::new(CoalescePartitionsExec::new(Arc::clone(&input.plan))) as _
@@ -992,8 +982,13 @@ fn add_spm_on_top(
 /// ```
 fn remove_dist_changing_operators(
     mut distribution_context: DistributionContext,
-) -> Result<(DistributionContext, Option<usize>)> {
+) -> Result<(
+    DistributionContext,
+    Option<usize>,
+    Option<Arc<dyn ExecutionPlan>>,
+)> {
     let mut fetch = None;
+    let mut spm: Option<Arc<dyn ExecutionPlan>> = None;
     while is_repartition(&distribution_context.plan)
         || is_coalesce_partitions(&distribution_context.plan)
         || is_sort_preserving_merge(&distribution_context.plan)
@@ -1002,6 +997,7 @@ fn remove_dist_changing_operators(
             if let Some(child_fetch) = distribution_context.plan.fetch() {
                 if fetch.is_none() {
                     fetch = Some(child_fetch);
+                    spm = Some(distribution_context.plan);
                 } else {
                     fetch = Some(fetch.unwrap().min(child_fetch));
                 }
@@ -1013,7 +1009,7 @@ fn remove_dist_changing_operators(
         // Note that they will be re-inserted later on if necessary or helpful.
     }
 
-    Ok((distribution_context, fetch))
+    Ok((distribution_context, fetch, spm))
 }
 
 /// Updates the [`DistributionContext`] if preserving ordering while changing partitioning is not helpful or desirable.
@@ -1224,6 +1220,7 @@ pub fn ensure_distribution(
             children,
         },
         mut fetch,
+        spm,
     ) = remove_dist_changing_operators(dist_context)?;
 
     if let Some(exec) = plan.as_any().downcast_ref::<WindowAggExec>() {
@@ -1286,10 +1283,16 @@ pub fn ensure_distribution(
                     }
                 }
 
-                // Satisfy the distribution requirement if it is unmet.
-                match &requirement {
-                    Distribution::SinglePartition => {
-                        child = add_spm_on_top(child, &mut fetch);
+            // Satisfy the distribution requirement if it is unmet.
+            match &requirement {
+                Distribution::SinglePartition => {
+                    child = add_merge_on_top(child, &mut fetch);
+                }
+                Distribution::HashPartitioned(exprs) => {
+                    if add_roundrobin {
+                        // Add round-robin repartitioning on top of the operator
+                        // to increase parallelism.
+                        child = add_roundrobin_on_top(child, target_partitions)?;
                     }
                     // When inserting hash is necessary to satisfy hash requirement, insert hash repartition.
                     if hash_necessary {
@@ -1320,7 +1323,8 @@ pub fn ensure_distribution(
                 if (!ordering_satisfied || !order_preserving_variants_desirable)
                     && child.data
                 {
-                    child = replace_order_preserving_variants(child)?;
+                    let (replaced_child, fetch)  = replace_order_preserving_variants(child, ordering_satisfied)?;
+                    child = replaced_child;
                     // If ordering requirements were satisfied before repartitioning,
                     // make sure ordering requirements are still satisfied after.
                     if ordering_satisfied {
@@ -1328,10 +1332,7 @@ pub fn ensure_distribution(
                         child = add_sort_above_with_check(
                             child,
                             sort_req,
-                            plan.as_any()
-                                .downcast_ref::<OutputRequirementExec>()
-                                .map(|output| output.fetch())
-                                .unwrap_or(None),
+                            fetch,
                         )?;
                     }
                 }
@@ -1343,62 +1344,19 @@ pub fn ensure_distribution(
                     // Operator requires specific distribution.
                     Distribution::SinglePartition | Distribution::HashPartitioned(_) => {
                         // Since there is no ordering requirement, preserving ordering is pointless
-                        child = replace_order_preserving_variants(child)?;
+                        child = replace_order_preserving_variants(child, false)?.0;
                     }
                     Distribution::UnspecifiedDistribution => {
-                        if add_roundrobin {
-                            // Add round-robin repartitioning on top of the operator
-                            // to increase parallelism.
-                            child = add_roundrobin_on_top(child, target_partitions)?;
+                        // Since ordering is lost, trying to preserve ordering is pointless
+                        if !maintains || plan.as_any().is::<OutputRequirementExec>() {
+                            child = replace_order_preserving_variants(child,false)?.0;
                         }
+
                     }
                 };
+            }
 
-                // There is an ordering requirement of the operator:
-                if let Some(required_input_ordering) = required_input_ordering {
-                    // Either:
-                    // - Ordering requirement cannot be satisfied by preserving ordering through repartitions, or
-                    // - using order preserving variant is not desirable.
-                    let ordering_satisfied = child
-                        .plan
-                        .equivalence_properties()
-                        .ordering_satisfy_requirement(&required_input_ordering);
-                    if (!ordering_satisfied || !order_preserving_variants_desirable)
-                        && child.data
-                    {
-                        let (replaced_child, fetch) =
-                            replace_order_preserving_variants(child, ordering_satisfied)?;
-                        child = replaced_child;
-                        // If ordering requirements were satisfied before repartitioning,
-                        // make sure ordering requirements are still satisfied after.
-                        if ordering_satisfied {
-                            // Make sure to satisfy ordering requirement:
-                            child = add_sort_above_with_check(
-                                child,
-                                required_input_ordering.clone(),
-                                fetch,
-                            );
-                        }
-                    }
-                    // Stop tracking distribution changing operators
-                    child.data = false;
-                } else {
-                    // no ordering requirement
-                    match requirement {
-                        // Operator requires specific distribution.
-                        Distribution::SinglePartition | Distribution::HashPartitioned(_) => {
-                            // Since there is no ordering requirement, preserving ordering is pointless
-                            child = replace_order_preserving_variants(child, false)?.0;
-                        }
-                        Distribution::UnspecifiedDistribution => {
-                            // Since ordering is lost, trying to preserve ordering is pointless
-                            if !maintains || plan.as_any().is::<OutputRequirementExec>() {
-                                child = replace_order_preserving_variants(child, false)?.0;
-                            }
-                        }
-                    }
-                }
-                Ok(child)
+            Ok(child)
             },
         )
         .collect::<Result<Vec<_>>>()?;
@@ -1447,15 +1405,8 @@ pub fn ensure_distribution(
     // It was removed by `remove_dist_changing_operators`
     // and we need to add it back.
     if fetch.is_some() {
-        let plan = Arc::new(
-            SortPreservingMergeExec::new(
-                plan.output_ordering()
-                    .unwrap_or(&LexOrdering::default())
-                    .clone(),
-                plan,
-            )
-            .with_fetch(fetch.take()),
-        );
+        // It's safe to unwrap because `spm` is set only if `fetch` is set.
+        let plan = spm.unwrap().with_fetch(fetch.take()).unwrap();
         optimized_distribution_ctx =
             DistributionContext::new(plan, data, vec![optimized_distribution_ctx]);
     }

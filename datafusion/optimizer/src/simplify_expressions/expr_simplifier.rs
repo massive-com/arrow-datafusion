@@ -18,7 +18,7 @@
 //! Expression simplification API
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Not;
 
 use arrow::{

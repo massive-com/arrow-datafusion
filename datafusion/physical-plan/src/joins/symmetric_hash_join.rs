@@ -484,7 +484,7 @@ impl ExecutionPlan for SymmetricHashJoinExec {
             self.on.clone(),
             self.filter.clone(),
             self.join_type(),
-            self.null_equals_null,
+            self.null_equality,
             self.left_sort_exprs.clone(),
             self.right_sort_exprs.clone(),
             self.mode,

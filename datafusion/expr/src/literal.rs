@@ -20,7 +20,6 @@
 use crate::expr::FieldMetadata;
 use crate::Expr;
 use datafusion_common::ScalarValue;
-use std::collections::HashMap;
 
 /// Create a literal expression
 pub fn lit<T: Literal>(n: T) -> Expr {

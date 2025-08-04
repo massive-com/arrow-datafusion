@@ -187,6 +187,10 @@ pub trait AggregateWindowExpr: WindowExpr {
         accumulator: &mut Box<dyn Accumulator>,
     ) -> Result<ScalarValue>;
 
+    /// Indicates whether this window function always produces the same result
+    /// for all rows in the partition.
+    fn is_constant_in_partition(&self) -> bool;
+
     /// Evaluates the window function against the batch.
     fn aggregate_evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
         let mut accumulator = self.get_accumulator()?;

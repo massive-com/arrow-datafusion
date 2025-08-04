@@ -1451,11 +1451,7 @@ mod tests {
         let sql_string = fmt_sql(expr.as_ref()).to_string();
         let display_string = expr.to_string();
         assert_eq!(sql_string, "a IN (a, b)");
-<<<<<<< HEAD
-        assert_eq!(display_string, "Use a@0 IN (SET) ([Literal { value: Utf8(\"a\"), field: Field { name: \"a\", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} } }, Literal { value: Utf8(\"b\"), field: Field { name: \"b\", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} } }])");
-=======
         assert_eq!(display_string, "Use a@0 IN (SET) ([Literal { value: Utf8(\"a\"), field: Field { name: \"lit\", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} } }, Literal { value: Utf8(\"b\"), field: Field { name: \"lit\", data_type: Utf8, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} } }])");
->>>>>>> upstream/branch-49
 
         // Test: a NOT IN ('a', 'b')
         let list = vec![lit("a"), lit("b")];
