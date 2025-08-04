@@ -40,6 +40,7 @@ use datafusion_common::{
     assert_batches_eq, assert_batches_sorted_eq, assert_contains, exec_err, not_impl_err,
     plan_err, DFSchema, DataFusionError, Result, ScalarValue,
 };
+use datafusion_expr::expr::FieldMetadata;
 use datafusion_expr::simplify::{ExprSimplifyResult, SimplifyInfo};
 use datafusion_expr::{
     lit_with_metadata, Accumulator, ColumnarValue, CreateFunction, CreateFunctionBody,
@@ -215,6 +216,34 @@ impl ScalarUDFImpl for Simple0ArgsScalarUDF {
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         Ok(ColumnarValue::Scalar(ScalarValue::Int32(Some(100))))
+    }
+
+    fn equals(&self, other: &dyn ScalarUDFImpl) -> bool {
+        let Some(other) = other.as_any().downcast_ref::<Self>() else {
+            return false;
+        };
+        let Self {
+            name,
+            signature,
+            return_type,
+        } = self;
+        name == &other.name
+            && signature == &other.signature
+            && return_type == &other.return_type
+    }
+
+    fn hash_value(&self) -> u64 {
+        let Self {
+            name,
+            signature,
+            return_type,
+        } = self;
+        let mut hasher = DefaultHasher::new();
+        std::any::type_name::<Self>().hash(&mut hasher);
+        name.hash(&mut hasher);
+        signature.hash(&mut hasher);
+        return_type.hash(&mut hasher);
+        hasher.finish()
     }
 }
 
@@ -555,6 +584,34 @@ impl ScalarUDFImpl for AddIndexToStringVolatileScalarUDF {
             _ => unimplemented!(),
         };
         Ok(ColumnarValue::Array(Arc::new(StringArray::from(answer))))
+    }
+
+    fn equals(&self, other: &dyn ScalarUDFImpl) -> bool {
+        let Some(other) = other.as_any().downcast_ref::<Self>() else {
+            return false;
+        };
+        let Self {
+            name,
+            signature,
+            return_type,
+        } = self;
+        name == &other.name
+            && signature == &other.signature
+            && return_type == &other.return_type
+    }
+
+    fn hash_value(&self) -> u64 {
+        let Self {
+            name,
+            signature,
+            return_type,
+        } = self;
+        let mut hasher = DefaultHasher::new();
+        std::any::type_name::<Self>().hash(&mut hasher);
+        name.hash(&mut hasher);
+        signature.hash(&mut hasher);
+        return_type.hash(&mut hasher);
+        hasher.finish()
     }
 }
 
@@ -974,8 +1031,36 @@ impl ScalarUDFImpl for ScalarFunctionWrapper {
         Ok(ExprSimplifyResult::Simplified(replacement))
     }
 
-    fn aliases(&self) -> &[String] {
-        &[]
+    fn equals(&self, other: &dyn ScalarUDFImpl) -> bool {
+        let Some(other) = other.as_any().downcast_ref::<Self>() else {
+            return false;
+        };
+        let Self {
+            name,
+            expr,
+            signature,
+            return_type,
+        } = self;
+        name == &other.name
+            && expr == &other.expr
+            && signature == &other.signature
+            && return_type == &other.return_type
+    }
+
+    fn hash_value(&self) -> u64 {
+        let Self {
+            name,
+            expr,
+            signature,
+            return_type,
+        } = self;
+        let mut hasher = DefaultHasher::new();
+        std::any::type_name::<Self>().hash(&mut hasher);
+        name.hash(&mut hasher);
+        expr.hash(&mut hasher);
+        signature.hash(&mut hasher);
+        return_type.hash(&mut hasher);
+        hasher.finish()
     }
 }
 
@@ -1184,7 +1269,7 @@ async fn create_scalar_function_from_sql_statement_postgres_syntax() -> Result<(
                 quote_style: None,
                 span: Span::empty(),
             }),
-            data_type: DataType::Utf8,
+            data_type: DataType::Utf8View,
             default_expr: None,
         }]),
         return_type: Some(DataType::Int32),
@@ -1453,7 +1538,30 @@ impl ScalarUDFImpl for MetadataBasedUdf {
     }
 
     fn equals(&self, other: &dyn ScalarUDFImpl) -> bool {
-        self.name == other.name()
+        let Some(other) = other.as_any().downcast_ref::<Self>() else {
+            return false;
+        };
+        let Self {
+            name,
+            signature,
+            metadata,
+        } = self;
+        name == &other.name
+            && signature == &other.signature
+            && metadata == &other.metadata
+    }
+
+    fn hash_value(&self) -> u64 {
+        let Self {
+            name,
+            signature,
+            metadata: _, // unhashable
+        } = self;
+        let mut hasher = DefaultHasher::new();
+        std::any::type_name::<Self>().hash(&mut hasher);
+        name.hash(&mut hasher);
+        signature.hash(&mut hasher);
+        hasher.finish()
     }
 }
 
@@ -1536,6 +1644,7 @@ async fn test_metadata_based_udf_with_literal() -> Result<()> {
         [("modify_values".to_string(), "double_output".to_string())]
             .into_iter()
             .collect();
+    let input_metadata = FieldMetadata::from(input_metadata);
     let df = ctx.sql("select 0;").await?.select(vec![
         lit(5u64).alias_with_metadata("lit_with_doubling", Some(input_metadata.clone())),
         lit(5u64).alias("lit_no_doubling"),
@@ -1670,10 +1779,6 @@ impl ScalarUDFImpl for ExtensionBasedUdf {
                 ))))
             }
         }
-    }
-
-    fn equals(&self, other: &dyn ScalarUDFImpl) -> bool {
-        self.name == other.name()
     }
 }
 

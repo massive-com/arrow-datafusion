@@ -280,7 +280,7 @@ physical_plan
 06)┌─────────────┴─────────────┐
 07)│       DataSourceExec      │
 08)│    --------------------   │
-09)│        bytes: 3120        │
+09)│        bytes: 1040        │
 10)│       format: memory      │
 11)│          rows: 2          │
 12)└───────────────────────────┘
@@ -360,7 +360,11 @@ physical_plan
 21)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
 22)│       DataSourceExec      ││       ProjectionExec      │
 23)│    --------------------   ││    --------------------   │
+<<<<<<< HEAD
 24)│        bytes: 1560        ││     date_col: date_col    │
+=======
+24)│         bytes: 520        ││     date_col: date_col    │
+>>>>>>> upstream/branch-49
 25)│       format: memory      ││      int_col: int_col     │
 26)│          rows: 1          ││                           │
 27)│                           ││        string_col:        │
@@ -655,7 +659,7 @@ physical_plan
 13)┌─────────────┴─────────────┐
 14)│       DataSourceExec      │
 15)│    --------------------   │
-16)│        bytes: 1560        │
+16)│         bytes: 520        │
 17)│       format: memory      │
 18)│          rows: 1          │
 19)└───────────────────────────┘
@@ -809,7 +813,7 @@ physical_plan
 40)└───────────────────────────┘
 
 query TT
-explain select 
+explain select
   count(*) over(),
   row_number() over ()
 from table1
@@ -922,7 +926,7 @@ physical_plan
 27)└───────────────────────────┘
 
 query TT
-explain select 
+explain select
   rank() over(ORDER BY int_col DESC),
   row_number() over (ORDER BY int_col ASC)
 from table1
@@ -1020,7 +1024,10 @@ physical_plan
 16)│          files: 1         │
 17)│      format: parquet      │
 18)└───────────────────────────┘
+<<<<<<< HEAD
 
+=======
+>>>>>>> upstream/branch-49
 
 # Query with projection on memory
 query TT
@@ -1042,7 +1049,7 @@ physical_plan
 13)┌─────────────┴─────────────┐
 14)│       DataSourceExec      │
 15)│    --------------------   │
-16)│        bytes: 1560        │
+16)│         bytes: 520        │
 17)│       format: memory      │
 18)│          rows: 1          │
 19)└───────────────────────────┘
@@ -1185,42 +1192,24 @@ physical_plan
 21)│    --------------------   │
 22)│            on:            │
 23)│   (int_col = int_col),    ├──────────────┐
-24)│     (string_col = CAST    │              │
-25)│   (table1.string_col AS   │              │
-26)│         Utf8View))        │              │
-27)└─────────────┬─────────────┘              │
-28)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
-29)│       DataSourceExec      ││       ProjectionExec      │
-30)│    --------------------   ││    --------------------   │
-31)│          files: 1         ││ CAST(table1.string_col AS │
-32)│      format: parquet      ││         Utf8View):        │
-33)│                           ││     CAST(string_col AS    │
-34)│                           ││          Utf8View)        │
-35)│                           ││                           │
-36)│                           ││        bigint_col:        │
-37)│                           ││         bigint_col        │
-38)│                           ││                           │
-39)│                           ││     date_col: date_col    │
-40)│                           ││      int_col: int_col     │
-41)│                           ││                           │
-42)│                           ││        string_col:        │
-43)│                           ││         string_col        │
-44)└───────────────────────────┘└─────────────┬─────────────┘
-45)-----------------------------┌─────────────┴─────────────┐
-46)-----------------------------│      RepartitionExec      │
-47)-----------------------------│    --------------------   │
-48)-----------------------------│ partition_count(in->out): │
-49)-----------------------------│           1 -> 4          │
-50)-----------------------------│                           │
-51)-----------------------------│    partitioning_scheme:   │
-52)-----------------------------│     RoundRobinBatch(4)    │
-53)-----------------------------└─────────────┬─────────────┘
-54)-----------------------------┌─────────────┴─────────────┐
-55)-----------------------------│       DataSourceExec      │
-56)-----------------------------│    --------------------   │
-57)-----------------------------│          files: 1         │
-58)-----------------------------│        format: csv        │
-59)-----------------------------└───────────────────────────┘
+24)│       (string_col =       │              │
+25)│         string_col)       │              │
+26)└─────────────┬─────────────┘              │
+27)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+28)│       DataSourceExec      ││      RepartitionExec      │
+29)│    --------------------   ││    --------------------   │
+30)│          files: 1         ││ partition_count(in->out): │
+31)│      format: parquet      ││           1 -> 4          │
+32)│                           ││                           │
+33)│                           ││    partitioning_scheme:   │
+34)│                           ││     RoundRobinBatch(4)    │
+35)└───────────────────────────┘└─────────────┬─────────────┘
+36)-----------------------------┌─────────────┴─────────────┐
+37)-----------------------------│       DataSourceExec      │
+38)-----------------------------│    --------------------   │
+39)-----------------------------│          files: 1         │
+40)-----------------------------│        format: csv        │
+41)-----------------------------└───────────────────────────┘
 
 # Query with outer hash join.
 query TT
@@ -1252,42 +1241,24 @@ physical_plan
 23)│                           │
 24)│            on:            ├──────────────┐
 25)│   (int_col = int_col),    │              │
-26)│     (string_col = CAST    │              │
-27)│   (table1.string_col AS   │              │
-28)│         Utf8View))        │              │
-29)└─────────────┬─────────────┘              │
-30)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
-31)│       DataSourceExec      ││       ProjectionExec      │
-32)│    --------------------   ││    --------------------   │
-33)│          files: 1         ││ CAST(table1.string_col AS │
-34)│      format: parquet      ││         Utf8View):        │
-35)│                           ││     CAST(string_col AS    │
-36)│                           ││          Utf8View)        │
-37)│                           ││                           │
-38)│                           ││        bigint_col:        │
-39)│                           ││         bigint_col        │
-40)│                           ││                           │
-41)│                           ││     date_col: date_col    │
-42)│                           ││      int_col: int_col     │
-43)│                           ││                           │
-44)│                           ││        string_col:        │
-45)│                           ││         string_col        │
-46)└───────────────────────────┘└─────────────┬─────────────┘
-47)-----------------------------┌─────────────┴─────────────┐
-48)-----------------------------│      RepartitionExec      │
-49)-----------------------------│    --------------------   │
-50)-----------------------------│ partition_count(in->out): │
-51)-----------------------------│           1 -> 4          │
-52)-----------------------------│                           │
-53)-----------------------------│    partitioning_scheme:   │
-54)-----------------------------│     RoundRobinBatch(4)    │
-55)-----------------------------└─────────────┬─────────────┘
-56)-----------------------------┌─────────────┴─────────────┐
-57)-----------------------------│       DataSourceExec      │
-58)-----------------------------│    --------------------   │
-59)-----------------------------│          files: 1         │
-60)-----------------------------│        format: csv        │
-61)-----------------------------└───────────────────────────┘
+26)│       (string_col =       │              │
+27)│         string_col)       │              │
+28)└─────────────┬─────────────┘              │
+29)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+30)│       DataSourceExec      ││      RepartitionExec      │
+31)│    --------------------   ││    --------------------   │
+32)│          files: 1         ││ partition_count(in->out): │
+33)│      format: parquet      ││           1 -> 4          │
+34)│                           ││                           │
+35)│                           ││    partitioning_scheme:   │
+36)│                           ││     RoundRobinBatch(4)    │
+37)└───────────────────────────┘└─────────────┬─────────────┘
+38)-----------------------------┌─────────────┴─────────────┐
+39)-----------------------------│       DataSourceExec      │
+40)-----------------------------│    --------------------   │
+41)-----------------------------│          files: 1         │
+42)-----------------------------│        format: csv        │
+43)-----------------------------└───────────────────────────┘
 
 # Query with nested loop join.
 query TT
@@ -1323,7 +1294,10 @@ physical_plan
 07)│          files: 1         ││          files: 1         │
 08)│        format: csv        ││      format: parquet      │
 09)└───────────────────────────┘└───────────────────────────┘
+<<<<<<< HEAD
 
+=======
+>>>>>>> upstream/branch-49
 
 # Query with sort merge join.
 statement ok
@@ -1460,7 +1434,7 @@ physical_plan
 57)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
 58)│       DataSourceExec      ││       DataSourceExec      │
 59)│    --------------------   ││    --------------------   │
-60)│        bytes: 1320        ││        bytes: 1312        │
+60)│         bytes: 296        ││         bytes: 288        │
 61)│       format: memory      ││       format: memory      │
 62)│          rows: 1          ││          rows: 1          │
 63)└───────────────────────────┘└───────────────────────────┘
@@ -1479,14 +1453,14 @@ physical_plan
 04)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
 05)│       DataSourceExec      ││       ProjectionExec      │
 06)│    --------------------   ││    --------------------   │
-07)│        bytes: 1320        ││   id: CAST(id AS Int32)   │
+07)│         bytes: 296        ││   id: CAST(id AS Int32)   │
 08)│       format: memory      ││         name: name        │
 09)│          rows: 1          ││                           │
 10)└───────────────────────────┘└─────────────┬─────────────┘
 11)-----------------------------┌─────────────┴─────────────┐
 12)-----------------------------│       DataSourceExec      │
 13)-----------------------------│    --------------------   │
-14)-----------------------------│        bytes: 1312        │
+14)-----------------------------│         bytes: 288        │
 15)-----------------------------│       format: memory      │
 16)-----------------------------│          rows: 1          │
 17)-----------------------------└───────────────────────────┘
@@ -1502,8 +1476,8 @@ drop table t2;
 # prepare table
 statement ok
 CREATE UNBOUNDED EXTERNAL TABLE data (
-    "date"   DATE, 
-    "ticker" VARCHAR, 
+    "date"   DATE,
+    "ticker" VARCHAR,
     "time"   TIMESTAMP,
 ) STORED AS CSV
 WITH ORDER ("date", "ticker", "time")
@@ -1512,8 +1486,8 @@ LOCATION './a.parquet';
 
 # query
 query TT
-explain SELECT * FROM data 
-WHERE ticker = 'A' 
+explain SELECT * FROM data
+WHERE ticker = 'A'
 ORDER BY "date", "time";
 ----
 physical_plan
@@ -1675,7 +1649,7 @@ physical_plan
 
 # same thing but order by time, date
 query TT
-explain SELECT * FROM data 
+explain SELECT * FROM data
 WHERE ticker = 'A' AND CAST(time AS DATE) = date
 ORDER BY "time", "date";
 ----
@@ -1720,8 +1694,8 @@ physical_plan
 
 # query
 query TT
-explain SELECT * FROM data 
-WHERE date = '2006-01-02' 
+explain SELECT * FROM data
+WHERE date = '2006-01-02'
 ORDER BY "ticker", "time";
 ----
 physical_plan

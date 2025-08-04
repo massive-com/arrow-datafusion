@@ -60,7 +60,7 @@ pub fn sum(expr: Expr) -> Expr {
         vec![expr],
         false,
         None,
-        None,
+        vec![],
         None,
     ))
 }
@@ -73,7 +73,7 @@ pub fn count(expr: Expr) -> Expr {
         vec![expr],
         false,
         None,
-        None,
+        vec![],
         None,
     ))
 }
@@ -86,7 +86,7 @@ pub fn avg(expr: Expr) -> Expr {
         vec![expr],
         false,
         None,
-        None,
+        vec![],
         None,
     ))
 }
@@ -177,10 +177,6 @@ impl AggregateUDFImpl for Sum {
 
     fn state_fields(&self, _args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         unreachable!("stub should not have state_fields()")
-    }
-
-    fn aliases(&self) -> &[String] {
-        &[]
     }
 
     fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
@@ -286,7 +282,7 @@ pub fn min(expr: Expr) -> Expr {
         vec![expr],
         false,
         None,
-        None,
+        vec![],
         None,
     ))
 }
@@ -344,10 +340,6 @@ impl AggregateUDFImpl for Min {
         not_impl_err!("no impl for stub")
     }
 
-    fn aliases(&self) -> &[String] {
-        &[]
-    }
-
     fn create_groups_accumulator(
         &self,
         _args: AccumulatorArgs,
@@ -371,7 +363,7 @@ pub fn max(expr: Expr) -> Expr {
         vec![expr],
         false,
         None,
-        None,
+        vec![],
         None,
     ))
 }
@@ -427,10 +419,6 @@ impl AggregateUDFImpl for Max {
 
     fn accumulator(&self, _acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
         not_impl_err!("no impl for stub")
-    }
-
-    fn aliases(&self) -> &[String] {
-        &[]
     }
 
     fn create_groups_accumulator(
@@ -494,6 +482,7 @@ impl AggregateUDFImpl for Avg {
     fn state_fields(&self, _args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         not_impl_err!("no impl for stub")
     }
+
     fn aliases(&self) -> &[String] {
         &self.aliases
     }

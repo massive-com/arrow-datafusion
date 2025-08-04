@@ -22,12 +22,17 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion_physical_plan::execution_plan::{
+    Boundedness, EmissionType, SchedulingType,
+};
+use datafusion_physical_plan::metrics::SplitMetrics;
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::stream::BatchSplitStream;
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
+use itertools::Itertools;
 
 use crate::file_scan_config::FileScanConfig;
 use datafusion_common::config::ConfigOptions;
@@ -39,7 +44,7 @@ use datafusion_physical_expr::{
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use datafusion_physical_plan::filter::collect_columns_from_predicate;
 use datafusion_physical_plan::filter_pushdown::{
-    ChildPushdownResult, FilterPushdownPropagation,
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
 
 /// A source of data, typically a list of files or memory
@@ -146,6 +151,9 @@ pub trait DataSource: Send + Sync + Debug {
 
     fn output_partitioning(&self) -> Partitioning;
     fn eq_properties(&self) -> EquivalenceProperties;
+    fn scheduling_type(&self) -> SchedulingType {
+        SchedulingType::NonCooperative
+    }
     fn statistics(&self) -> Result<Statistics>;
     /// Return a copy of this DataSource with a new fetch limit
     fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>>;
@@ -166,7 +174,9 @@ pub trait DataSource: Send + Sync + Debug {
         filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
-        Ok(FilterPushdownPropagation::unsupported(filters))
+        Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+            vec![PushedDown::No; filters.len()],
+        ))
     }
 }
 
@@ -259,7 +269,18 @@ impl ExecutionPlan for DataSourceExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        self.data_source.open(partition, context)
+        let stream = self.data_source.open(partition, Arc::clone(&context))?;
+        let batch_size = context.session_config().batch_size();
+        log::debug!(
+            "Batch splitting enabled for partition {partition}: batch_size={batch_size}"
+        );
+        let metrics = self.data_source.metrics();
+        let split_metrics = SplitMetrics::new(&metrics, partition);
+        Ok(Box::pin(BatchSplitStream::new(
+            stream,
+            batch_size,
+            split_metrics,
+        )))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -317,22 +338,37 @@ impl ExecutionPlan for DataSourceExec {
     }
     fn handle_child_pushdown_result(
         &self,
+        _phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
         config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         // Push any remaining filters into our data source
-        let res = self.data_source.try_pushdown_filters(
-            child_pushdown_result.parent_filters.collect_all(),
-            config,
-        )?;
+        let parent_filters = child_pushdown_result
+            .parent_filters
+            .into_iter()
+            .map(|f| f.filter)
+            .collect_vec();
+        let res = self
+            .data_source
+            .try_pushdown_filters(parent_filters.clone(), config)?;
         match res.updated_node {
             Some(data_source) => {
                 let mut new_node = self.clone();
                 new_node.data_source = data_source;
                 new_node.cache =
                     Self::compute_properties(Arc::clone(&new_node.data_source));
-                // Add the missing filters' equivalence info when filters pushdown is applied
-                let filter = conjunction(res.filters.collect_supported());
+
+                // Recompute equivalence info using new filters
+                let filter = conjunction(
+                    res.filters
+                        .iter()
+                        .zip(parent_filters)
+                        .filter_map(|(s, f)| match s {
+                            PushedDown::Yes => Some(f),
+                            PushedDown::No => None,
+                        })
+                        .collect_vec(),
+                );
                 new_node = new_node.add_filter_equivalence_info(filter)?;
                 Ok(FilterPushdownPropagation {
                     filters: res.filters,
@@ -352,6 +388,7 @@ impl DataSourceExec {
         Arc::new(Self::new(Arc::new(data_source)))
     }
 
+    // Default constructor for `DataSourceExec`, setting the `cooperative` flag to `true`.
     pub fn new(data_source: Arc<dyn DataSource>) -> Self {
         let cache = Self::compute_properties(Arc::clone(&data_source));
         Self { data_source, cache }
@@ -389,7 +426,7 @@ impl DataSourceExec {
         for (lhs, rhs) in equal_pairs {
             self.cache
                 .eq_properties
-                .add_equal_conditions(&Arc::clone(lhs), &Arc::clone(rhs))?
+                .add_equal_conditions(Arc::clone(lhs), Arc::clone(rhs))?
         }
         Ok(self)
     }
@@ -401,6 +438,7 @@ impl DataSourceExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         )
+        .with_scheduling_type(data_source.scheduling_type())
     }
 
     /// Downcast the `DataSourceExec`'s `data_source` to a specific file source

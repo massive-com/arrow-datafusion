@@ -69,7 +69,7 @@ pub fn approx_percentile_cont(
         args,
         false,
         None,
-        Some(vec![order_by]),
+        vec![order_by],
         None,
     ))
 }
@@ -143,7 +143,7 @@ impl ApproxPercentileCont {
         let percentile = validate_input_percentile_expr(&args.exprs[1])?;
 
         let is_descending = args
-            .ordering_req
+            .order_bys
             .first()
             .map(|sort_expr| sort_expr.options.descending)
             .unwrap_or(false);

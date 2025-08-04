@@ -296,7 +296,7 @@ pub fn adjust_input_keys_ordering(
         join_type,
         projection,
         mode,
-        null_equals_null,
+        null_equality,
         ..
     }) = plan.as_any().downcast_ref::<HashJoinExec>()
     {
@@ -315,7 +315,7 @@ pub fn adjust_input_keys_ordering(
                         // TODO: although projection is not used in the join here, because projection pushdown is after enforce_distribution. Maybe we need to handle it later. Same as filter.
                         projection.clone(),
                         PartitionMode::Partitioned,
-                        *null_equals_null,
+                        *null_equality,
                     )
                     .map(|e| Arc::new(e) as _)
                 };
@@ -335,7 +335,7 @@ pub fn adjust_input_keys_ordering(
                         left.schema().fields().len(),
                     )
                     .unwrap_or_default(),
-                    JoinType::RightSemi | JoinType::RightAnti => {
+                    JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => {
                         requirements.data.clone()
                     }
                     JoinType::Left
@@ -365,7 +365,7 @@ pub fn adjust_input_keys_ordering(
         filter,
         join_type,
         sort_options,
-        null_equals_null,
+        null_equality,
         ..
     }) = plan.as_any().downcast_ref::<SortMergeJoinExec>()
     {
@@ -380,7 +380,7 @@ pub fn adjust_input_keys_ordering(
                 filter.clone(),
                 *join_type,
                 new_conditions.1,
-                *null_equals_null,
+                *null_equality,
             )
             .map(|e| Arc::new(e) as _)
         };
@@ -617,7 +617,7 @@ pub fn reorder_join_keys_to_inputs(
         join_type,
         projection,
         mode,
-        null_equals_null,
+        null_equality,
         ..
     }) = plan_any.downcast_ref::<HashJoinExec>()
     {
@@ -643,7 +643,7 @@ pub fn reorder_join_keys_to_inputs(
                     join_type,
                     projection.clone(),
                     PartitionMode::Partitioned,
-                    *null_equals_null,
+                    *null_equality,
                 )?));
             }
         }
@@ -654,7 +654,7 @@ pub fn reorder_join_keys_to_inputs(
         filter,
         join_type,
         sort_options,
-        null_equals_null,
+        null_equality,
         ..
     }) = plan_any.downcast_ref::<SortMergeJoinExec>()
     {
@@ -682,7 +682,7 @@ pub fn reorder_join_keys_to_inputs(
                     filter.clone(),
                     *join_type,
                     new_sort_options,
-                    *null_equals_null,
+                    *null_equality,
                 )
                 .map(|smj| Arc::new(smj) as _);
             }
@@ -1291,17 +1291,59 @@ pub fn ensure_distribution(
                     Distribution::SinglePartition => {
                         child = add_spm_on_top(child, &mut fetch);
                     }
-                    Distribution::HashPartitioned(exprs) => {
-                        if add_roundrobin {
-                            // Add round-robin repartitioning on top of the operator
-                            // to increase parallelism.
-                            child = add_roundrobin_on_top(child, target_partitions)?;
-                        }
-                        // When inserting hash is necessary to satisfy hash requirement, insert hash repartition.
-                        if hash_necessary {
-                            child =
-                                add_hash_on_top(child, exprs.to_vec(), target_partitions)?;
-                        }
+                    // When inserting hash is necessary to satisfy hash requirement, insert hash repartition.
+                    if hash_necessary {
+                        child =
+                            add_hash_on_top(child, exprs.to_vec(), target_partitions)?;
+                    }
+                }
+                Distribution::UnspecifiedDistribution => {
+                    if add_roundrobin {
+                        // Add round-robin repartitioning on top of the operator
+                        // to increase parallelism.
+                        child = add_roundrobin_on_top(child, target_partitions)?;
+                    }
+                }
+            };
+
+            // There is an ordering requirement of the operator:
+            if let Some(required_input_ordering) = required_input_ordering {
+                // Either:
+                // - Ordering requirement cannot be satisfied by preserving ordering through repartitions, or
+                // - using order preserving variant is not desirable.
+                let sort_req = required_input_ordering.into_single();
+                let ordering_satisfied = child
+                    .plan
+                    .equivalence_properties()
+                    .ordering_satisfy_requirement(sort_req.clone())?;
+
+                if (!ordering_satisfied || !order_preserving_variants_desirable)
+                    && child.data
+                {
+                    child = replace_order_preserving_variants(child)?;
+                    // If ordering requirements were satisfied before repartitioning,
+                    // make sure ordering requirements are still satisfied after.
+                    if ordering_satisfied {
+                        // Make sure to satisfy ordering requirement:
+                        child = add_sort_above_with_check(
+                            child,
+                            sort_req,
+                            plan.as_any()
+                                .downcast_ref::<OutputRequirementExec>()
+                                .map(|output| output.fetch())
+                                .unwrap_or(None),
+                        )?;
+                    }
+                }
+                // Stop tracking distribution changing operators
+                child.data = false;
+            } else {
+                // no ordering requirement
+                match requirement {
+                    // Operator requires specific distribution.
+                    Distribution::SinglePartition | Distribution::HashPartitioned(_) => {
+                        // Since there is no ordering requirement, preserving ordering is pointless
+                        child = replace_order_preserving_variants(child)?;
                     }
                     Distribution::UnspecifiedDistribution => {
                         if add_roundrobin {

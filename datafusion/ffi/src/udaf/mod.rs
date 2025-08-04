@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{ffi::c_void, sync::Arc};
-
 use abi_stable::{
     std_types::{ROption, RResult, RStr, RString, RVec},
     StableAbi,
@@ -41,6 +39,8 @@ use datafusion::{
 };
 use datafusion_proto_common::from_proto::parse_proto_fields_to_fields;
 use groups_accumulator::{FFI_GroupsAccumulator, ForeignGroupsAccumulator};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::{ffi::c_void, sync::Arc};
 
 use crate::util::{rvec_wrapped_to_vec_fieldref, vec_fieldref_to_rvec_wrapped};
 use crate::{
@@ -553,6 +553,34 @@ impl AggregateUDFImpl for ForeignAggregateUDF {
             Ok(rvec_wrapped_to_vec_datatype(&result_types)?)
         }
     }
+
+    fn equals(&self, other: &dyn AggregateUDFImpl) -> bool {
+        let Some(other) = other.as_any().downcast_ref::<Self>() else {
+            return false;
+        };
+        let Self {
+            signature,
+            aliases,
+            udaf,
+        } = self;
+        signature == &other.signature
+            && aliases == &other.aliases
+            && std::ptr::eq(udaf, &other.udaf)
+    }
+
+    fn hash_value(&self) -> u64 {
+        let Self {
+            signature,
+            aliases,
+            udaf,
+        } = self;
+        let mut hasher = DefaultHasher::new();
+        std::any::type_name::<Self>().hash(&mut hasher);
+        signature.hash(&mut hasher);
+        aliases.hash(&mut hasher);
+        std::ptr::hash(udaf, &mut hasher);
+        hasher.finish()
+    }
 }
 
 #[repr(C)]
@@ -588,10 +616,8 @@ impl From<AggregateOrderSensitivity> for FFI_AggregateOrderSensitivity {
 mod tests {
     use arrow::datatypes::Schema;
     use datafusion::{
-        common::create_array,
-        functions_aggregate::sum::Sum,
-        physical_expr::{LexOrdering, PhysicalSortExpr},
-        physical_plan::expressions::col,
+        common::create_array, functions_aggregate::sum::Sum,
+        physical_expr::PhysicalSortExpr, physical_plan::expressions::col,
         scalar::ScalarValue,
     };
 
@@ -644,10 +670,7 @@ mod tests {
             return_field: Field::new("f", DataType::Float64, true).into(),
             schema: &schema,
             ignore_nulls: true,
-            ordering_req: &LexOrdering::new(vec![PhysicalSortExpr {
-                expr: col("a", &schema)?,
-                options: Default::default(),
-            }]),
+            order_bys: &[PhysicalSortExpr::new_default(col("a", &schema)?)],
             is_reversed: false,
             name: "round_trip",
             is_distinct: true,
@@ -698,10 +721,7 @@ mod tests {
             return_field: Field::new("f", DataType::Float64, true).into(),
             schema: &schema,
             ignore_nulls: true,
-            ordering_req: &LexOrdering::new(vec![PhysicalSortExpr {
-                expr: col("a", &schema)?,
-                options: Default::default(),
-            }]),
+            order_bys: &[PhysicalSortExpr::new_default(col("a", &schema)?)],
             is_reversed: false,
             name: "round_trip",
             is_distinct: true,
