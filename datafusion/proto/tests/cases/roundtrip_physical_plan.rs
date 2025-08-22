@@ -31,6 +31,9 @@ use arrow::csv::WriterBuilder;
 use arrow::datatypes::{Fields, TimeUnit};
 use datafusion::physical_expr::aggregate::AggregateExprBuilder;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion::physical_plan::node_id::{
+    annotate_node_id_for_execution_plan, NodeIdAnnotator,
+};
 use datafusion_expr::dml::InsertOp;
 use datafusion_functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf;
 use datafusion_functions_aggregate::array_agg::array_agg_udaf;
@@ -133,13 +136,22 @@ fn roundtrip_test_and_return(
     ctx: &SessionContext,
     codec: &dyn PhysicalExtensionCodec,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    let mut annotator = NodeIdAnnotator::new();
+    let exec_plan = annotate_node_id_for_execution_plan(&exec_plan, &mut annotator)?;
     let proto: protobuf::PhysicalPlanNode =
         protobuf::PhysicalPlanNode::try_from_physical_plan(exec_plan.clone(), codec)
             .expect("to proto");
     let runtime = ctx.runtime_env();
-    let result_exec_plan: Arc<dyn ExecutionPlan> = proto
+    let mut result_exec_plan: Arc<dyn ExecutionPlan> = proto
         .try_into_physical_plan(ctx, runtime.deref(), codec)
         .expect("from proto");
+
+    // Re-annotate the deserialized plan with node IDs to match the original plan structure
+    // This ensures that the roundtrip preserves the node_id values for comparison
+    let mut annotator = NodeIdAnnotator::new();
+    result_exec_plan =
+        annotate_node_id_for_execution_plan(&result_exec_plan, &mut annotator)?;
+
     assert_eq!(format!("{exec_plan:?}"), format!("{result_exec_plan:?}"));
     Ok(result_exec_plan)
 }
