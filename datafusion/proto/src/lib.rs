@@ -97,29 +97,6 @@
 //!  assert_eq!(format!("{:?}", plan), format!("{:?}", logical_round_trip));
 //! # Ok(())
 //! # }
-//! ```
-//! # Example: Serializing [`ExecutionPlan`]s
-//!
-//! ```
-//! # use datafusion::prelude::*;
-//! # use datafusion_common::Result;
-//! # use datafusion_proto::bytes::{physical_plan_from_bytes,physical_plan_to_bytes};
-//! # #[tokio::main]
-//! # async fn main() -> Result<()>{
-//!  // Create a plan that scans table 't'
-//!  let ctx = SessionContext::new();
-//!  ctx.register_csv("t1", "tests/testdata/test.csv", CsvReadOptions::default()).await?;
-//!  let physical_plan = ctx.table("t1").await?.create_physical_plan().await?;
-//!
-//!  // Convert the plan into bytes (for sending over the network, etc.)
-//!  let bytes = physical_plan_to_bytes(physical_plan.clone())?;
-//!
-//!  // Decode bytes from somewhere (over network, etc.) back to ExecutionPlan
-//!  let physical_round_trip = physical_plan_from_bytes(&bytes, &ctx)?;
-//!  assert_eq!(format!("{:?}", physical_plan), format!("{:?}", physical_round_trip));
-//! # Ok(())
-//! # }
-//! ```
 pub mod bytes;
 pub mod common;
 pub mod generated;
