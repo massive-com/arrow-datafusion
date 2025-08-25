@@ -766,7 +766,7 @@ impl ExecutionPlan for RepartitionExec {
     }
     fn with_node_id(
         self: Arc<Self>,
-        _node_id: usize,
+        node_id: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let mut new_plan = RepartitionExec {
             input: Arc::clone(&self.input),
@@ -775,7 +775,7 @@ impl ExecutionPlan for RepartitionExec {
             preserve_order: self.preserve_order,
             cache: self.cache.clone(),
         };
-        let new_props = new_plan.cache.clone().with_node_id(_node_id);
+        let new_props = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
     }

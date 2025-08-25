@@ -951,17 +951,16 @@ fn add_spm_on_top(
         // (determined by flag `config.optimizer.bounded_order_preserving_variants`)
         let should_preserve_ordering = input.plan.output_ordering().is_some();
 
+        let ordering = input
+            .plan
+            .output_ordering()
+            .cloned()
+            .unwrap_or_else(LexOrdering::default);
+
         let new_plan = if should_preserve_ordering {
             Arc::new(
-                SortPreservingMergeExec::new(
-                    input
-                        .plan
-                        .output_ordering()
-                        .unwrap_or(&LexOrdering::default())
-                        .clone(),
-                    Arc::clone(&input.plan),
-                )
-                .with_fetch(fetch.take()),
+                SortPreservingMergeExec::new(ordering, Arc::clone(&input.plan))
+                    .with_fetch(fetch.take()),
             ) as _
         } else {
             Arc::new(CoalescePartitionsExec::new(Arc::clone(&input.plan))) as _
@@ -1405,14 +1404,12 @@ pub fn ensure_distribution(
     // It was removed by `remove_dist_changing_operators`
     // and we need to add it back.
     if fetch.is_some() {
+        let ordering = plan
+            .output_ordering()
+            .cloned()
+            .unwrap_or_else(LexOrdering::default);
         let plan = Arc::new(
-            SortPreservingMergeExec::new(
-                plan.output_ordering()
-                    .unwrap_or(&LexOrdering::default())
-                    .clone(),
-                plan,
-            )
-            .with_fetch(fetch.take()),
+            SortPreservingMergeExec::new(ordering, plan).with_fetch(fetch.take()),
         );
         optimized_distribution_ctx =
             DistributionContext::new(plan, data, vec![optimized_distribution_ctx]);

@@ -31,16 +31,16 @@ pub(crate) fn simplify_predicates(predicates: Vec<Expr>) -> Result<Vec<Expr>> {
 
     for pred in predicates {
         match &pred {
-            Expr::BinaryExpr(BinaryExpr { left, op, right })
-                if matches!(
-                    op,
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op:
                     Operator::Gt
-                        | Operator::GtEq
-                        | Operator::Lt
-                        | Operator::LtEq
-                        | Operator::Eq
-                ) =>
-            {
+                    | Operator::GtEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Eq,
+                right,
+            }) => {
                 let left_col = extract_column_from_expr(left);
                 let right_col = extract_column_from_expr(right);
                 let left_lit = left.is_literal();
