@@ -734,7 +734,7 @@ explain select * from testSubQueryLimit as t1 join (select * from testSubQueryLi
 ----
 logical_plan
 01)Limit: skip=0, fetch=10
-02)--Cross Join: 
+02)--Cross Join:
 03)----SubqueryAlias: t1
 04)------Limit: skip=0, fetch=10
 05)--------TableScan: testsubquerylimit projection=[a, b], fetch=10
@@ -759,7 +759,7 @@ explain select * from testSubQueryLimit as t1 join (select * from testSubQueryLi
 ----
 logical_plan
 01)Limit: skip=0, fetch=2
-02)--Cross Join: 
+02)--Cross Join:
 03)----SubqueryAlias: t1
 04)------Limit: skip=0, fetch=2
 05)--------TableScan: testsubquerylimit projection=[a, b], fetch=2
@@ -830,6 +830,9 @@ CREATE EXTERNAL TABLE test_limit_with_partitions
 STORED AS PARQUET
 LOCATION 'test_files/scratch/parquet/test_limit_with_partitions/';
 
+statement ok
+set datafusion.explain.logical_plan_only = true;
+
 query TT
 explain
 with selection as (
@@ -849,12 +852,9 @@ logical_plan
 04)------SubqueryAlias: selection
 05)--------Limit: skip=0, fetch=1
 06)----------TableScan: test_limit_with_partitions projection=[part_key], fetch=1
-physical_plan
-01)ProjectionExec: expr=[foo@0 as foo]
-02)--SortExec: TopK(fetch=1000), expr=[part_key@1 ASC NULLS LAST], preserve_partitioning=[false]
-03)----ProjectionExec: expr=[1 as foo, part_key@0 as part_key]
-04)------CoalescePartitionsExec: fetch=1
-05)--------DataSourceExec: file_groups={3 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet/test_limit_with_partitions/part-2.parquet:0..265], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet/test_limit_with_partitions/part-2.parquet:265..530], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet/test_limit_with_partitions/part-2.parquet:530..794]]}, projection=[part_key], limit=1, file_type=parquet
+
+statement ok
+set datafusion.explain.logical_plan_only = false;
 
 query I
 with selection as (
