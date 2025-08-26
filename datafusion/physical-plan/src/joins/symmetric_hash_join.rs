@@ -478,7 +478,7 @@ impl ExecutionPlan for SymmetricHashJoinExec {
 
     fn with_node_id(
         self: Arc<Self>,
-        _node_id: usize,
+        node_id: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let mut new_plan = SymmetricHashJoinExec::try_new(
             Arc::clone(&self.left),
@@ -491,7 +491,7 @@ impl ExecutionPlan for SymmetricHashJoinExec {
             self.right_sort_exprs.clone(),
             self.mode,
         )?;
-        let new_props = new_plan.cache.clone().with_node_id(_node_id);
+        let new_props = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
     }
