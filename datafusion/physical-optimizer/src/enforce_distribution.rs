@@ -949,10 +949,10 @@ fn add_merge_on_top(
         // - Usage of order preserving variants is not desirable
         // (determined by flag `config.optimizer.prefer_existing_sort`)
         let new_plan = if let Some(req) = input.plan.output_ordering() {
-            Arc::new(SortPreservingMergeExec::new(
-                req.clone(),
-                Arc::clone(&input.plan),
-            ).with_fetch(*fetch)) as _
+            Arc::new(
+                SortPreservingMergeExec::new(req.clone(), Arc::clone(&input.plan))
+                    .with_fetch(*fetch),
+            ) as _
         } else {
             // If there is no input order, we can simply coalesce partitions:
             Arc::new(CoalescePartitionsExec::new(Arc::clone(&input.plan))) as _
@@ -1406,13 +1406,8 @@ pub fn ensure_distribution(
     // It was removed by `remove_dist_changing_operators`
     // and we need to add it back.
     if fetch.is_some() {
-        let ordering = plan
-            .output_ordering()
-            .cloned()
-            .unwrap_or_else(LexOrdering::default);
-        let plan = Arc::new(
-            SortPreservingMergeExec::new(ordering, plan).with_fetch(fetch.take()),
-        );
+        // It's safe to unwrap because `spm` is set only if `fetch` is set.
+        let plan = spm.unwrap().with_fetch(fetch.take()).unwrap();
         optimized_distribution_ctx =
             DistributionContext::new(plan, data, vec![optimized_distribution_ctx]);
     }
