@@ -360,11 +360,7 @@ physical_plan
 21)┌─────────────┴─────────────┐┌─────────────┴─────────────┐
 22)│       DataSourceExec      ││       ProjectionExec      │
 23)│    --------------------   ││    --------------------   │
-<<<<<<< HEAD
-24)│        bytes: 1560        ││     date_col: date_col    │
-=======
 24)│         bytes: 520        ││     date_col: date_col    │
->>>>>>> upstream/branch-49
 25)│       format: memory      ││      int_col: int_col     │
 26)│          rows: 1          ││                           │
 27)│                           ││        string_col:        │
@@ -1024,10 +1020,6 @@ physical_plan
 16)│          files: 1         │
 17)│      format: parquet      │
 18)└───────────────────────────┘
-<<<<<<< HEAD
-
-=======
->>>>>>> upstream/branch-49
 
 # Query with projection on memory
 query TT
@@ -1294,10 +1286,6 @@ physical_plan
 07)│          files: 1         ││          files: 1         │
 08)│        format: csv        ││      format: parquet      │
 09)└───────────────────────────┘└───────────────────────────┘
-<<<<<<< HEAD
-
-=======
->>>>>>> upstream/branch-49
 
 # Query with sort merge join.
 statement ok

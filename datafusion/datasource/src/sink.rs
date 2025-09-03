@@ -252,14 +252,14 @@ impl ExecutionPlan for DataSinkExec {
 
     fn with_node_id(
         self: Arc<Self>,
-        _node_id: usize,
+        node_id: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let mut new_plan = DataSinkExec::new(
             Arc::clone(self.input()),
             Arc::clone(&self.sink),
             self.sort_order.clone(),
         );
-        let new_props = new_plan.cache.clone().with_node_id(_node_id);
+        let new_props = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
     }

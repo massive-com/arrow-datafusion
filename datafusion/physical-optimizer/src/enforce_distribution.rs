@@ -948,9 +948,17 @@ fn add_merge_on_top(
         // - Preserving ordering is not helpful in terms of satisfying ordering requirements
         // - Usage of order preserving variants is not desirable
         // (determined by flag `config.optimizer.bounded_order_preserving_variants`)
-        let new_plan = if let Some(ordering) = input.plan.output_ordering() {
+        let should_preserve_ordering = input.plan.output_ordering().is_some();
+
+        let ordering = input
+            .plan
+            .output_ordering()
+            .cloned()
+            .unwrap_or_else(LexOrdering::default);
+
+        let new_plan = if should_preserve_ordering {
             Arc::new(
-                SortPreservingMergeExec::new(ordering.clone(), Arc::clone(&input.plan))
+                SortPreservingMergeExec::new(ordering, Arc::clone(&input.plan))
                     .with_fetch(fetch.take()),
             ) as _
         } else {
@@ -1030,7 +1038,7 @@ fn remove_dist_changing_operators(
 /// "    RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2",
 /// "      DataSourceExec: file_groups={2 groups: \[\[x], \[y]]}, projection=\[a, b, c, d, e], output_ordering=\[a@0 ASC], file_type=parquet",
 /// ```
-fn replace_order_preserving_variants(
+pub fn replace_order_preserving_variants(
     mut context: DistributionContext,
     ordering_satisfied: bool,
 ) -> Result<(DistributionContext, Option<usize>)> {
@@ -1405,8 +1413,13 @@ pub fn ensure_distribution(
     // It was removed by `remove_dist_changing_operators`
     // and we need to add it back.
     if fetch.is_some() {
-        // It's safe to unwrap because `spm` is set only if `fetch` is set.
-        let plan = spm.unwrap().with_fetch(fetch.take()).unwrap();
+        let ordering = plan
+            .output_ordering()
+            .cloned()
+            .unwrap_or_else(LexOrdering::default);
+        let plan = Arc::new(
+            SortPreservingMergeExec::new(ordering, plan).with_fetch(fetch.take()),
+        );
         optimized_distribution_ctx =
             DistributionContext::new(plan, data, vec![optimized_distribution_ctx]);
     }

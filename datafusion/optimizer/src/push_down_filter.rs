@@ -41,7 +41,7 @@ use datafusion_expr::{
 
 use crate::optimizer::ApplyOrder;
 use crate::utils::{has_all_column_refs, is_restrict_null_predicate};
-use crate::{simplify_predicates::simplify_predicates, OptimizerConfig, OptimizerRule};
+use crate::{simplify_expressions::simplify_predicates, OptimizerConfig, OptimizerRule};
 
 /// Optimizer rule for pushing (moving) filter expressions down in a plan so
 /// they are applied as early as possible.
@@ -2311,7 +2311,7 @@ mod tests {
             plan,
             @r"
         Projection: test.a, test1.d
-          Cross Join:
+          Cross Join: 
             Projection: test.a, test.b, test.c
               TableScan: test, full_filters=[test.a = Int32(1)]
             Projection: test1.d, test1.e, test1.f
@@ -2341,7 +2341,7 @@ mod tests {
             plan,
             @r"
         Projection: test.a, test1.a
-          Cross Join:
+          Cross Join: 
             Projection: test.a, test.b, test.c
               TableScan: test, full_filters=[test.a = Int32(1)]
             Projection: test1.a, test1.b, test1.c

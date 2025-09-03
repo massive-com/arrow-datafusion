@@ -91,6 +91,11 @@ pub trait GroupColumn: Send + Sync {
     /// Returns the number of rows stored in this builder
     fn len(&self) -> usize;
 
+    /// true if len == 0
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Returns the number of bytes used by this [`GroupColumn`]
     fn size(&self) -> usize;
 

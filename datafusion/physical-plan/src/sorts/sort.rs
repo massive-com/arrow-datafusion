@@ -1276,7 +1276,7 @@ impl ExecutionPlan for SortExec {
     }
     fn with_node_id(
         self: Arc<Self>,
-        _node_id: usize,
+        node_id: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let new_plan = SortExec {
             input: Arc::clone(self.input()),
@@ -1284,7 +1284,7 @@ impl ExecutionPlan for SortExec {
             fetch: self.fetch,
             metrics_set: self.metrics_set.clone(),
             preserve_partitioning: self.preserve_partitioning,
-            cache: self.cache.clone().with_node_id(_node_id),
+            cache: self.cache.clone().with_node_id(node_id),
             common_sort_prefix: self.common_sort_prefix.clone(),
             filter: self.filter.clone(),
         };

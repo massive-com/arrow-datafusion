@@ -1019,7 +1019,7 @@ impl ExecutionPlan for AggregateExec {
     }
     fn with_node_id(
         self: Arc<Self>,
-        _node_id: usize,
+        node_id: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let mut new_plan = AggregateExec {
             mode: self.mode,
@@ -1036,7 +1036,7 @@ impl ExecutionPlan for AggregateExec {
             metrics: self.metrics.clone(),
         };
 
-        let new_props: PlanProperties = new_plan.cache.clone().with_node_id(_node_id);
+        let new_props: PlanProperties = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
     }
