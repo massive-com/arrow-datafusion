@@ -981,6 +981,7 @@ fn add_merge_on_top(
 /// ```text
 /// "DataSourceExec: file_groups={2 groups: \[\[x], \[y]]}, projection=\[a, b, c, d, e], output_ordering=\[a@0 ASC], file_type=parquet",
 /// ```
+#[allow(clippy::type_complexity)]
 fn remove_dist_changing_operators(
     mut distribution_context: DistributionContext,
 ) -> Result<(
@@ -1222,7 +1223,7 @@ pub fn ensure_distribution(
             children,
         },
         mut fetch,
-        spm,
+        _spm,
     ) = remove_dist_changing_operators(dist_context)?;
 
     if let Some(exec) = plan.as_any().downcast_ref::<WindowAggExec>() {
