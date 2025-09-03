@@ -940,28 +940,21 @@ fn add_merge_on_top(
     input: DistributionContext,
     fetch: &mut Option<usize>,
 ) -> DistributionContext {
-    // Add SortPreservingMerge only when partition count is larger than 1.
+    // Apply only when the partition count is larger than one.
     if input.plan.output_partitioning().partition_count() > 1 {
         // When there is an existing ordering, we preserve ordering
         // when decreasing partitions. This will be un-done in the future
         // if any of the following conditions is true
         // - Preserving ordering is not helpful in terms of satisfying ordering requirements
         // - Usage of order preserving variants is not desirable
-        // (determined by flag `config.optimizer.bounded_order_preserving_variants`)
-        let should_preserve_ordering = input.plan.output_ordering().is_some();
-
-        let ordering = input
-            .plan
-            .output_ordering()
-            .cloned()
-            .unwrap_or_else(LexOrdering::default);
-
-        let new_plan = if should_preserve_ordering {
-            Arc::new(
-                SortPreservingMergeExec::new(ordering, Arc::clone(&input.plan))
-                    .with_fetch(fetch.take()),
-            ) as _
+        // (determined by flag `config.optimizer.prefer_existing_sort`)
+        let new_plan = if let Some(req) = input.plan.output_ordering() {
+            Arc::new(SortPreservingMergeExec::new(
+                req.clone(),
+                Arc::clone(&input.plan),
+            ).with_fetch(*fetch)) as _
         } else {
+            // If there is no input order, we can simply coalesce partitions:
             Arc::new(CoalescePartitionsExec::new(Arc::clone(&input.plan))) as _
         };
 
