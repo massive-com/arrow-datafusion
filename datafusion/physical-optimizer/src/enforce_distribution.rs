@@ -1407,8 +1407,13 @@ pub fn ensure_distribution(
     // It was removed by `remove_dist_changing_operators`
     // and we need to add it back.
     if fetch.is_some() {
-        // It's safe to unwrap because `spm` is set only if `fetch` is set.
-        let plan = spm.unwrap().with_fetch(fetch.take()).unwrap();
+        // We can make sure that `plan` has an ordering because
+        // `SortPreservingMergeExec` requires ordering to be constructed.
+        // If there is no ordering, `SortPreservingMergeExec::new` will panic
+        let ordering = plan.output_ordering().cloned().unwrap();
+        let plan = Arc::new(
+            SortPreservingMergeExec::new(ordering, plan).with_fetch(fetch.take()),
+        );
         optimized_distribution_ctx =
             DistributionContext::new(plan, data, vec![optimized_distribution_ctx]);
     }
