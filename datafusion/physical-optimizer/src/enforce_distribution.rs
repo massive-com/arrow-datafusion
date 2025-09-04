@@ -940,20 +940,21 @@ fn add_merge_on_top(
     input: DistributionContext,
     fetch: &mut Option<usize>,
 ) -> DistributionContext {
-    // Add SortPreservingMerge only when partition count is larger than 1.
+    // Apply only when the partition count is larger than one.
     if input.plan.output_partitioning().partition_count() > 1 {
         // When there is an existing ordering, we preserve ordering
         // when decreasing partitions. This will be un-done in the future
         // if any of the following conditions is true
         // - Preserving ordering is not helpful in terms of satisfying ordering requirements
         // - Usage of order preserving variants is not desirable
-        // (determined by flag `config.optimizer.bounded_order_preserving_variants`)
-        let new_plan = if let Some(ordering) = input.plan.output_ordering() {
+        // (determined by flag `config.optimizer.prefer_existing_sort`)
+        let new_plan = if let Some(req) = input.plan.output_ordering() {
             Arc::new(
-                SortPreservingMergeExec::new(ordering.clone(), Arc::clone(&input.plan))
+                SortPreservingMergeExec::new(req.clone(), Arc::clone(&input.plan))
                     .with_fetch(fetch.take()),
             ) as _
         } else {
+            // If there is no input order, we can simply coalesce partitions:
             Arc::new(CoalescePartitionsExec::new(Arc::clone(&input.plan))) as _
         };
 
@@ -980,6 +981,7 @@ fn add_merge_on_top(
 /// ```text
 /// "DataSourceExec: file_groups={2 groups: \[\[x], \[y]]}, projection=\[a, b, c, d, e], output_ordering=\[a@0 ASC], file_type=parquet",
 /// ```
+#[allow(clippy::type_complexity)]
 fn remove_dist_changing_operators(
     mut distribution_context: DistributionContext,
 ) -> Result<(
@@ -1030,7 +1032,8 @@ fn remove_dist_changing_operators(
 /// "    RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2",
 /// "      DataSourceExec: file_groups={2 groups: \[\[x], \[y]]}, projection=\[a, b, c, d, e], output_ordering=\[a@0 ASC], file_type=parquet",
 /// ```
-fn replace_order_preserving_variants(
+#[allow(clippy::type_complexity)]
+pub fn replace_order_preserving_variants(
     mut context: DistributionContext,
     ordering_satisfied: bool,
 ) -> Result<(DistributionContext, Option<usize>)> {

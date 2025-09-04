@@ -22,6 +22,7 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_plan::execution_plan::{
     Boundedness, EmissionType, SchedulingType,
 };
@@ -324,15 +325,47 @@ impl ExecutionPlan for DataSourceExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        self.data_source.try_swapping_with_projection(projection)
+        match self.data_source.try_swapping_with_projection(projection)? {
+            Some(new_plan) => {
+                if let Some(new_data_source_exec) =
+                    new_plan.as_any().downcast_ref::<DataSourceExec>()
+                {
+                    let projection_mapping = ProjectionMapping::try_new(
+                        projection.expr().iter().cloned(),
+                        &self.schema(),
+                    )?;
+
+                    // Project the equivalence properties to the new schema
+                    let projected_eq_properties = self
+                        .cache
+                        .eq_properties
+                        .project(&projection_mapping, new_data_source_exec.schema());
+
+                    let preserved_exec = DataSourceExec {
+                        data_source: Arc::clone(&new_data_source_exec.data_source),
+                        cache: PlanProperties::new(
+                            projected_eq_properties,
+                            new_data_source_exec.cache.partitioning.clone(),
+                            new_data_source_exec.cache.emission_type,
+                            new_data_source_exec.cache.boundedness,
+                        )
+                        .with_scheduling_type(new_data_source_exec.cache.scheduling_type),
+                    };
+                    Ok(Some(Arc::new(preserved_exec)))
+                } else {
+                    Ok(Some(new_plan))
+                }
+            }
+            None => Ok(None),
+        }
     }
 
     fn with_node_id(
         self: Arc<Self>,
-        _node_id: usize,
+        node_id: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let mut new_plan = DataSourceExec::new(self.data_source.clone());
-        let new_props = new_plan.cache.clone().with_node_id(_node_id);
+        let mut new_plan = DataSourceExec::new(Arc::clone(&self.data_source));
+        let new_props = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
     }

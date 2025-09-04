@@ -209,7 +209,7 @@ impl ExecutionPlan for RecursiveQueryExec {
 
     fn with_node_id(
         self: Arc<Self>,
-        _node_id: usize,
+        node_id: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let mut new_plan = RecursiveQueryExec::try_new(
             self.name.clone(),
@@ -217,7 +217,7 @@ impl ExecutionPlan for RecursiveQueryExec {
             Arc::clone(&self.recursive_term),
             self.is_distinct,
         )?;
-        let new_props = new_plan.cache.clone().with_node_id(_node_id);
+        let new_props = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
     }
@@ -387,7 +387,7 @@ fn assign_work_table(
 }
 
 /// Some plans will change their internal states after execution, making them unable to be executed again.
-/// This function uses `ExecutionPlan::with_new_children` to fork a new plan with initial states.
+/// This function uses [`ExecutionPlan::reset_state`] to reset any internal state within the plan.
 ///
 /// An example is `CrossJoinExec`, which loads the left table into memory and stores it in the plan.
 /// However, if the data of the left table is derived from the work table, it will become outdated
@@ -398,8 +398,7 @@ fn reset_plan_states(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPl
         if plan.as_any().is::<WorkTableExec>() {
             Ok(Transformed::no(plan))
         } else {
-            let new_plan = Arc::clone(&plan)
-                .with_new_children(plan.children().into_iter().cloned().collect())?;
+            let new_plan = Arc::clone(&plan).reset_state()?;
             Ok(Transformed::yes(new_plan))
         }
     })

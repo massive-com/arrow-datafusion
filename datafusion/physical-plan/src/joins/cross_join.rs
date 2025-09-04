@@ -270,6 +270,18 @@ impl ExecutionPlan for CrossJoinExec {
         )))
     }
 
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        let new_exec = CrossJoinExec {
+            left: Arc::clone(&self.left),
+            right: Arc::clone(&self.right),
+            schema: Arc::clone(&self.schema),
+            left_fut: Default::default(), // reset the build side!
+            metrics: ExecutionPlanMetricsSet::default(),
+            cache: self.cache.clone(),
+        };
+        Ok(Arc::new(new_exec))
+    }
+
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![
             Distribution::SinglePartition,
@@ -350,11 +362,11 @@ impl ExecutionPlan for CrossJoinExec {
 
     fn with_node_id(
         self: Arc<Self>,
-        _node_id: usize,
+        node_id: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let mut new_plan =
             CrossJoinExec::new(Arc::clone(&self.left), Arc::clone(&self.right));
-        let new_props = new_plan.cache.clone().with_node_id(_node_id);
+        let new_props = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
     }

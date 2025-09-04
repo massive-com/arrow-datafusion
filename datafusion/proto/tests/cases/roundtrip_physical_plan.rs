@@ -32,6 +32,9 @@ use arrow::csv::WriterBuilder;
 use arrow::datatypes::{Fields, TimeUnit};
 use datafusion::physical_expr::aggregate::AggregateExprBuilder;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion::physical_plan::node_id::{
+    annotate_node_id_for_execution_plan, NodeIdAnnotator,
+};
 use datafusion_expr::dml::InsertOp;
 use datafusion_functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf;
 use datafusion_functions_aggregate::array_agg::array_agg_udaf;
@@ -134,13 +137,22 @@ fn roundtrip_test_and_return(
     ctx: &SessionContext,
     codec: &dyn PhysicalExtensionCodec,
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    let mut annotator = NodeIdAnnotator::new();
+    let exec_plan = annotate_node_id_for_execution_plan(&exec_plan, &mut annotator)?;
     let proto: protobuf::PhysicalPlanNode =
         protobuf::PhysicalPlanNode::try_from_physical_plan(exec_plan.clone(), codec)
             .expect("to proto");
     let runtime = ctx.runtime_env();
-    let result_exec_plan: Arc<dyn ExecutionPlan> = proto
+    let mut result_exec_plan: Arc<dyn ExecutionPlan> = proto
         .try_into_physical_plan(ctx, runtime.deref(), codec)
         .expect("from proto");
+
+    // Re-annotate the deserialized plan with node IDs to match the original plan structure
+    // This ensures that the roundtrip preserves the node_id values for comparison
+    let mut annotator = NodeIdAnnotator::new();
+    result_exec_plan =
+        annotate_node_id_for_execution_plan(&result_exec_plan, &mut annotator)?;
+
     assert_eq!(format!("{exec_plan:?}"), format!("{result_exec_plan:?}"));
     Ok(result_exec_plan)
 }
@@ -1837,5 +1849,38 @@ async fn test_round_trip_tpch_queries() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_tpch_part_in_list_query_with_real_parquet_data() -> Result<()> {
+    use datafusion_common::test_util::datafusion_test_data;
+
+    let ctx = SessionContext::new();
+
+    // Register the TPC-H part table using the local test data
+    let test_data = datafusion_test_data();
+    let table_sql = format!(
+    "CREATE EXTERNAL TABLE part STORED AS PARQUET LOCATION '{test_data}/tpch_part_small.parquet'"
+);
+    ctx.sql(&table_sql).await.map_err(|e| {
+        DataFusionError::External(format!("Failed to create part table: {e}").into())
+    })?;
+
+    // Test the exact problematic query
+    let sql =
+        "SELECT p_size FROM part WHERE p_size IN (14, 6, 5, 31) and p_partkey > 1000";
+
+    let logical_plan = ctx.sql(sql).await?.into_unoptimized_plan();
+    let optimized_plan = ctx.state().optimize(&logical_plan)?;
+    let physical_plan = ctx.state().create_physical_plan(&optimized_plan).await?;
+
+    // Serialize the physical plan - bug may happen here already but not necessarily manifests
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto = PhysicalPlanNode::try_from_physical_plan(physical_plan.clone(), &codec)?;
+
+    // This will fail with the bug, but should succeed when fixed
+    let _deserialized_plan =
+        proto.try_into_physical_plan(&ctx, ctx.runtime_env().as_ref(), &codec)?;
     Ok(())
 }
