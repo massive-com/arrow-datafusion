@@ -505,7 +505,8 @@ impl CsvFormat {
                             .unwrap_or_else(|| state.config_options().catalog.has_header),
                 )
                 .with_delimiter(self.options.delimiter)
-                .with_quote(self.options.quote);
+                .with_quote(self.options.quote)
+                .with_truncated_rows(self.options.truncated_rows.unwrap_or(false));
 
             if let Some(null_regex) = &self.options.null_regex {
                 let regex = Regex::new(null_regex.as_str())
