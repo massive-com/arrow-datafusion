@@ -1260,7 +1260,7 @@ mod tests {
                 assert!(!col4.is_null(0));
                 assert!(col4.is_null(1));
             }
-            other => panic!("expected RecordBatch but got {:?}", other),
+            other => panic!("expected RecordBatch but got {other:?}"),
         }
         Ok(())
     }
@@ -1306,8 +1306,7 @@ mod tests {
             assert!(
                 msg.contains("Encountered unequal lengths")
                     || msg.contains("incorrect number of fields"),
-                "unexpected error message: {}",
-                msg
+                "unexpected error message: {msg}",
             );
         }
 
