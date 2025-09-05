@@ -234,7 +234,6 @@ impl<'a> CsvReadOptions<'a> {
     /// By default this is set to false and will error if the CSV rows have different lengths
     /// When set to true then it will allow records with less than the expected number of columns and fill the missing columns with nulls.
     /// If the record’s schema is not nullable, then it will still return an error.
-    /// See https://docs.rs/arrow/latest/arrow/csv/struct.ReaderBuilder.html#method.with_allow_truncated_rows
     pub fn truncated_rows(mut self, truncated_rows: bool) -> Self {
         self.truncated_rows = truncated_rows;
         self
