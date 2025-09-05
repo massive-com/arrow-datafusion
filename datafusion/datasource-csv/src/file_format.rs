@@ -222,6 +222,11 @@ impl CsvFormat {
         self
     }
 
+    pub fn with_truncated_rows(mut self, truncated_rows: bool) -> Self {
+        self.options.truncated_rows = Some(truncated_rows);
+        self
+    }
+
     /// Set the regex to use for null values in the CSV reader.
     /// - default to treat empty values as null.
     pub fn with_null_regex(mut self, null_regex: Option<String>) -> Self {
@@ -422,11 +427,13 @@ impl FileFormat for CsvFormat {
             .with_file_compression_type(self.options.compression.into())
             .with_newlines_in_values(newlines_in_values);
 
+        let truncated_rows = self.options.truncated_rows.unwrap_or(false);
         let source = Arc::new(
             CsvSource::new(has_header, self.options.delimiter, self.options.quote)
                 .with_escape(self.options.escape)
                 .with_terminator(self.options.terminator)
-                .with_comment(self.options.comment),
+                .with_comment(self.options.comment)
+                .with_truncate_rows(truncated_rows),
         );
 
         let config = conf_builder.with_source(source).build();
