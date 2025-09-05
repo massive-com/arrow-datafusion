@@ -2286,6 +2286,7 @@ impl protobuf::PhysicalPlanNode {
                                 None
                             },
                             newlines_in_values: maybe_csv.newlines_in_values(),
+                            truncate_rows: csv_config.truncate_rows(),
                         },
                     )),
                 }));

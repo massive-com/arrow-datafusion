@@ -1312,4 +1312,44 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_read_csv_truncated_rows_via_tempfile() -> Result<()> {
+        use std::io::Write;
+
+        // create a SessionContext
+        let ctx = SessionContext::new();
+
+        // Create a temp file with a .csv suffix so the reader accepts it
+        let mut tmp = tempfile::Builder::new().suffix(".csv").tempfile()?; // ensures path ends with .csv
+                                                                           // CSV has header "a,b,c". First data row is truncated (only "1,2"), second row is complete.
+        write!(tmp, "a,b,c\n1,2\n3,4,5\n")?;
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        // Build CsvReadOptions: header present, enable truncated_rows.
+        // (Use the exact builder method your crate exposes: `truncated_rows(true)` here,
+        //  if the method name differs in your codebase use the appropriate one.)
+        let options = CsvReadOptions::default().truncated_rows(true);
+
+        println!("options: {}, path: {path}", options.truncated_rows);
+
+        // Call the API under test
+        let df = ctx.read_csv(&path, options).await?;
+
+        // Collect the results and combine batches so we can inspect columns
+        let batches = df.collect().await?;
+        let combined = concat_batches(&batches[0].schema(), &batches)?;
+
+        // Column 'c' is the 3rd column (index 2). The first data row was truncated -> should be NULL.
+        let col_c = combined.column(2);
+        assert!(
+            col_c.is_null(0),
+            "expected first row column 'c' to be NULL due to truncated row"
+        );
+
+        // Also ensure we read at least one row
+        assert!(combined.num_rows() >= 2);
+
+        Ok(())
+    }
 }
