@@ -296,6 +296,13 @@ impl CsvFormat {
         self
     }
 
+    /// Set whether rows should be truncated to the column width
+    /// - defaults to false
+    pub fn with_truncate_rows(mut self, truncate_rows: bool) -> Self {
+        self.options.truncated_rows = Some(truncate_rows);
+        self
+    }
+
     /// The delimiter character.
     pub fn delimiter(&self) -> u8 {
         self.options.delimiter
