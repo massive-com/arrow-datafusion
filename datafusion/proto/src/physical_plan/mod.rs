@@ -616,7 +616,6 @@ impl protobuf::PhysicalPlanNode {
                 )
             })?;
 
-
         let filter_selectivity = filter.default_filter_selectivity.try_into();
         let projection = if !filter.projection.is_empty() {
             Some(
@@ -629,7 +628,6 @@ impl protobuf::PhysicalPlanNode {
         } else {
             None
         };
-
 
         let filter =
             FilterExec::try_new(predicate, input)?.with_projection(projection)?;
