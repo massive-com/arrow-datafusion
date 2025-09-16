@@ -882,6 +882,26 @@ impl ExecutionPlan for HashJoinExec {
         }))
     }
 
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        // Reset the left_fut to allow re-execution
+        Ok(Arc::new(HashJoinExec {
+            left: Arc::clone(&self.left),
+            right: Arc::clone(&self.right),
+            on: self.on.clone(),
+            filter: self.filter.clone(),
+            join_type: self.join_type,
+            join_schema: Arc::clone(&self.join_schema),
+            left_fut: OnceAsync::default(),
+            random_state: self.random_state.clone(),
+            mode: self.mode,
+            metrics: ExecutionPlanMetricsSet::new(),
+            projection: self.projection.clone(),
+            column_indices: self.column_indices.clone(),
+            null_equality: self.null_equality,
+            cache: self.cache.clone(),
+        }))
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -1046,6 +1066,25 @@ impl ExecutionPlan for HashJoinExec {
         )?;
         // Project statistics if there is a projection
         Ok(stats.project(self.projection.as_ref()))
+    }
+
+    fn with_node_id(
+        self: Arc<Self>,
+        node_id: usize,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let mut new_plan = HashJoinExec::try_new(
+            Arc::clone(&self.left),
+            Arc::clone(&self.right),
+            self.on.clone(),
+            self.filter.clone(),
+            self.join_type(),
+            self.projection.clone(),
+            *self.partition_mode(),
+            self.null_equality,
+        )?;
+        let new_props = new_plan.cache.clone().with_node_id(node_id);
+        new_plan.cache = new_props;
+        Ok(Some(Arc::new(new_plan)))
     }
 
     /// Tries to push `projection` down through `hash_join`. If possible, performs the

@@ -2007,6 +2007,7 @@ impl<'de> serde::Deserialize<'de> for CsvOptions {
                             if truncated_rows__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("truncatedRows"));
                             }
+                            
                             truncated_rows__ =
                                 Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
                             ;

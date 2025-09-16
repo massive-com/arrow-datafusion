@@ -352,6 +352,16 @@ impl ExecutionPlan for ProjectionExec {
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Equal
     }
+    fn with_node_id(
+        self: Arc<Self>,
+        node_id: usize,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let mut new_plan =
+            ProjectionExec::try_new(self.expr.clone(), Arc::clone(self.input()))?;
+        let new_props = new_plan.cache.clone().with_node_id(node_id);
+        new_plan.cache = new_props;
+        Ok(Some(Arc::new(new_plan)))
+    }
 
     fn try_swapping_with_projection(
         &self,
