@@ -144,7 +144,7 @@ fn roundtrip_test_and_return(
         protobuf::PhysicalPlanNode::try_from_physical_plan(exec_plan.clone(), codec)
             .expect("to proto");
     let runtime = ctx.runtime_env();
-    let mut result_exec_plan: Arc<dyn ExecutionPlan> = proto
+    let result_exec_plan: Arc<dyn ExecutionPlan> = proto
         .try_into_physical_plan(ctx, runtime.deref(), codec)
         .expect("from proto");
 

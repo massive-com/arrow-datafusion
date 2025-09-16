@@ -945,7 +945,6 @@ fn add_hash_on_top(
 ///
 /// # Returns
 ///
-
 /// Updated node with an execution plan, where desired single
 /// distribution is satisfied by adding [`SortPreservingMergeExec`].
 fn add_merge_on_top(
