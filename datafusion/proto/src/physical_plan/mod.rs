@@ -616,6 +616,7 @@ impl protobuf::PhysicalPlanNode {
                 )
             })?;
 
+
         let filter_selectivity = filter.default_filter_selectivity.try_into();
         let projection = if !filter.projection.is_empty() {
             Some(
@@ -628,6 +629,7 @@ impl protobuf::PhysicalPlanNode {
         } else {
             None
         };
+
 
         let filter =
             FilterExec::try_new(predicate, input)?.with_projection(projection)?;
@@ -2619,6 +2621,7 @@ impl protobuf::PhysicalPlanNode {
                                 None
                             },
                             newlines_in_values: maybe_csv.newlines_in_values(),
+                            truncate_rows: csv_config.truncate_rows(),
                         },
                     )),
                 }));

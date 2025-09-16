@@ -165,7 +165,9 @@ async fn page_index_filter_one_col() {
 
     // 5.create filter date_string_col == "01/01/09"`;
     // Note this test doesn't apply type coercion so the literal must match the actual view type
-    let filter = col("date_string_col").eq(lit(ScalarValue::new_utf8view("01/01/09")));
+    // xudong: use new_utf8, because schema_force_view_types was changed to false now.
+    // qi: when schema_force_view_types setting to true, we should change back to utf8view
+    let filter = col("date_string_col").eq(lit(ScalarValue::new_utf8("01/01/09")));
     let batches = get_filter_results(&state, filter.clone(), false).await;
     assert_eq!(batches[0].num_rows(), 14);
 
