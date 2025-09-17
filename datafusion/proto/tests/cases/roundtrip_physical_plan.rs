@@ -144,9 +144,15 @@ fn roundtrip_test_and_return(
         protobuf::PhysicalPlanNode::try_from_physical_plan(exec_plan.clone(), codec)
             .expect("to proto");
     let runtime = ctx.runtime_env();
-    let result_exec_plan: Arc<dyn ExecutionPlan> = proto
+    let mut result_exec_plan: Arc<dyn ExecutionPlan> = proto
         .try_into_physical_plan(ctx, runtime.deref(), codec)
         .expect("from proto");
+
+    // Qi: workaround for NodeId not being serialized/deserialized,
+    // otherwise the assert_eq! below will fail
+    let mut annotator2 = NodeIdAnnotator::new();
+    result_exec_plan =
+        annotate_node_id_for_execution_plan(&result_exec_plan, &mut annotator2)?;
 
     pretty_assertions::assert_eq!(
         format!("{exec_plan:?}"),
