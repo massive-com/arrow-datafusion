@@ -419,6 +419,18 @@ impl ExecutionPlan for FilterExec {
         CardinalityEffect::LowerEqual
     }
 
+    fn with_node_id(
+        self: Arc<Self>,
+        node_id: usize,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let mut new_plan =
+            FilterExec::try_new(Arc::clone(&self.predicate), Arc::clone(self.input()))?
+                .with_projection(self.projection.clone())?;
+        let new_props = new_plan.cache.clone().with_node_id(node_id);
+        new_plan.cache = new_props;
+        Ok(Some(Arc::new(new_plan)))
+    }
+
     /// Tries to swap `projection` with its input (`filter`). If possible, performs
     /// the swap and returns [`FilterExec`] as the top plan. Otherwise, returns `None`.
     fn try_swapping_with_projection(

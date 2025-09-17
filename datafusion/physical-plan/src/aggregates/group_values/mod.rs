@@ -119,7 +119,7 @@ pub trait GroupValues: Send {
 ///   - If group by single column, and type of this column has
 ///     the specific [`GroupValues`] implementation, such implementation
 ///     will be chosen.
-///   
+///
 ///   - If group by multiple columns, and all column types have the specific
 ///     `GroupColumn` implementations, `GroupValuesColumn` will be chosen.
 ///

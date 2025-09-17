@@ -945,9 +945,12 @@ fn add_hash_on_top(
 ///
 /// # Returns
 ///
-/// Updated node with an execution plan, where the desired single distribution
-/// requirement is satisfied.
-fn add_merge_on_top(input: DistributionContext) -> DistributionContext {
+/// Updated node with an execution plan, where desired single
+/// distribution is satisfied by adding [`SortPreservingMergeExec`].
+fn add_merge_on_top(
+    input: DistributionContext,
+    fetch: &mut Option<usize>,
+) -> DistributionContext {
     // Apply only when the partition count is larger than one.
     if input.plan.output_partitioning().partition_count() > 1 {
         // When there is an existing ordering, we preserve ordering
@@ -957,10 +960,10 @@ fn add_merge_on_top(input: DistributionContext) -> DistributionContext {
         // - Usage of order preserving variants is not desirable
         // (determined by flag `config.optimizer.prefer_existing_sort`)
         let new_plan = if let Some(req) = input.plan.output_ordering() {
-            Arc::new(SortPreservingMergeExec::new(
-                req.clone(),
-                Arc::clone(&input.plan),
-            )) as _
+            Arc::new(
+                SortPreservingMergeExec::new(req.clone(), Arc::clone(&input.plan))
+                    .with_fetch(fetch.take()),
+            ) as _
         } else {
             // If there is no input order, we can simply coalesce partitions:
             Arc::new(CoalescePartitionsExec::new(Arc::clone(&input.plan))) as _
@@ -989,20 +992,37 @@ fn add_merge_on_top(input: DistributionContext) -> DistributionContext {
 /// ```text
 /// "DataSourceExec: file_groups={2 groups: \[\[x], \[y]]}, projection=\[a, b, c, d, e], output_ordering=\[a@0 ASC], file_type=parquet",
 /// ```
+#[allow(clippy::type_complexity)]
 fn remove_dist_changing_operators(
     mut distribution_context: DistributionContext,
-) -> Result<DistributionContext> {
+) -> Result<(
+    DistributionContext,
+    Option<usize>,
+    Option<Arc<dyn ExecutionPlan>>,
+)> {
+    let mut fetch = None;
+    let mut spm: Option<Arc<dyn ExecutionPlan>> = None;
     while is_repartition(&distribution_context.plan)
         || is_coalesce_partitions(&distribution_context.plan)
         || is_sort_preserving_merge(&distribution_context.plan)
     {
+        if is_sort_preserving_merge(&distribution_context.plan) {
+            if let Some(child_fetch) = distribution_context.plan.fetch() {
+                if fetch.is_none() {
+                    fetch = Some(child_fetch);
+                    spm = Some(distribution_context.plan);
+                } else {
+                    fetch = Some(fetch.unwrap().min(child_fetch));
+                }
+            }
+        }
         // All of above operators have a single child. First child is only child.
         // Remove any distribution changing operators at the beginning:
         distribution_context = distribution_context.children.swap_remove(0);
         // Note that they will be re-inserted later on if necessary or helpful.
     }
 
-    Ok(distribution_context)
+    Ok((distribution_context, fetch, spm))
 }
 
 /// Updates the [`DistributionContext`] if preserving ordering while changing partitioning is not helpful or desirable.
@@ -1023,27 +1043,36 @@ fn remove_dist_changing_operators(
 /// "    RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=2",
 /// "      DataSourceExec: file_groups={2 groups: \[\[x], \[y]]}, projection=\[a, b, c, d, e], output_ordering=\[a@0 ASC], file_type=parquet",
 /// ```
+#[allow(clippy::type_complexity)]
 pub fn replace_order_preserving_variants(
     mut context: DistributionContext,
-) -> Result<DistributionContext> {
-    context.children = context
-        .children
-        .into_iter()
-        .map(|child| {
-            if child.data {
-                replace_order_preserving_variants(child)
-            } else {
-                Ok(child)
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-
+    ordering_satisfied: bool,
+) -> Result<(DistributionContext, Option<usize>)> {
+    let mut children = vec![];
+    let mut fetch = None;
+    for child in context.children.into_iter() {
+        if child.data {
+            let (child, inner_fetch) =
+                replace_order_preserving_variants(child, ordering_satisfied)?;
+            children.push(child);
+            fetch = inner_fetch;
+        } else {
+            children.push(child);
+        }
+    }
+    context.children = children;
     if is_sort_preserving_merge(&context.plan) {
+        // Keep the fetch value of the SortPreservingMerge operator, maybe it will be used later.
+        let fetch = context.plan.fetch();
         let child_plan = Arc::clone(&context.children[0].plan);
-        context.plan = Arc::new(
-            CoalescePartitionsExec::new(child_plan).with_fetch(context.plan.fetch()),
-        );
-        return Ok(context);
+        if !ordering_satisfied {
+            // It's safe to unwrap because `CoalescePartitionsExec` supports `fetch`.
+            context.plan =
+                Arc::new(CoalescePartitionsExec::new(child_plan).with_fetch(fetch));
+            return Ok((context, None));
+        }
+        context.plan = Arc::new(CoalescePartitionsExec::new(child_plan));
+        return Ok((context, fetch));
     } else if let Some(repartition) =
         context.plan.as_any().downcast_ref::<RepartitionExec>()
     {
@@ -1052,11 +1081,11 @@ pub fn replace_order_preserving_variants(
                 Arc::clone(&context.children[0].plan),
                 repartition.partitioning().clone(),
             )?);
-            return Ok(context);
+            return Ok((context, None));
         }
     }
 
-    context.update_plan_from_children()
+    Ok((context.update_plan_from_children()?, fetch))
 }
 
 /// A struct to keep track of repartition requirements for each child node.
@@ -1198,11 +1227,15 @@ pub fn ensure_distribution(
         unbounded_and_pipeline_friendly || config.optimizer.prefer_existing_sort;
 
     // Remove unnecessary repartition from the physical plan if any
-    let DistributionContext {
-        mut plan,
-        data,
-        children,
-    } = remove_dist_changing_operators(dist_context)?;
+    let (
+        DistributionContext {
+            mut plan,
+            data,
+            children,
+        },
+        mut fetch,
+        spm,
+    ) = remove_dist_changing_operators(dist_context)?;
 
     if let Some(exec) = plan.as_any().downcast_ref::<WindowAggExec>() {
         if let Some(updated_window) = get_best_fitting_window(
@@ -1235,43 +1268,39 @@ pub fn ensure_distribution(
         plan.maintains_input_order(),
         repartition_status_flags.into_iter()
     )
-    .map(
-        |(
-            mut child,
-            required_input_ordering,
-            maintains,
-            RepartitionRequirementStatus {
-                requirement,
-                roundrobin_beneficial,
-                roundrobin_beneficial_stats,
-                hash_necessary,
-            },
-        )| {
-            let add_roundrobin = enable_round_robin
-                // Operator benefits from partitioning (e.g. filter):
-                && roundrobin_beneficial
-                && roundrobin_beneficial_stats
-                // Unless partitioning increases the partition count, it is not beneficial:
-                && child.plan.output_partitioning().partition_count() < target_partitions;
+        .map(
+            |(
+                 mut child,
+                 required_input_ordering,
+                 maintains,
+                 RepartitionRequirementStatus {
+                     requirement,
+                     roundrobin_beneficial,
+                     roundrobin_beneficial_stats,
+                     hash_necessary,
+                 },
+             )| {
+                let add_roundrobin = enable_round_robin
+                    // Operator benefits from partitioning (e.g. filter):
+                    && roundrobin_beneficial
+                    && roundrobin_beneficial_stats
+                    // Unless partitioning increases the partition count, it is not beneficial:
+                    && child.plan.output_partitioning().partition_count() < target_partitions;
 
-            // When `repartition_file_scans` is set, attempt to increase
-            // parallelism at the source.
-            //
-            // If repartitioning is not possible (a.k.a. None is returned from `ExecutionPlan::repartitioned`)
-            // then no repartitioning will have occurred. As the default implementation returns None, it is only
-            // specific physical plan nodes, such as certain datasources, which are repartitioned.
-            if repartition_file_scans && roundrobin_beneficial_stats {
-                if let Some(new_child) =
-                    child.plan.repartitioned(target_partitions, config)?
-                {
-                    child.plan = new_child;
+                // When `repartition_file_scans` is set, attempt to increase
+                // parallelism at the source.
+                if repartition_file_scans && roundrobin_beneficial_stats {
+                    if let Some(new_child) =
+                        child.plan.repartitioned(target_partitions, config)?
+                    {
+                        child.plan = new_child;
+                    }
                 }
-            }
 
             // Satisfy the distribution requirement if it is unmet.
             match &requirement {
                 Distribution::SinglePartition => {
-                    child = add_merge_on_top(child);
+                    child = add_merge_on_top(child, &mut fetch);
                 }
                 Distribution::HashPartitioned(exprs) => {
                     if add_roundrobin {
@@ -1308,7 +1337,8 @@ pub fn ensure_distribution(
                 if (!ordering_satisfied || !order_preserving_variants_desirable)
                     && child.data
                 {
-                    child = replace_order_preserving_variants(child)?;
+                    let (replaced_child, fetch)  = replace_order_preserving_variants(child, ordering_satisfied)?;
+                    child = replaced_child;
                     // If ordering requirements were satisfied before repartitioning,
                     // make sure ordering requirements are still satisfied after.
                     if ordering_satisfied {
@@ -1316,10 +1346,7 @@ pub fn ensure_distribution(
                         child = add_sort_above_with_check(
                             child,
                             sort_req,
-                            plan.as_any()
-                                .downcast_ref::<OutputRequirementExec>()
-                                .map(|output| output.fetch())
-                                .unwrap_or(None),
+                            fetch,
                         )?;
                     }
                 }
@@ -1331,20 +1358,22 @@ pub fn ensure_distribution(
                     // Operator requires specific distribution.
                     Distribution::SinglePartition | Distribution::HashPartitioned(_) => {
                         // Since there is no ordering requirement, preserving ordering is pointless
-                        child = replace_order_preserving_variants(child)?;
+                        child = replace_order_preserving_variants(child, false)?.0;
                     }
                     Distribution::UnspecifiedDistribution => {
                         // Since ordering is lost, trying to preserve ordering is pointless
                         if !maintains || plan.as_any().is::<OutputRequirementExec>() {
-                            child = replace_order_preserving_variants(child)?;
+                            child = replace_order_preserving_variants(child,false)?.0;
                         }
+
                     }
-                }
+                };
             }
+
             Ok(child)
-        },
-    )
-    .collect::<Result<Vec<_>>>()?;
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
 
     let children_plans = children
         .iter()
@@ -1383,9 +1412,20 @@ pub fn ensure_distribution(
         plan.with_new_children(children_plans)?
     };
 
-    Ok(Transformed::yes(DistributionContext::new(
-        plan, data, children,
-    )))
+    let mut optimized_distribution_ctx =
+        DistributionContext::new(Arc::clone(&plan), data, children);
+
+    // If `fetch` was not consumed, it means that there was `SortPreservingMergeExec` with fetch before
+    // It was removed by `remove_dist_changing_operators`
+    // and we need to add it back.
+    if fetch.is_some() {
+        // It's safe to unwrap because `spm` is set only if `fetch` is set.
+        let plan = spm.unwrap().with_fetch(fetch.take()).unwrap();
+        optimized_distribution_ctx =
+            DistributionContext::new(plan, data, vec![optimized_distribution_ctx]);
+    }
+
+    Ok(Transformed::yes(optimized_distribution_ctx))
 }
 
 /// Keeps track of distribution changing operators (like `RepartitionExec`,
