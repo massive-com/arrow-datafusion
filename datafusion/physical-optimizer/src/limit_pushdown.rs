@@ -29,6 +29,8 @@ use datafusion_common::tree_node::{Transformed, TreeNodeRecursion};
 use datafusion_common::utils::combine_limit;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
+use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 /// This rule inspects [`ExecutionPlan`]'s and pushes down the fetch limit from
@@ -135,6 +137,19 @@ pub fn pushdown_limit_helper(
 ) -> Result<(Transformed<Arc<dyn ExecutionPlan>>, GlobalRequirements)> {
     // Extract limit, if exist, and return child inputs.
     if let Some(limit_exec) = extract_limit(&pushdown_plan) {
+        if let Some(projection) =
+            limit_exec.input().as_any().downcast_ref::<ProjectionExec>()
+        {
+            // If `PlaceholderRowExec`, it's possible that the projection is from aggregate_statistics,
+            // So to be conservative, we should not push down the limit.
+            // Like this:
+            // LimitExec(fetch=1)
+            //    ProjectionExec(expr=[10 as count(*)])
+            //       PlaceholderRowExec
+            if projection.input().as_any().is::<PlaceholderRowExec>() {
+                return Ok((Transformed::no(pushdown_plan), global_state));
+            }
+        }
         // If we have fetch/skip info in the global state already, we need to
         // decide which one to continue with:
         let (skip, fetch) = combine_limit(
