@@ -100,7 +100,7 @@ use async_trait::async_trait;
 use datafusion_physical_plan::async_func::{AsyncFuncExec, AsyncMapper};
 use futures::{StreamExt, TryStreamExt};
 use itertools::{multiunzip, Itertools};
-use log::{debug, trace};
+use log::debug;
 use tokio::sync::Mutex;
 
 /// Physical query planner that converts a `LogicalPlan` to an
