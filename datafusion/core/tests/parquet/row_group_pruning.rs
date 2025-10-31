@@ -18,8 +18,12 @@
 //! This file contains an end to end test of parquet pruning. It writes
 //! data into a parquet file and then verifies row groups are pruned as
 //! expected.
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, Int32Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::SessionConfig;
-use datafusion_common::ScalarValue;
+use datafusion_common::{DataFusionError, ScalarValue};
 use itertools::Itertools;
 
 use crate::parquet::Unit::RowGroup;
@@ -34,6 +38,7 @@ struct RowGroupPruningTest {
     expected_files_pruned_by_statistics: Option<usize>,
     expected_row_group_matched_by_bloom_filter: Option<usize>,
     expected_row_group_pruned_by_bloom_filter: Option<usize>,
+    expected_limit_pruned_row_groups: Option<usize>,
     expected_rows: usize,
 }
 impl RowGroupPruningTest {
@@ -48,6 +53,7 @@ impl RowGroupPruningTest {
             expected_files_pruned_by_statistics: None,
             expected_row_group_matched_by_bloom_filter: None,
             expected_row_group_pruned_by_bloom_filter: None,
+            expected_limit_pruned_row_groups: None,
             expected_rows: 0,
         }
     }
@@ -99,6 +105,11 @@ impl RowGroupPruningTest {
         self
     }
 
+    fn with_limit_pruned_row_groups(mut self, pruned_by_limit: Option<usize>) -> Self {
+        self.expected_limit_pruned_row_groups = pruned_by_limit;
+        self
+    }
+
     /// Set the number of expected rows from the output of this test
     fn with_expected_rows(mut self, rows: usize) -> Self {
         self.expected_rows = rows;
@@ -142,6 +153,73 @@ impl RowGroupPruningTest {
             output.row_groups_pruned_bloom_filter(),
             self.expected_row_group_pruned_by_bloom_filter,
             "mismatched row_groups_pruned_bloom_filter",
+        );
+        assert_eq!(
+            output.limit_pruned_row_groups(),
+            self.expected_limit_pruned_row_groups,
+            "mismatched limit_pruned_row_groups",
+        );
+        assert_eq!(
+            output.result_rows,
+            self.expected_rows,
+            "Expected {} rows, got {}: {}",
+            output.result_rows,
+            self.expected_rows,
+            output.description(),
+        );
+    }
+
+    // Execute the test with the current configuration
+    async fn test_row_group_prune_with_custom_data(
+        self,
+        schema: Arc<Schema>,
+        batches: Vec<RecordBatch>,
+    ) {
+        let output = ContextWithParquet::with_custom_data(
+            self.scenario,
+            RowGroup(2),
+            schema,
+            batches,
+        )
+        .await
+        .query(&self.query)
+        .await;
+
+        println!("{}", output.description());
+        assert_eq!(
+            output.predicate_evaluation_errors(),
+            self.expected_errors,
+            "mismatched predicate_evaluation error"
+        );
+        assert_eq!(
+            output.row_groups_matched_statistics(),
+            self.expected_row_group_matched_by_statistics,
+            "mismatched row_groups_matched_statistics",
+        );
+        assert_eq!(
+            output.row_groups_pruned_statistics(),
+            self.expected_row_group_pruned_by_statistics,
+            "mismatched row_groups_pruned_statistics",
+        );
+        assert_eq!(
+            output.files_ranges_pruned_statistics(),
+            self.expected_files_pruned_by_statistics,
+            "mismatched files_ranges_pruned_statistics",
+        );
+        assert_eq!(
+            output.row_groups_matched_bloom_filter(),
+            self.expected_row_group_matched_by_bloom_filter,
+            "mismatched row_groups_matched_bloom_filter",
+        );
+        assert_eq!(
+            output.row_groups_pruned_bloom_filter(),
+            self.expected_row_group_pruned_by_bloom_filter,
+            "mismatched row_groups_pruned_bloom_filter",
+        );
+        assert_eq!(
+            output.limit_pruned_row_groups(),
+            self.expected_limit_pruned_row_groups,
+            "mismatched limit_pruned_row_groups",
         );
         assert_eq!(
             output.result_rows,
@@ -287,11 +365,16 @@ async fn prune_disabled() {
     let expected_rows = 10;
     let config = SessionConfig::new().with_parquet_pruning(false);
 
-    let output =
-        ContextWithParquet::with_config(Scenario::Timestamps, RowGroup(5), config)
-            .await
-            .query(query)
-            .await;
+    let output = ContextWithParquet::with_config(
+        Scenario::Timestamps,
+        RowGroup(5),
+        config,
+        None,
+        None,
+    )
+    .await
+    .query(query)
+    .await;
     println!("{}", output.description());
 
     // This should not prune any
@@ -1633,4 +1716,57 @@ async fn test_bloom_filter_decimal_dict() {
         .with_matched_by_bloom_filter(Some(0))
         .test_row_group_prune()
         .await;
+}
+
+// Helper function to create a batch with a single Int32 column.
+fn make_i32_batch(
+    name: &str,
+    values: Vec<i32>,
+) -> datafusion_common::error::Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
+    let array: ArrayRef = Arc::new(Int32Array::from(values));
+    RecordBatch::try_new(schema, vec![array]).map_err(DataFusionError::from)
+}
+
+#[tokio::test]
+async fn test_limit_pruning() -> datafusion_common::error::Result<()> {
+    // Scenario: Simple integer column, multiple row groups
+    // Query: SELECT c1 FROM  t WHERE c1 > 0 LIMIT 2
+    // We expect 2 rows in total.
+
+    // Row Group 0: c1 = [1, 2] -> Fully matched, 2 rows
+    // Row Group 1: c1 = [3, 4] -> Fully matched, 2 rows
+    // Row Group 2: c1 = [5, 6] -> Fully matched, 2 rows
+    // Row Group 3: c1 = [-1, 0] -> Pruned by statistics, 0 rows
+
+    // If limit = 2, and RG0 is fully matched and has 2 rows, we should
+    // only scan RG0 and prune other row groups (RG1, RG2, RG3)
+    // RG3 is pruned by statistics. RG1 and RG2 are pruned by limit.
+    // So 3 row groups are effectively pruned due to limit pruning.
+
+    let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
+    let query = "explain verbose SELECT c1 FROM t WHERE c1 > 0 LIMIT 2";
+
+    let batches = vec![
+        make_i32_batch("c1", vec![1, 2])?, // RG0: Fully matched, 2 rows
+        make_i32_batch("c1", vec![3, 4])?, // RG1: Fully matched, 2 rows
+        make_i32_batch("c1", vec![5, 6])?, // RG2: Fully matched, 2 rows
+        make_i32_batch("c1", vec![-1, 0])?, // RG3: Pruned by statistics, 0 rows
+    ];
+
+    RowGroupPruningTest::new()
+        .with_scenario(Scenario::Int) // Assuming Scenario::Int can handle this data
+        .with_query(query)
+        .with_expected_errors(Some(0))
+        .with_expected_rows(2)
+        .with_pruned_files(Some(0))
+        .with_matched_by_bloom_filter(Some(0))
+        .with_pruned_by_bloom_filter(Some(0))
+        .with_matched_by_stats(Some(3)) // RG0, RG1, RG2 are matched by stats (c1 > 0)
+        .with_pruned_by_stats(Some(1)) // RG3 is pruned by stats (c1 = [-1, 0] does not satisfy c1 > 0)
+        // .with_limit_pruned_row_groups(Some(2)) // RG1, RG2 are pruned by limit. (RG3 is already pruned by stats)
+        .test_row_group_prune_with_custom_data(schema, batches)
+        .await;
+
+    Ok(())
 }
