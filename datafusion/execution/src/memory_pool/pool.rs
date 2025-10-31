@@ -34,9 +34,7 @@ pub struct UnboundedMemoryPool {
 }
 
 impl MemoryPool for UnboundedMemoryPool {
-    fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
-        self.used.fetch_add(additional, Ordering::Relaxed);
-    }
+    fn grow(&self, _reservation: &MemoryReservation, additional: usize) {}
 
     fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
         self.used.fetch_sub(shrink, Ordering::Relaxed);
