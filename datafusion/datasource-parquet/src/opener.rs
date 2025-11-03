@@ -384,13 +384,28 @@ impl FileOpener for ParquetOpener {
             // with that range can be skipped as well
             if enable_page_index && !access_plan.is_empty() {
                 if let Some(p) = page_pruning_predicate {
-                    access_plan = p.prune_plan_with_page_index(
-                        access_plan,
-                        &physical_file_schema,
-                        builder.parquet_schema(),
-                        file_metadata.as_ref(),
-                        &file_metrics,
-                    );
+                    // Todo: only collect page_match_infos if limit is specified
+                    let (new_access_plan, page_match_infos) = p
+                        .prune_plan_with_page_index(
+                            access_plan,
+                            &physical_file_schema,
+                            builder.parquet_schema(),
+                            file_metadata.as_ref(),
+                            &file_metrics,
+                        );
+
+                    access_plan = new_access_plan;
+
+                    // Apply page-level limit pruning if limit is specified
+                    if let Some(limit) = limit {
+                        access_plan = p.prune_by_limit(
+                            access_plan,
+                            limit,
+                            &page_match_infos,
+                            rg_metadata,
+                            &file_metrics,
+                        );
+                    }
                 }
             }
 

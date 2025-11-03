@@ -17,7 +17,7 @@
 
 //! Contains code to filter entire pages
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::metrics::ParquetFileMetrics;
@@ -30,6 +30,7 @@ use arrow::{
 };
 use datafusion_common::pruning::PruningStatistics;
 use datafusion_common::ScalarValue;
+use datafusion_physical_expr::expressions::NotExpr;
 use datafusion_physical_expr::{split_conjunction, PhysicalExpr};
 use datafusion_pruning::PruningPredicate;
 
@@ -114,6 +115,11 @@ pub struct PagePruningAccessPlanFilter {
     /// single column predicates (e.g. (`col = 5`) extracted from the overall
     /// predicate. Must all be true for a row to be included in the result.
     predicates: Vec<PruningPredicate>,
+    /// For each row group, tracks which pages are fully matched (all rows satisfy predicates)
+    /// Key: row group index, Value: Vec of booleans (one per page)
+    fully_matched_pages: HashMap<usize, Vec<bool>>,
+    /// For each row group, stores the row counts per page
+    page_row_counts: HashMap<usize, Vec<usize>>,
 }
 
 impl PagePruningAccessPlanFilter {
@@ -148,11 +154,16 @@ impl PagePruningAccessPlanFilter {
                 Some(pp)
             })
             .collect::<Vec<_>>();
-        Self { predicates }
+        Self {
+            predicates,
+            fully_matched_pages: HashMap::new(),
+            page_row_counts: HashMap::new(),
+        }
     }
 
     /// Returns an updated [`ParquetAccessPlan`] by applying predicates to the
     /// parquet page index, if any
+    /// This also identifies "fully matched" pages where all rows satisfy the predicates.
     pub fn prune_plan_with_page_index(
         &self,
         mut access_plan: ParquetAccessPlan,
@@ -160,18 +171,19 @@ impl PagePruningAccessPlanFilter {
         parquet_schema: &SchemaDescriptor,
         parquet_metadata: &ParquetMetaData,
         file_metrics: &ParquetFileMetrics,
-    ) -> ParquetAccessPlan {
+    ) -> (ParquetAccessPlan, HashMap<usize, PageMatchInfo>) {
         // scoped timer updates on drop
         let _timer_guard = file_metrics.page_index_eval_time.timer();
+        let mut page_match_infos = HashMap::new();
         if self.predicates.is_empty() {
-            return access_plan;
+            return (access_plan, page_match_infos);
         }
 
         let page_index_predicates = &self.predicates;
         let groups = parquet_metadata.row_groups();
 
         if groups.is_empty() {
-            return access_plan;
+            return (access_plan, page_match_infos);
         }
 
         if parquet_metadata.offset_index().is_none()
@@ -181,7 +193,7 @@ impl PagePruningAccessPlanFilter {
                     "Can not prune pages due to lack of indexes. Have offset: {}, column index: {}",
                     parquet_metadata.offset_index().is_some(), parquet_metadata.column_index().is_some()
                 );
-            return access_plan;
+            return (access_plan, page_match_infos);
         };
 
         // track the total number of rows that should be skipped
@@ -194,6 +206,9 @@ impl PagePruningAccessPlanFilter {
         for row_group_index in row_group_indexes {
             // The selection for this particular row group
             let mut overall_selection = None;
+            let mut page_match_info: Option<Vec<bool>> = None;
+            let mut page_row_counts_info: Option<Vec<usize>> = None;
+
             for predicate in page_index_predicates {
                 let column = predicate
                     .required_columns()
@@ -217,13 +232,15 @@ impl PagePruningAccessPlanFilter {
                     }
                 };
 
-                let selection = prune_pages_in_one_row_group(
+                let page_pruning_stats = PagesPruningStatistics::try_new(
                     row_group_index,
-                    predicate,
                     converter,
                     parquet_metadata,
-                    file_metrics,
-                );
+                )
+                .unwrap();
+
+                let (selection, page_matches, page_row_counts) = page_pruning_stats
+                    .prune_pages_in_one_row_group(predicate, file_metrics);
 
                 let Some(selection) = selection else {
                     trace!("No pages pruned in prune_pages_in_one_row_group");
@@ -237,6 +254,25 @@ impl PagePruningAccessPlanFilter {
 
                 overall_selection = update_selection(overall_selection, selection);
 
+                if page_row_counts_info.is_none() {
+                    page_row_counts_info = page_row_counts;
+                }
+
+                // Update page match info (intersection of all predicates)
+                if let Some(matches) = page_matches {
+                    page_match_info = Some(match page_match_info {
+                        None => matches,
+                        Some(existing) => {
+                            // Intersection: a page is fully matched only if it's fully matched for ALL predicates
+                            existing
+                                .into_iter()
+                                .zip(matches.into_iter())
+                                .map(|(a, b)| a && b)
+                                .collect()
+                        }
+                    });
+                }
+
                 // if the overall selection has ruled out all rows, no need to
                 // continue with the other predicates
                 let selects_any = overall_selection
@@ -247,6 +283,18 @@ impl PagePruningAccessPlanFilter {
                 if !selects_any {
                     break;
                 }
+            }
+
+            if let (Some(fully_matched), Some(page_counts)) =
+                (page_match_info, page_row_counts_info)
+            {
+                page_match_infos.insert(
+                    row_group_index,
+                    PageMatchInfo {
+                        fully_matched,
+                        page_row_counts: page_counts,
+                    },
+                );
             }
 
             if let Some(overall_selection) = overall_selection {
@@ -272,6 +320,96 @@ impl PagePruningAccessPlanFilter {
 
         file_metrics.page_index_rows_pruned.add(total_skip);
         file_metrics.page_index_rows_matched.add(total_select);
+        (access_plan, page_match_infos)
+    }
+
+    /// Prune the access plan based on a limit, using fully matched pages.
+    ///
+    /// If we have enough fully matched pages to satisfy the limit, we can skip
+    /// scanning other pages entirely, reducing I/O.
+    ///
+    /// A "fully matched" page is one where ALL rows satisfy the predicates.
+    pub fn prune_by_limit(
+        &self,
+        access_plan: ParquetAccessPlan,
+        limit: usize,
+        page_match_infos: &HashMap<usize, PageMatchInfo>,
+        rg_metadata: &[RowGroupMetaData],
+        file_metrics: &ParquetFileMetrics,
+    ) -> ParquetAccessPlan {
+        if self.fully_matched_pages.is_empty() {
+            return access_plan;
+        }
+
+        // Collect information about fully matched pages across all row groups
+        // (row_group_index, fully_matched_page_indices, matched_row_count_in_rg)
+        let mut fully_matched_info: Vec<(usize, Vec<usize>, usize)> = Vec::new();
+        let mut total_fully_matched_rows = 0;
+
+        for &rg_idx in access_plan.row_group_indexes().iter() {
+            if let Some(match_info) = page_match_infos.get(&rg_idx) {
+                let mut fully_matched_page_indices = Vec::new();
+                let mut row_count_in_rg = 0;
+
+                for (page_idx, &is_fully_matched) in
+                    match_info.fully_matched.iter().enumerate()
+                {
+                    if is_fully_matched {
+                        fully_matched_page_indices.push(page_idx);
+                        row_count_in_rg += match_info.page_row_counts[page_idx];
+                    }
+                }
+
+                if !fully_matched_page_indices.is_empty() {
+                    total_fully_matched_rows += row_count_in_rg;
+                    fully_matched_info.push((
+                        rg_idx,
+                        fully_matched_page_indices,
+                        row_count_in_rg,
+                    ));
+
+                    if total_fully_matched_rows >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // If we have enough fully matched rows to satisfy the limit, create a new access plan
+        if total_fully_matched_rows >= limit {
+            debug!("Page limit pruning: found {total_fully_matched_rows} fully matched rows >= limit {limit}");
+
+            let mut new_access_plan = ParquetAccessPlan::new_none(rg_metadata.len());
+            let mut rows_selected = 0;
+
+            for (rg_idx, page_indices, row_count) in fully_matched_info {
+                if rows_selected >= limit {
+                    break;
+                }
+
+                // Build a RowSelection for this row group that includes only the fully matched pages
+                let page_row_counts = self.page_row_counts.get(&rg_idx).unwrap();
+                let row_selection = build_row_selection_for_pages(
+                    &page_indices,
+                    &page_row_counts,
+                    limit - rows_selected,
+                );
+
+                new_access_plan.scan_selection(rg_idx, row_selection);
+                rows_selected += std::cmp::min(row_count, limit - rows_selected);
+            }
+
+            let original_row_groups = access_plan.row_group_indexes().len();
+            let new_row_groups = new_access_plan.row_group_indexes().len();
+            let pruned_row_groups = original_row_groups.saturating_sub(new_row_groups);
+
+            if pruned_row_groups > 0 {
+                file_metrics.limit_pruned_row_groups.add(pruned_row_groups);
+            }
+
+            return new_access_plan;
+        }
+
         access_plan
     }
 
@@ -279,6 +417,14 @@ impl PagePruningAccessPlanFilter {
     pub fn filter_number(&self) -> usize {
         self.predicates.len()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct PageMatchInfo {
+    /// Which pages are fully matched (all rows satisfy predicates)
+    pub fully_matched: Vec<bool>,
+    /// Row counts for each page
+    pub page_row_counts: Vec<usize>,
 }
 
 fn update_selection(
@@ -291,72 +437,99 @@ fn update_selection(
     }
 }
 
-/// Returns a [`RowSelection`] for the rows in this row group to scan.
+/// Builds a [`RowSelection`] that selects specific pages up to a row limit.
 ///
-/// This Row Selection is formed from the page index and the predicate skips row
-/// ranges that can be ruled out based on the predicate.
+/// This function constructs a row selection plan that tells the Parquet reader
+/// which rows to read and which to skip, based on fully matched pages and a limit.
 ///
-/// Returns `None` if there is an error evaluating the predicate or the required
-/// page information is not present.
-fn prune_pages_in_one_row_group(
-    row_group_index: usize,
-    pruning_predicate: &PruningPredicate,
-    converter: StatisticsConverter<'_>,
-    parquet_metadata: &ParquetMetaData,
-    metrics: &ParquetFileMetrics,
-) -> Option<RowSelection> {
-    let pruning_stats =
-        PagesPruningStatistics::try_new(row_group_index, converter, parquet_metadata)?;
+/// # Arguments
+///
+/// * `page_indices` - Indices of pages to select.
+///                    These are the pages identified as "fully matched" where all
+///                    rows satisfy the predicate.
+/// * `page_row_counts` - Number of rows in each page of the row group.
+///                       The index corresponds to the page number.
+/// * `limit` - Maximum number of rows to select across all pages.
+///
+/// # Returns
+///
+/// A [`RowSelection`] containing a sequence of [`RowSelector`]s that specify
+/// which rows to select and which to skip.
+///
+/// # How It Works
+///
+/// The function iterates through all pages in order and generates selectors:
+/// - `RowSelector::skip(n)` - Skip n rows (for non-selected pages or rows beyond limit)
+/// - `RowSelector::select(n)` - Select n rows (for selected pages within limit)
+///
+/// # Example
+///
+/// ```text
+/// page_row_counts = [100, 150, 200, 120, 80]  // 5 pages with these row counts
+/// page_indices = [1, 3]                       // Select pages 1 and 3
+/// limit = 1000                                // Large enough to not constrain
+///
+/// Result:
+/// [
+///   skip(100),     // Skip page 0 (100 rows)
+///   select(150),   // Select page 1 (150 rows)
+///   skip(200),     // Skip page 2 (200 rows)
+///   select(120),   // Select page 3 (120 rows)
+///   skip(80)       // Skip page 4 (80 rows)
+/// ]
+/// Total selected: 150 + 120 = 270 rows
+/// ```
+fn build_row_selection_for_pages(
+    page_indices: &[usize],
+    page_row_counts: &[usize],
+    limit: usize,
+) -> RowSelection {
+    let mut selectors = Vec::new();
+    let mut current_row = 0;
+    let mut rows_selected = 0;
+    let mut page_idx_iter = page_indices.iter().peekable();
 
-    // Each element in values is a boolean indicating whether the page may have
-    // values that match the predicate (true) or could not possibly have values
-    // that match the predicate (false).
-    let values = match pruning_predicate.prune(&pruning_stats) {
-        Ok(values) => values,
-        Err(e) => {
-            debug!("Error evaluating page index predicate values {e}");
-            metrics.predicate_evaluation_errors.add(1);
-            return None;
-        }
-    };
+    for (page_num, &page_row_count) in page_row_counts.iter().enumerate() {
+        if let Some(&&next_page_idx) = page_idx_iter.peek() {
+            if page_num == next_page_idx {
+                // This page should be selected
+                page_idx_iter.next();
 
-    // Convert the information of which pages to skip into a RowSelection
-    // that describes the ranges of rows to skip.
-    let Some(page_row_counts) = pruning_stats.page_row_counts() else {
-        debug!(
-            "Can not determine page row counts for row group {row_group_index}, skipping"
-        );
-        metrics.predicate_evaluation_errors.add(1);
-        return None;
-    };
+                // Add skip selector for any rows before this page
+                if current_row > 0 {
+                    selectors.push(RowSelector::skip(current_row));
+                    current_row = 0;
+                }
 
-    let mut vec = Vec::with_capacity(values.len());
-    assert_eq!(page_row_counts.len(), values.len());
-    let mut sum_row = *page_row_counts.first().unwrap();
-    let mut selected = *values.first().unwrap();
-    trace!("Pruned to {values:?} using {pruning_stats:?}");
-    for (i, &f) in values.iter().enumerate().skip(1) {
-        if f == selected {
-            sum_row += *page_row_counts.get(i).unwrap();
-        } else {
-            let selector = if selected {
-                RowSelector::select(sum_row)
+                // Determine how many rows to select from this page
+                let rows_to_select = std::cmp::min(page_row_count, limit - rows_selected);
+                selectors.push(RowSelector::select(rows_to_select));
+                rows_selected += rows_to_select;
+
+                // If we have a partial page selection, add skip for the rest
+                if rows_to_select < page_row_count {
+                    current_row = page_row_count - rows_to_select;
+                }
+
+                if rows_selected >= limit {
+                    break;
+                }
             } else {
-                RowSelector::skip(sum_row)
-            };
-            vec.push(selector);
-            sum_row = *page_row_counts.get(i).unwrap();
-            selected = f;
+                // This page should be skipped
+                current_row += page_row_count;
+            }
+        } else {
+            // No more pages to select, skip the rest
+            current_row += page_row_count;
         }
     }
 
-    let selector = if selected {
-        RowSelector::select(sum_row)
-    } else {
-        RowSelector::skip(sum_row)
-    };
-    vec.push(selector);
-    Some(RowSelection::from(vec))
+    // Add final skip if needed
+    if current_row > 0 {
+        selectors.push(RowSelector::skip(current_row));
+    }
+
+    RowSelection::from(selectors)
 }
 
 /// Implement [`PruningStatistics`] for one column's PageIndex (column_index + offset_index)
@@ -438,6 +611,133 @@ impl<'a> PagesPruningStatistics<'a> {
         vec.push(num_rows_in_row_group - page_offsets.last()?.first_row_index as usize);
         Some(vec)
     }
+
+    /// Identifies which pages are fully matched (all rows satisfy the predicate)
+    ///
+    /// A page is fully matched if:
+    /// 1. The normal predicate doesn't prune it (it may have matching rows)
+    /// 2. The inverted predicate prunes it (no rows satisfy NOT predicate, so all rows satisfy predicate)
+    fn identify_fully_matched_pages(
+        &self,
+        pruning_predicate: &PruningPredicate,
+        partial_matches: &[bool],
+        metrics: &ParquetFileMetrics,
+    ) -> Option<Vec<bool>> {
+        if !partial_matches.iter().any(|&matched| matched) {
+            return Some(vec![false; partial_matches.len()]);
+        }
+
+        // Create inverted predicate
+        let inverted_expr = Arc::new(NotExpr::new(pruning_predicate.orig_expr().clone()));
+        let inverted_predicate = match PruningPredicate::try_new(
+            inverted_expr,
+            pruning_predicate.schema().clone(),
+        ) {
+            Ok(pred) => pred,
+            Err(e) => {
+                debug!("Could not create inverted predicate for page pruning: {e}");
+                return None;
+            }
+        };
+
+        // We can only evaluate the inverted predicate for pages that possibly match
+        // But can't directly leverage PruningPredicate
+        let inverted_values = match inverted_predicate.prune(self) {
+            Ok(values) => values,
+            Err(e) => {
+                debug!("Error evaluating inverted page predicate: {e}");
+                metrics.predicate_evaluation_errors.add(1);
+                return None;
+            }
+        };
+
+        // A page is fully matched if:
+        // - The normal predicate says it may have matches (partial_matches[i] == true)
+        // - The inverted predicate says it has NO matches (inverted_values[i] == false)
+        // This means all rows in the page satisfy the original predicate
+        let fully_matched: Vec<bool> = partial_matches
+            .iter()
+            .zip(inverted_values.iter())
+            .map(|(&partial, &inverted)| partial && !inverted)
+            .collect();
+
+        Some(fully_matched)
+    }
+
+    /// Returns a [`RowSelection`] and page match information for the rows in this row group to scan.
+    ///
+    /// The returned tuple contains:
+    /// - Option<RowSelection>: The row selection to apply
+    /// - Option<Vec<bool>>: For each page, whether it's fully matched (all rows satisfy predicate)
+    ///
+    /// A page is considered "fully matched" if the inverted predicate prunes it out,
+    /// meaning all rows in that page satisfy the original predicate.
+    fn prune_pages_in_one_row_group(
+        &self,
+        pruning_predicate: &PruningPredicate,
+        metrics: &ParquetFileMetrics,
+    ) -> (Option<RowSelection>, Option<Vec<bool>>, Option<Vec<usize>>) {
+        // Each element in values is a boolean indicating whether the page may have
+        // values that match the predicate (true) or could not possibly have values
+        // that match the predicate (false).
+        let values = match pruning_predicate.prune(self) {
+            Ok(values) => values,
+            Err(e) => {
+                debug!("Error evaluating page index predicate values {e}");
+                metrics.predicate_evaluation_errors.add(1);
+                return (None, None, None);
+            }
+        };
+
+        // Convert the information of which pages to skip into a RowSelection
+        // that describes the ranges of rows to skip.
+        // Todo: we can avoid call `page_row_counts` for each predicate
+        let Some(page_row_counts) = self.page_row_counts() else {
+            debug!(
+                "Can not determine page row counts for row group {}, skipping",
+                self.row_group_index
+            );
+            metrics.predicate_evaluation_errors.add(1);
+            return (None, None, None);
+        };
+
+        let mut vec = Vec::with_capacity(values.len());
+        assert_eq!(page_row_counts.len(), values.len());
+        let mut sum_row = *page_row_counts.first().unwrap();
+        let mut selected = *values.first().unwrap();
+        trace!("Pruned to {values:?} using {self:?}");
+        for (i, &f) in values.iter().enumerate().skip(1) {
+            if f == selected {
+                sum_row += *page_row_counts.get(i).unwrap();
+            } else {
+                let selector = if selected {
+                    RowSelector::select(sum_row)
+                } else {
+                    RowSelector::skip(sum_row)
+                };
+                vec.push(selector);
+                sum_row = *page_row_counts.get(i).unwrap();
+                selected = f;
+            }
+        }
+
+        let selector = if selected {
+            RowSelector::select(sum_row)
+        } else {
+            RowSelector::skip(sum_row)
+        };
+        vec.push(selector);
+
+        // Now identify fully matched pages using inverted predicate
+        let fully_matched_pages =
+            self.identify_fully_matched_pages(pruning_predicate, &values, metrics);
+
+        (
+            Some(RowSelection::from(vec)),
+            fully_matched_pages,
+            Some(page_row_counts),
+        )
+    }
 }
 impl PruningStatistics for PagesPruningStatistics<'_> {
     fn min_values(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
@@ -506,5 +806,90 @@ impl PruningStatistics for PagesPruningStatistics<'_> {
         _values: &HashSet<ScalarValue>,
     ) -> Option<BooleanArray> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+    /// Helper function to convert RowSelection to a vector of (selector_type, row_count) tuples
+    /// for easier assertion in tests
+    fn row_selection_to_vec(selection: &RowSelection) -> Vec<(bool, usize)> {
+        let selectors: Vec<RowSelector> = selection.clone().into();
+        selectors
+            .into_iter()
+            .map(|selector| {
+                let is_select = selector.skip == false;
+                (is_select, selector.row_count)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_build_row_selection_select_all_pages_no_limit() {
+        // Select all pages when limit is large enough
+        let page_indices = vec![0, 1, 2, 3, 4];
+        let page_row_counts = vec![100, 150, 200, 120, 80];
+        let limit = 1000;
+
+        let selection =
+            build_row_selection_for_pages(&page_indices, &page_row_counts, limit);
+        let result = row_selection_to_vec(&selection);
+
+        // Should select all rows from all pages
+        assert_eq!(result, vec![(true, 650)]);
+    }
+
+    #[test]
+    fn test_build_row_selection_select_partial_pages() {
+        // Select only pages 1 and 3
+        let page_indices = vec![1, 3];
+        let page_row_counts = vec![100, 150, 200, 120, 80];
+        let limit = 1000;
+
+        let selection =
+            build_row_selection_for_pages(&page_indices, &page_row_counts, limit);
+        let result = row_selection_to_vec(&selection);
+
+        assert_eq!(
+            result,
+            vec![
+                (false, 100), // skip page 0 (100 rows)
+                (true, 150),  // select page 1 (150 rows)
+                (false, 200), // skip page 2 (200 rows)
+                (true, 120),  // select page 3 (120 rows)
+                (false, 80),  // skip page 4 (80 rows)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_row_selection_with_limit_partial_page() {
+        // Limit causes partial selection of the last page
+        let page_indices = vec![0, 1];
+        let page_row_counts = vec![100, 150, 200];
+        let limit = 200;
+
+        let selection =
+            build_row_selection_for_pages(&page_indices, &page_row_counts, limit);
+        let result = row_selection_to_vec(&selection);
+
+        assert_eq!(result, vec![(true, 200), (false, 50)]);
+    }
+
+    #[test]
+    fn test_build_row_selection_with_limit_stops_early() {
+        // Limit is reached before all selected pages are processed
+        let page_indices = vec![1, 2, 4];
+        let page_row_counts = vec![50, 100, 80, 120, 60];
+        let limit = 150;
+
+        let selection =
+            build_row_selection_for_pages(&page_indices, &page_row_counts, limit);
+        let result = row_selection_to_vec(&selection);
+
+        assert_eq!(result, vec![(false, 50), (true, 150), (false, 30),]);
     }
 }
