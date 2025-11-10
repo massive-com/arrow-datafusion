@@ -183,7 +183,8 @@ impl RowGroupAccessPlanFilter {
         match predicate.prune(&pruning_stats) {
             Ok(values) => {
                 let mut new_access_plan = ParquetAccessPlan::new_all(groups.len());
-                let mut fully_contained_candidates_original_idx: Vec<usize> = Vec::new();
+                let mut fully_contained_candidates_original_idxes: Vec<usize> =
+                    Vec::new();
 
                 for (idx_in_pruning_stats_result, &pruning_result) in
                     values.iter().enumerate()
@@ -194,13 +195,13 @@ impl RowGroupAccessPlanFilter {
                         new_access_plan.skip(original_row_group_idx);
                         metrics.row_groups_pruned_statistics.add(1);
                     } else {
-                        fully_contained_candidates_original_idx
+                        fully_contained_candidates_original_idxes
                             .push(original_row_group_idx);
                         metrics.row_groups_matched_statistics.add(1);
                     }
                 }
 
-                if !fully_contained_candidates_original_idx.is_empty() {
+                if !fully_contained_candidates_original_idxes.is_empty() {
                     // Use NotExpr to create the inverted predicate
                     let inverted_expr =
                         Arc::new(NotExpr::new(predicate.orig_expr().clone()));
@@ -210,18 +211,20 @@ impl RowGroupAccessPlanFilter {
                     ) {
                         let inverted_pruning_stats = RowGroupPruningStatistics {
                             parquet_schema,
-                            row_group_metadatas: fully_contained_candidates_original_idx
-                                .iter()
-                                .map(|&i| &groups[i])
-                                .collect::<Vec<_>>(),
+                            row_group_metadatas:
+                                fully_contained_candidates_original_idxes
+                                    .iter()
+                                    .map(|&i| &groups[i])
+                                    .collect::<Vec<_>>(),
                             arrow_schema,
                         };
-
                         if let Ok(inverted_values) =
                             inverted_predicate.prune(&inverted_pruning_stats)
                         {
                             for (i, &original_row_group_idx) in
-                                fully_contained_candidates_original_idx.iter().enumerate()
+                                fully_contained_candidates_original_idxes
+                                    .iter()
+                                    .enumerate()
                             {
                                 // If the inverted predicate *also* prunes this row group (meaning inverted_values[i] is false),
                                 // it implies that *all* rows in this group satisfy the original predicate.

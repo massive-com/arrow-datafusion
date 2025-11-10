@@ -174,10 +174,11 @@ impl RowGroupPruningTest {
         self,
         schema: Arc<Schema>,
         batches: Vec<RecordBatch>,
+        max_row_per_row_group: usize,
     ) {
         let output = ContextWithParquet::with_custom_data(
             self.scenario,
-            RowGroup(2),
+            RowGroup(max_row_per_row_group),
             schema,
             batches,
         )
@@ -1745,7 +1746,7 @@ async fn test_limit_pruning() -> datafusion_common::error::Result<()> {
     // So 3 row groups are effectively pruned due to limit pruning.
 
     let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
-    let query = "explain verbose SELECT c1 FROM t WHERE c1 > 0 LIMIT 2";
+    let query = "SELECT c1 FROM t WHERE c1 > 0 LIMIT 2";
 
     let batches = vec![
         make_i32_batch("c1", vec![1, 2])?, // RG0: Fully matched, 2 rows
@@ -1764,8 +1765,8 @@ async fn test_limit_pruning() -> datafusion_common::error::Result<()> {
         .with_pruned_by_bloom_filter(Some(0))
         .with_matched_by_stats(Some(3)) // RG0, RG1, RG2 are matched by stats (c1 > 0)
         .with_pruned_by_stats(Some(1)) // RG3 is pruned by stats (c1 = [-1, 0] does not satisfy c1 > 0)
-        // .with_limit_pruned_row_groups(Some(2)) // RG1, RG2 are pruned by limit. (RG3 is already pruned by stats)
-        .test_row_group_prune_with_custom_data(schema, batches)
+        .with_limit_pruned_row_groups(Some(2)) // RG1, RG2 are pruned by limit. (RG3 is already pruned by stats)
+        .test_row_group_prune_with_custom_data(schema, batches, 2)
         .await;
 
     Ok(())

@@ -37,6 +37,7 @@ use datafusion::{
     prelude::{ParquetReadOptions, SessionConfig, SessionContext},
 };
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion_physical_plan::execute_stream;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use std::sync::Arc;
@@ -225,6 +226,7 @@ impl ContextWithParquet {
     ) -> Self {
         // Use a single partition for deterministic results no matter how many CPUs the host has
         config = config.with_target_partitions(1);
+        config.options_mut().execution.parquet.pushdown_filters = true;
         let file = match unit {
             Unit::RowGroup(row_per_group) => {
                 config = config.with_parquet_bloom_filter_pruning(true);
@@ -307,6 +309,15 @@ impl ContextWithParquet {
             .create_physical_plan(&logical_plan)
             .await
             .expect("creating physical plan");
+
+        /*
+        use arrow::util::pretty::print_batches;
+        use futures::TryStreamExt;
+        let res =
+            execute_stream(physical_plan.clone(), self.ctx.task_ctx().clone()).unwrap();
+        let batches = res.try_collect::<Vec<_>>().await.unwrap();
+        print_batches(&batches).unwrap();
+        */
 
         let task_ctx = state.task_ctx();
         let results = datafusion::physical_plan::collect(physical_plan.clone(), task_ctx)
