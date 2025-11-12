@@ -115,11 +115,6 @@ pub struct PagePruningAccessPlanFilter {
     /// single column predicates (e.g. (`col = 5`) extracted from the overall
     /// predicate. Must all be true for a row to be included in the result.
     predicates: Vec<PruningPredicate>,
-    /// For each row group, tracks which pages are fully matched (all rows satisfy predicates)
-    /// Key: row group index, Value: Vec of booleans (one per page)
-    fully_matched_pages: HashMap<usize, Vec<bool>>,
-    /// For each row group, stores the row counts per page
-    page_row_counts: HashMap<usize, Vec<usize>>,
 }
 
 impl PagePruningAccessPlanFilter {
@@ -154,11 +149,7 @@ impl PagePruningAccessPlanFilter {
                 Some(pp)
             })
             .collect::<Vec<_>>();
-        Self {
-            predicates,
-            fully_matched_pages: HashMap::new(),
-            page_row_counts: HashMap::new(),
-        }
+        Self { predicates }
     }
 
     /// Returns an updated [`ParquetAccessPlan`] by applying predicates to the
@@ -337,7 +328,7 @@ impl PagePruningAccessPlanFilter {
         rg_metadata: &[RowGroupMetaData],
         file_metrics: &ParquetFileMetrics,
     ) -> ParquetAccessPlan {
-        if self.fully_matched_pages.is_empty() {
+        if page_match_infos.is_empty() {
             return access_plan;
         }
 
@@ -388,15 +379,16 @@ impl PagePruningAccessPlanFilter {
                 }
 
                 // Build a RowSelection for this row group that includes only the fully matched pages
-                let page_row_counts = self.page_row_counts.get(&rg_idx).unwrap();
-                let row_selection = build_row_selection_for_pages(
-                    &page_indices,
-                    &page_row_counts,
-                    limit - rows_selected,
-                );
-
-                new_access_plan.scan_selection(rg_idx, row_selection);
-                rows_selected += std::cmp::min(row_count, limit - rows_selected);
+                if let Some(page_match_info) = page_match_infos.get(&rg_idx) {
+                    let row_selection = build_row_selection_for_pages(
+                        &page_indices,
+                        &page_match_info.page_row_counts,
+                        limit - rows_selected,
+                    );
+                    new_access_plan.scan(rg_idx);
+                    new_access_plan.scan_selection(rg_idx, row_selection);
+                    rows_selected += std::cmp::min(row_count, limit - rows_selected);
+                }
             }
 
             let original_row_groups = access_plan.row_group_indexes().len();
@@ -406,7 +398,7 @@ impl PagePruningAccessPlanFilter {
             if pruned_row_groups > 0 {
                 file_metrics.limit_pruned_row_groups.add(pruned_row_groups);
             }
-
+            file_metrics.limit_pruning_matched_rows.add(rows_selected);
             return new_access_plan;
         }
 
@@ -490,7 +482,10 @@ fn build_row_selection_for_pages(
     let mut page_idx_iter = page_indices.iter().peekable();
 
     for (page_num, &page_row_count) in page_row_counts.iter().enumerate() {
-        if let Some(&&next_page_idx) = page_idx_iter.peek() {
+        if rows_selected >= limit {
+            // Once we've reached the limit, skip all remaining pages
+            current_row += page_row_count;
+        } else if let Some(&&next_page_idx) = page_idx_iter.peek() {
             if page_num == next_page_idx {
                 // This page should be selected
                 page_idx_iter.next();
@@ -509,10 +504,6 @@ fn build_row_selection_for_pages(
                 // If we have a partial page selection, add skip for the rest
                 if rows_to_select < page_row_count {
                     current_row = page_row_count - rows_to_select;
-                }
-
-                if rows_selected >= limit {
-                    break;
                 }
             } else {
                 // This page should be skipped
@@ -876,7 +867,7 @@ mod tests {
             build_row_selection_for_pages(&page_indices, &page_row_counts, limit);
         let result = row_selection_to_vec(&selection);
 
-        assert_eq!(result, vec![(true, 200), (false, 50)]);
+        assert_eq!(result, vec![(true, 200), (false, 250)]);
     }
 
     #[test]
@@ -890,6 +881,6 @@ mod tests {
             build_row_selection_for_pages(&page_indices, &page_row_counts, limit);
         let result = row_selection_to_vec(&selection);
 
-        assert_eq!(result, vec![(false, 50), (true, 150), (false, 30),]);
+        assert_eq!(result, vec![(false, 50), (true, 150), (false, 210),]);
     }
 }

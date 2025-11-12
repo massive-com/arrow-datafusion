@@ -395,7 +395,6 @@ impl FileOpener for ParquetOpener {
                         );
 
                     access_plan = new_access_plan;
-
                     // Apply page-level limit pruning if limit is specified
                     if let Some(limit) = limit {
                         access_plan = p.prune_by_limit(
@@ -411,7 +410,7 @@ impl FileOpener for ParquetOpener {
 
             let row_group_indexes = access_plan.row_group_indexes();
             if let Some(row_selection) =
-                access_plan.into_overall_row_selection(rg_metadata)?
+                access_plan.into_overall_row_selection(rg_metadata).unwrap()
             {
                 builder = builder.with_row_selection(row_selection);
             }

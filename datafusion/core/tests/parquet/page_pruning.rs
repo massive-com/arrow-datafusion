@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use crate::parquet::utils::MetricsFinder;
 use crate::parquet::Unit::Page;
 use crate::parquet::{ContextWithParquet, Scenario};
 
@@ -45,6 +46,7 @@ async fn get_parquet_exec(
     state: &SessionState,
     filter: Expr,
     pushdown_filters: bool,
+    limit: Option<usize>,
 ) -> DataSourceExec {
     let object_store_url = ObjectStoreUrl::local_filesystem();
     let store = state.runtime_env().object_store(&object_store_url).unwrap();
@@ -88,6 +90,7 @@ async fn get_parquet_exec(
     );
     let base_config = FileScanConfigBuilder::new(object_store_url, schema, source)
         .with_file(partitioned_file)
+        .with_limit(limit)
         .build();
 
     DataSourceExec::new(Arc::new(base_config))
@@ -98,7 +101,7 @@ async fn get_filter_results(
     filter: Expr,
     pushdown_filters: bool,
 ) -> Vec<RecordBatch> {
-    let parquet_exec = get_parquet_exec(state, filter, pushdown_filters).await;
+    let parquet_exec = get_parquet_exec(state, filter, pushdown_filters, None).await;
     let task_ctx = state.task_ctx();
     let mut results = parquet_exec.execute(0, task_ctx.clone()).unwrap();
     let mut batches = Vec::new();
@@ -106,6 +109,29 @@ async fn get_filter_results(
         batches.push(batch);
     }
     batches
+}
+
+#[tokio::test]
+async fn limit_pruning_filter_one_col() {
+    let session_ctx = SessionContext::new();
+    let state = session_ctx.state();
+    let filter = col("month").eq(lit(1_i32));
+
+    let parquet_exec = get_parquet_exec(&state, filter, false, Some(10)).await;
+    let task_ctx = state.task_ctx();
+    let mut results = parquet_exec.execute(0, task_ctx).unwrap();
+    let mut limited_rows = 0;
+    while let Some(Ok(batch)) = results.next().await {
+        limited_rows += batch.num_rows();
+    }
+
+    assert_eq!(limited_rows, 10);
+    let metrics = MetricsFinder::find_metrics(&parquet_exec).unwrap();
+    if let Some(matched_rows) =
+        cast_count_metric(metrics.sum_by_name("limit_pruning_matched_rows").unwrap())
+    {
+        assert_eq!(matched_rows, 10);
+    }
 }
 
 #[tokio::test]
