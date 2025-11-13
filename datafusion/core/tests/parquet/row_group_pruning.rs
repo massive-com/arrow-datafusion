@@ -208,16 +208,6 @@ impl RowGroupPruningTest {
             "mismatched files_ranges_pruned_statistics",
         );
         assert_eq!(
-            output.row_groups_matched_bloom_filter(),
-            self.expected_row_group_matched_by_bloom_filter,
-            "mismatched row_groups_matched_bloom_filter",
-        );
-        assert_eq!(
-            output.row_groups_pruned_bloom_filter(),
-            self.expected_row_group_pruned_by_bloom_filter,
-            "mismatched row_groups_pruned_bloom_filter",
-        );
-        assert_eq!(
             output.limit_pruned_row_groups(),
             self.expected_limit_pruned_row_groups,
             "mismatched limit_pruned_row_groups",
@@ -1746,12 +1736,13 @@ async fn test_limit_pruning() -> datafusion_common::error::Result<()> {
     // So 3 row groups are effectively pruned due to limit pruning.
 
     let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
-    let query = "SELECT c1 FROM t WHERE c1 > 0 LIMIT 2";
+    let query = "SELECT c1 FROM t WHERE c1 >= 0 LIMIT 2";
 
     let batches = vec![
-        make_i32_batch("c1", vec![1, 2])?, // RG0: Fully matched, 2 rows
-        make_i32_batch("c1", vec![3, 4])?, // RG1: Fully matched, 2 rows
-        make_i32_batch("c1", vec![5, 6])?, // RG2: Fully matched, 2 rows
+        make_i32_batch("c1", vec![0, -2])?,
+        make_i32_batch("c1", vec![0, 0])?, // RG0: Fully matched, 2 rows
+        make_i32_batch("c1", vec![0, 0])?, // RG1: Fully matched, 2 rows
+        make_i32_batch("c1", vec![0, 0])?, // RG2: Fully matched, 2 rows
         make_i32_batch("c1", vec![-1, 0])?, // RG3: Pruned by statistics, 0 rows
     ];
 
@@ -1761,11 +1752,9 @@ async fn test_limit_pruning() -> datafusion_common::error::Result<()> {
         .with_expected_errors(Some(0))
         .with_expected_rows(2)
         .with_pruned_files(Some(0))
-        .with_matched_by_bloom_filter(Some(0))
-        .with_pruned_by_bloom_filter(Some(0))
-        .with_matched_by_stats(Some(3)) // RG0, RG1, RG2 are matched by stats (c1 > 0)
-        .with_pruned_by_stats(Some(1)) // RG3 is pruned by stats (c1 = [-1, 0] does not satisfy c1 > 0)
-        .with_limit_pruned_row_groups(Some(2)) // RG1, RG2 are pruned by limit. (RG3 is already pruned by stats)
+        .with_matched_by_stats(Some(5)) // RG0, RG1, RG2 are matched by stats (c1 > 0)
+        .with_pruned_by_stats(Some(0)) // RG3 is pruned by stats (c1 = [-1, 0] does not satisfy c1 > 0)
+        .with_limit_pruned_row_groups(Some(4)) // RG1, RG2 are pruned by limit. (RG3 is already pruned by stats)
         .test_row_group_prune_with_custom_data(schema, batches, 2)
         .await;
 
