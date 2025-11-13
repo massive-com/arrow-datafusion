@@ -25,6 +25,7 @@ use datafusion_common::pruning::PruningStatistics;
 use datafusion_common::{Column, Result, ScalarValue};
 use datafusion_datasource::FileRange;
 use datafusion_physical_expr::expressions::NotExpr;
+use datafusion_physical_expr::PhysicalExprSimplifier;
 use datafusion_pruning::PruningPredicate;
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::parquet_column;
@@ -204,6 +205,10 @@ impl RowGroupAccessPlanFilter {
                     // Use NotExpr to create the inverted predicate
                     let inverted_expr =
                         Arc::new(NotExpr::new(predicate.orig_expr().clone()));
+                    // Simplify the NOT expression (e.g., NOT(c1 = 0) -> c1 != 0)
+                    // before building the pruning predicate
+                    let mut simplifier = PhysicalExprSimplifier::new(arrow_schema);
+                    let inverted_expr = simplifier.simplify(inverted_expr).unwrap();
                     if let Ok(inverted_predicate) = PruningPredicate::try_new(
                         inverted_expr,
                         predicate.schema().clone(),
