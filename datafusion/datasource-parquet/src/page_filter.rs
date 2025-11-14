@@ -623,6 +623,7 @@ impl<'a> PagesPruningStatistics<'a> {
         // before building the pruning predicate
         let mut simplifier = PhysicalExprSimplifier::new(pruning_predicate.schema());
         let inverted_expr = simplifier.simplify(inverted_expr).unwrap();
+        dbg!(inverted_expr.clone().to_string());
         let inverted_predicate = match PruningPredicate::try_new(
             inverted_expr,
             pruning_predicate.schema().clone(),
@@ -644,6 +645,8 @@ impl<'a> PagesPruningStatistics<'a> {
                 return None;
             }
         };
+
+        dbg!(inverted_values.clone());
 
         // A page is fully matched if:
         // - The normal predicate says it may have matches (partial_matches[i] == true)
