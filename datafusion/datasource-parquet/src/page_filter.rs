@@ -31,7 +31,7 @@ use arrow::{
 use datafusion_common::pruning::PruningStatistics;
 use datafusion_common::ScalarValue;
 use datafusion_physical_expr::expressions::NotExpr;
-use datafusion_physical_expr::{split_conjunction, PhysicalExpr};
+use datafusion_physical_expr::{split_conjunction, PhysicalExpr, PhysicalExprSimplifier};
 use datafusion_pruning::PruningPredicate;
 
 use log::{debug, trace};
@@ -325,7 +325,6 @@ impl PagePruningAccessPlanFilter {
         access_plan: ParquetAccessPlan,
         limit: usize,
         page_match_infos: &HashMap<usize, PageMatchInfo>,
-        rg_metadata: &[RowGroupMetaData],
         file_metrics: &ParquetFileMetrics,
     ) -> ParquetAccessPlan {
         if page_match_infos.is_empty() {
@@ -370,7 +369,7 @@ impl PagePruningAccessPlanFilter {
         if total_fully_matched_rows >= limit {
             debug!("Page limit pruning: found {total_fully_matched_rows} fully matched rows >= limit {limit}");
 
-            let mut new_access_plan = ParquetAccessPlan::new_none(rg_metadata.len());
+            let mut new_access_plan = ParquetAccessPlan::new_none(access_plan.len());
             let mut rows_selected = 0;
 
             for (rg_idx, page_indices, row_count) in fully_matched_info {
@@ -620,6 +619,10 @@ impl<'a> PagesPruningStatistics<'a> {
 
         // Create inverted predicate
         let inverted_expr = Arc::new(NotExpr::new(pruning_predicate.orig_expr().clone()));
+        // Simplify the NOT expression (e.g., NOT(c1 = 0) -> c1 != 0)
+        // before building the pruning predicate
+        let mut simplifier = PhysicalExprSimplifier::new(pruning_predicate.schema());
+        let inverted_expr = simplifier.simplify(inverted_expr).unwrap();
         let inverted_predicate = match PruningPredicate::try_new(
             inverted_expr,
             pruning_predicate.schema().clone(),

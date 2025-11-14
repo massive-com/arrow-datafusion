@@ -401,7 +401,6 @@ impl FileOpener for ParquetOpener {
                             access_plan,
                             limit,
                             &page_match_infos,
-                            rg_metadata,
                             &file_metrics,
                         );
                     }
