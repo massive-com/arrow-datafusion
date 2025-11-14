@@ -174,10 +174,11 @@ impl RowGroupPruningTest {
         self,
         schema: Arc<Schema>,
         batches: Vec<RecordBatch>,
+        max_row_per_group: usize,
     ) {
         let output = ContextWithParquet::with_custom_data(
             self.scenario,
-            RowGroup(2),
+            RowGroup(max_row_per_group),
             schema,
             batches,
         )
@@ -1721,28 +1722,29 @@ fn make_i32_batch(
 #[tokio::test]
 async fn test_limit_pruning() -> datafusion_common::error::Result<()> {
     // Scenario: Simple integer column, multiple row groups
-    // Query: SELECT c1 FROM  t WHERE c1 > 0 LIMIT 2
+    // Query: SELECT c1 FROM  t WHERE c1 = 0 LIMIT 2
     // We expect 2 rows in total.
 
-    // Row Group 0: c1 = [1, 2] -> Fully matched, 2 rows
-    // Row Group 1: c1 = [3, 4] -> Fully matched, 2 rows
-    // Row Group 2: c1 = [5, 6] -> Fully matched, 2 rows
-    // Row Group 3: c1 = [-1, 0] -> Pruned by statistics, 0 rows
+    // Row Group 0: c1 = [0, -2] -> Partially matched, 1 row
+    // Row Group 1: c1 = [1, 2] -> Fully matched, 2 rows
+    // Row Group 2: c1 = [3, 4] -> Fully matched, 2 rows
+    // Row Group 3: c1 = [5, 6] -> Fully matched, 2 rows
+    // Row Group 4: c1 = [-1, -2] -> Not matched
 
-    // If limit = 2, and RG0 is fully matched and has 2 rows, we should
-    // only scan RG0 and prune other row groups (RG1, RG2, RG3)
-    // RG3 is pruned by statistics. RG1 and RG2 are pruned by limit.
-    // So 3 row groups are effectively pruned due to limit pruning.
+    // If limit = 2, and RG1 is fully matched and has 2 rows, we should
+    // only scan RG1 and prune other row groups
+    // RG4 is pruned by statistics. RG2 and RG3 are pruned by limit.
+    // So 2 row groups are effectively pruned due to limit pruning.
 
     let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
-    let query = "explain verbose SELECT c1 FROM t WHERE c1 > 0 LIMIT 2";
+    let query = "SELECT c1 FROM t WHERE c1 >= 0 LIMIT 2";
 
     let batches = vec![
         make_i32_batch("c1", vec![0, -2])?,
-        make_i32_batch("c1", vec![0, 0])?, // RG0: Fully matched, 2 rows
-        make_i32_batch("c1", vec![0, 0])?, // RG1: Fully matched, 2 rows
-        make_i32_batch("c1", vec![0, 0])?, // RG2: Fully matched, 2 rows
-        make_i32_batch("c1", vec![-1, 0])?, // RG3: Pruned by statistics, 0 rows
+        make_i32_batch("c1", vec![0, 0])?,
+        make_i32_batch("c1", vec![0, 0])?,
+        make_i32_batch("c1", vec![0, 0])?,
+        make_i32_batch("c1", vec![-1, -2])?,
     ];
 
     RowGroupPruningTest::new()
@@ -1751,9 +1753,9 @@ async fn test_limit_pruning() -> datafusion_common::error::Result<()> {
         .with_expected_errors(Some(0))
         .with_expected_rows(2)
         .with_pruned_files(Some(0))
-        .with_matched_by_stats(Some(5)) // RG0, RG1, RG2 are matched by stats (c1 > 0)
-        .with_pruned_by_stats(Some(0)) // RG3 is pruned by stats (c1 = [-1, 0] does not satisfy c1 > 0)
-        .with_limit_pruned_row_groups(Some(4)) // RG1, RG2 are pruned by limit. (RG3 is already pruned by stats)
+        .with_matched_by_stats(Some(4))
+        .with_pruned_by_stats(Some(1)) 
+        .with_limit_pruned_row_groups(Some(2))
         .test_row_group_prune_with_custom_data(schema, batches, 2)
         .await;
 
