@@ -1761,3 +1761,183 @@ async fn test_limit_pruning() -> datafusion_common::error::Result<()> {
 
     Ok(())
 }
+
+// Helper function to create a batch with two Int32 columns
+fn make_two_col_i32_batch(
+    name_a: &str,
+    name_b: &str,
+    values_a: Vec<i32>,
+    values_b: Vec<i32>,
+) -> datafusion_common::error::Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(name_a, DataType::Int32, false),
+        Field::new(name_b, DataType::Int32, false),
+    ]));
+    let array_a: ArrayRef = Arc::new(Int32Array::from(values_a));
+    let array_b: ArrayRef = Arc::new(Int32Array::from(values_b));
+    RecordBatch::try_new(schema, vec![array_a, array_b]).map_err(DataFusionError::from)
+}
+
+#[tokio::test]
+async fn test_limit_pruning_complex_filter() -> datafusion_common::error::Result<()> {
+    // Test Case 1: Complex filter with two columns (a = 1 AND b > 1 AND b < 4)
+    // Row Group 0: a=[1,1,1], b=[0,2,3] -> Partially matched, 2 rows match (b=2,3)
+    // Row Group 1: a=[1,1,1], b=[2,2,2] -> Fully matched, 3 rows
+    // Row Group 2: a=[1,1,1], b=[2,3,3] -> Fully matched, 3 rows
+    // Row Group 3: a=[1,1,1], b=[2,2,3] -> Fully matched, 3 rows
+    // Row Group 4: a=[2,2,2], b=[2,2,2] -> Not matched (a != 1)
+    // Row Group 5: a=[1,1,1], b=[5,6,7] -> Not matched (b >= 4)
+
+    // With LIMIT 5, we need RG1 (3 rows) + RG2 (2 rows from 3) = 5 rows
+    // RG4 and RG5 should be pruned by statistics
+    // RG3 should be pruned by limit
+    // RG0 is partially matched, so it depends on the order
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]));
+    let query = "SELECT a, b FROM t WHERE a = 1 AND b > 1 AND b < 4 LIMIT 5";
+
+    let batches = vec![
+        make_two_col_i32_batch("a", "b", vec![1, 1, 1], vec![0, 2, 3])?,
+        make_two_col_i32_batch("a", "b", vec![1, 1, 1], vec![2, 2, 2])?,
+        make_two_col_i32_batch("a", "b", vec![1, 1, 1], vec![2, 3, 3])?,
+        make_two_col_i32_batch("a", "b", vec![1, 1, 1], vec![2, 2, 3])?,
+        make_two_col_i32_batch("a", "b", vec![2, 2, 2], vec![2, 2, 2])?,
+        make_two_col_i32_batch("a", "b", vec![1, 1, 1], vec![5, 6, 7])?,
+    ];
+
+    RowGroupPruningTest::new()
+        .with_scenario(Scenario::Int)
+        .with_query(query)
+        .with_expected_errors(Some(0))
+        .with_expected_rows(5)
+        .with_pruned_files(Some(0))
+        .with_matched_by_stats(Some(4)) // RG0,1,2,3 are matched
+        .with_pruned_by_stats(Some(2)) // RG4,5 are pruned
+        .with_limit_pruned_row_groups(Some(2)) // RG0, RG3 is pruned by limit
+        .test_row_group_prune_with_custom_data(schema, batches, 3)
+        .await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_limit_pruning_multiple_fully_matched(
+) -> datafusion_common::error::Result<()> {
+    // Test Case 2: Limit requires multiple fully matched row groups
+    // Row Group 0: a=[5,5,5,5] -> Fully matched, 4 rows
+    // Row Group 1: a=[5,5,5,5] -> Fully matched, 4 rows
+    // Row Group 2: a=[5,5,5,5] -> Fully matched, 4 rows
+    // Row Group 3: a=[5,5,5,5] -> Fully matched, 4 rows
+    // Row Group 4: a=[1,2,3,4] -> Not matched
+
+    // With LIMIT 8, we need RG0 (4 rows) + RG1 (4 rows)  8 rows
+    // RG2,3 should be pruned by limit
+    // RG4 should be pruned by statistics
+
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+    let query = "SELECT a FROM t WHERE a = 5 LIMIT 8";
+
+    let batches = vec![
+        make_i32_batch("a", vec![5, 5, 5, 5])?,
+        make_i32_batch("a", vec![5, 5, 5, 5])?,
+        make_i32_batch("a", vec![5, 5, 5, 5])?,
+        make_i32_batch("a", vec![5, 5, 5, 5])?,
+        make_i32_batch("a", vec![1, 2, 3, 4])?,
+    ];
+
+    RowGroupPruningTest::new()
+        .with_scenario(Scenario::Int)
+        .with_query(query)
+        .with_expected_errors(Some(0))
+        .with_expected_rows(8)
+        .with_pruned_files(Some(0))
+        .with_matched_by_stats(Some(4)) // RG0,1,2,3 matched
+        .with_pruned_by_stats(Some(1)) // RG4 pruned
+        .with_limit_pruned_row_groups(Some(2)) // RG2,3 pruned by limit
+        .test_row_group_prune_with_custom_data(schema, batches, 4)
+        .await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_limit_pruning_no_fully_matched() -> datafusion_common::error::Result<()> {
+    // Test Case 3: No fully matched row groups - all are partially matched
+    // Row Group 0: a=[1,2,3] -> Partially matched, 1 row (a=2)
+    // Row Group 1: a=[2,3,4] -> Partially matched, 1 row (a=2)
+    // Row Group 2: a=[2,5,6] -> Partially matched, 1 row (a=2)
+    // Row Group 3: a=[2,7,8] -> Partially matched, 1 row (a=2)
+    // Row Group 4: a=[9,10,11] -> Not matched
+
+    // With LIMIT 3, we need to scan RG0,1,2 to get 3 matching rows
+    // Cannot prune much by limit since all matching RGs are partial
+    // RG4 should be pruned by statistics
+
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+    let query = "SELECT a FROM t WHERE a = 2 LIMIT 3";
+
+    let batches = vec![
+        make_i32_batch("a", vec![1, 2, 3])?,
+        make_i32_batch("a", vec![2, 3, 4])?,
+        make_i32_batch("a", vec![2, 5, 6])?,
+        make_i32_batch("a", vec![2, 7, 8])?,
+        make_i32_batch("a", vec![9, 10, 11])?,
+    ];
+
+    RowGroupPruningTest::new()
+        .with_scenario(Scenario::Int)
+        .with_query(query)
+        .with_expected_errors(Some(0))
+        .with_expected_rows(3)
+        .with_pruned_files(Some(0))
+        .with_matched_by_stats(Some(4)) // RG0,1,2,3 matched
+        .with_pruned_by_stats(Some(1)) // RG4 pruned
+        .with_limit_pruned_row_groups(Some(0)) // RG3 pruned by limit
+        .test_row_group_prune_with_custom_data(schema, batches, 3)
+        .await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_limit_pruning_exceeds_fully_matched() -> datafusion_common::error::Result<()>
+{
+    // Test Case 4: Limit exceeds all fully matched rows, need partially matched
+    // Row Group 0: a=[10,11,12,12] -> Partially matched, 1 row (a=10)
+    // Row Group 1: a=[10,10,10,10] -> Fully matched, 4 rows
+    // Row Group 2: a=[10,10,10,10] -> Fully matched, 4 rows
+    // Row Group 3: a=[10,13,14,11] -> Partially matched, 1 row (a=10)
+    // Row Group 4: a=[20,21,22,22] -> Not matched
+
+    // With LIMIT 10, we need RG1 (4) + RG2 (4) = 8 from fully matched
+    // Still need 2 more, so we need to scan partially matched RG0 and RG3
+    // All matching row groups should be scanned, only RG4 pruned by statistics
+
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+    let query = "SELECT a FROM t WHERE a = 10 LIMIT 10";
+
+    let batches = vec![
+        make_i32_batch("a", vec![10, 11, 12, 12])?,
+        make_i32_batch("a", vec![10, 10, 10, 10])?,
+        make_i32_batch("a", vec![10, 10, 10, 10])?,
+        make_i32_batch("a", vec![10, 13, 14, 11])?,
+        make_i32_batch("a", vec![20, 21, 22, 22])?,
+    ];
+
+    RowGroupPruningTest::new()
+        .with_scenario(Scenario::Int)
+        .with_query(query)
+        .with_expected_errors(Some(0))
+        .with_expected_rows(10) // Total: 1 + 3 + 4 + 1 = 9 (less than limit)
+        .with_pruned_files(Some(0))
+        .with_matched_by_stats(Some(4)) // RG0,1,2,3 matched
+        .with_pruned_by_stats(Some(1)) // RG4 pruned
+        .with_limit_pruned_row_groups(Some(0)) // No limit pruning since we need all RGs
+        .test_row_group_prune_with_custom_data(schema, batches, 4)
+        .await;
+
+    Ok(())
+}
