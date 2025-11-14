@@ -228,6 +228,7 @@ impl ContextWithParquet {
         let file = match unit {
             Unit::RowGroup(row_per_group) => {
                 config = config.with_parquet_bloom_filter_pruning(true);
+                config.options_mut().execution.parquet.pushdown_filters = true;
                 make_test_file_rg(scenario, row_per_group, custom_schema, custom_batches)
                     .await
             }

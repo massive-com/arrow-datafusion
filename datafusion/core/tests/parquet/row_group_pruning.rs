@@ -1754,8 +1754,8 @@ async fn test_limit_pruning() -> datafusion_common::error::Result<()> {
         .with_expected_rows(2)
         .with_pruned_files(Some(0))
         .with_matched_by_stats(Some(4))
-        .with_pruned_by_stats(Some(1)) 
-        .with_limit_pruned_row_groups(Some(2))
+        .with_pruned_by_stats(Some(1))
+        .with_limit_pruned_row_groups(Some(3))
         .test_row_group_prune_with_custom_data(schema, batches, 2)
         .await;
 

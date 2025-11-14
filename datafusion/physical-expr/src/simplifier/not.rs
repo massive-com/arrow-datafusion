@@ -49,7 +49,10 @@ pub(crate) fn simplify_not_expr(
     // Handle NOT(NOT(expr)) -> expr (double negation elimination)
     if let Some(inner_not) = inner_expr.as_any().downcast_ref::<NotExpr>() {
         // Recursively simplify the inner expression
-        return simplify_not_expr_recursive(Arc::clone(inner_not.arg()), schema);
+        let simplified =
+            simplify_not_expr_recursive(Arc::clone(inner_not.arg()), schema)?;
+        // We eliminated double negation, so always return transformed=true
+        return Ok(Transformed::yes(simplified.data));
     }
 
     // Handle NOT(literal) -> !literal
@@ -65,12 +68,19 @@ pub(crate) fn simplify_not_expr(
     // Handle NOT(binary_expr) where we can flip the operator
     if let Some(binary_expr) = inner_expr.as_any().downcast_ref::<BinaryExpr>() {
         if let Some(negated_op) = negate_operator(binary_expr.op()) {
+            // Recursively simplify the left and right expressions first
+            let left_simplified =
+                simplify_not_expr_recursive(Arc::clone(binary_expr.left()), schema)?;
+            let right_simplified =
+                simplify_not_expr_recursive(Arc::clone(binary_expr.right()), schema)?;
+
             let new_binary = Arc::new(BinaryExpr::new(
-                Arc::clone(binary_expr.left()),
+                left_simplified.data,
                 negated_op,
-                Arc::clone(binary_expr.right()),
+                right_simplified.data,
             ));
-            return simplify_not_expr_recursive(new_binary, schema);
+            // We flipped the operator, so always return transformed=true
+            return Ok(Transformed::yes(new_binary));
         }
 
         // Handle De Morgan's laws for AND/OR
@@ -200,7 +210,7 @@ mod tests {
         let inner_not = Arc::new(NotExpr::new(inner_expr.clone()));
         let double_not = Arc::new(NotExpr::new(inner_not));
 
-        let result = simplify_not_expr(double_not, &schema)?;
+        let result = simplify_not_expr_recursive(double_not, &schema)?;
 
         assert!(result.transformed);
         // Should be simplified back to the original b > 5
@@ -225,7 +235,7 @@ mod tests {
 
         // NOT(FALSE) -> TRUE
         let not_false = Arc::new(NotExpr::new(lit(ScalarValue::Boolean(Some(false)))));
-        let result = simplify_not_expr(not_false, &schema)?;
+        let result = simplify_not_expr_recursive(not_false, &schema)?;
         assert!(result.transformed);
 
         if let Some(literal) = result.data.as_any().downcast_ref::<Literal>() {
@@ -249,7 +259,7 @@ mod tests {
         ));
         let not_eq = Arc::new(NotExpr::new(eq_expr));
 
-        let result = simplify_not_expr(not_eq, &schema)?;
+        let result = simplify_not_expr_recursive(not_eq, &schema)?;
         assert!(result.transformed);
 
         if let Some(binary) = result.data.as_any().downcast_ref::<BinaryExpr>() {
@@ -273,7 +283,7 @@ mod tests {
         ));
         let not_and = Arc::new(NotExpr::new(and_expr));
 
-        let result = simplify_not_expr(not_and, &schema)?;
+        let result = simplify_not_expr_recursive(not_and, &schema)?;
         assert!(result.transformed);
 
         if let Some(binary) = result.data.as_any().downcast_ref::<BinaryExpr>() {
@@ -300,7 +310,7 @@ mod tests {
         ));
         let not_or = Arc::new(NotExpr::new(or_expr));
 
-        let result = simplify_not_expr(not_or, &schema)?;
+        let result = simplify_not_expr_recursive(not_or, &schema)?;
         assert!(result.transformed);
 
         if let Some(binary) = result.data.as_any().downcast_ref::<BinaryExpr>() {
@@ -310,6 +320,56 @@ mod tests {
             assert!(binary.right().as_any().downcast_ref::<NotExpr>().is_some());
         } else {
             panic!("Expected binary expression result");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_demorgans_with_comparison_simplification() -> Result<()> {
+        let schema = test_schema();
+
+        // NOT(b = 1 AND b = 2) -> b != 1 OR b != 2
+        // This tests the combination of De Morgan's law and operator negation
+        let eq1 = Arc::new(BinaryExpr::new(
+            col("b", &schema)?,
+            Operator::Eq,
+            lit(ScalarValue::Int32(Some(1))),
+        ));
+        let eq2 = Arc::new(BinaryExpr::new(
+            col("b", &schema)?,
+            Operator::Eq,
+            lit(ScalarValue::Int32(Some(2))),
+        ));
+        let and_expr = Arc::new(BinaryExpr::new(eq1, Operator::And, eq2));
+        let not_and = Arc::new(NotExpr::new(and_expr));
+
+        let result = simplify_not_expr_recursive(not_and, &schema)?;
+        assert!(result.transformed, "Expression should be transformed");
+
+        // Verify the result is an OR expression
+        if let Some(or_binary) = result.data.as_any().downcast_ref::<BinaryExpr>() {
+            assert_eq!(or_binary.op(), &Operator::Or, "Top level should be OR");
+
+            // Verify left side is b != 1
+            if let Some(left_binary) =
+                or_binary.left().as_any().downcast_ref::<BinaryExpr>()
+            {
+                assert_eq!(left_binary.op(), &Operator::NotEq, "Left should be NotEq");
+            } else {
+                panic!("Expected left to be a binary expression with !=");
+            }
+
+            // Verify right side is b != 2
+            if let Some(right_binary) =
+                or_binary.right().as_any().downcast_ref::<BinaryExpr>()
+            {
+                assert_eq!(right_binary.op(), &Operator::NotEq, "Right should be NotEq");
+            } else {
+                panic!("Expected right to be a binary expression with !=");
+            }
+        } else {
+            panic!("Expected binary OR expression result");
         }
 
         Ok(())
