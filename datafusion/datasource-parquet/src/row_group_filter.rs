@@ -181,20 +181,13 @@ impl RowGroupAccessPlanFilter {
         // try to prune the row groups in a single call
         match predicate.prune(&pruning_stats) {
             Ok(values) => {
-                let mut new_access_plan = ParquetAccessPlan::new_all(groups.len());
                 let mut fully_contained_candidates_original_idx: Vec<usize> = Vec::new();
-
-                for (idx_in_pruning_stats_result, &pruning_result) in
-                    values.iter().enumerate()
-                {
-                    let original_row_group_idx =
-                        row_group_indexes[idx_in_pruning_stats_result];
-                    if !pruning_result {
-                        new_access_plan.skip(original_row_group_idx);
+                for (idx, &value) in row_group_indexes.iter().zip(values.iter()) {
+                    if !value {
+                        self.access_plan.skip(*idx);
                         metrics.row_groups_pruned_statistics.add(1);
                     } else {
-                        fully_contained_candidates_original_idx
-                            .push(original_row_group_idx);
+                        fully_contained_candidates_original_idx.push(*idx);
                         metrics.row_groups_matched_statistics.add(1);
                     }
                 }
@@ -238,7 +231,6 @@ impl RowGroupAccessPlanFilter {
                         }
                     }
                 }
-                self.access_plan = new_access_plan;
             }
             // stats filter array could not be built, so we can't prune
             Err(e) => {
