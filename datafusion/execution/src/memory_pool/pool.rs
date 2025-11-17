@@ -34,7 +34,9 @@ pub struct UnboundedMemoryPool {
 }
 
 impl MemoryPool for UnboundedMemoryPool {
-    fn grow(&self, _reservation: &MemoryReservation, _additional: usize) {}
+    fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
+        self.used.fetch_add(additional, Ordering::Relaxed);
+    }
 
     fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
         self.used.fetch_sub(shrink, Ordering::Relaxed);
@@ -258,7 +260,7 @@ fn insufficient_capacity_err(
     additional: usize,
     available: usize,
 ) -> DataFusionError {
-    resources_datafusion_err!("Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total pool", 
+    resources_datafusion_err!("Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total pool",
     human_readable_size(additional), reservation.registration.consumer.name, human_readable_size(reservation.size), human_readable_size(available))
 }
 

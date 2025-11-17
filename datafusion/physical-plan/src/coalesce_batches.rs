@@ -224,10 +224,6 @@ impl ExecutionPlan for CoalesceBatchesExec {
         self.fetch
     }
 
-    fn supports_limit_pushdown(&self) -> bool {
-        true
-    }
-
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Equal
     }

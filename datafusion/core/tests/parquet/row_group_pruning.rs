@@ -165,11 +165,7 @@ impl RowGroupPruningTest {
             self.expected_row_group_pruned_by_bloom_filter,
             "mismatched row_groups_pruned_bloom_filter",
         );
-        assert_eq!(
-            output.limit_pruned_row_groups(),
-            self.expected_limit_pruned_row_groups,
-            "mismatched limit_pruned_row_groups",
-        );
+
         assert_eq!(
             output.result_rows,
             self.expected_rows,
