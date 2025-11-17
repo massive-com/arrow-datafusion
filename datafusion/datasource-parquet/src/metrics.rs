@@ -100,7 +100,7 @@ impl ParquetFileMetrics {
         let limit_pruned_row_groups = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
             .counter("limit_pruned_row_groups", partition);
-        
+
         let row_groups_fully_matched_statistics = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
             .counter("row_groups_fully_matched_statistics", partition);

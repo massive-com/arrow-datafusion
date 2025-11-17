@@ -131,13 +131,13 @@ pub fn simplify_not_expr_recursive(
     schema: &Schema,
 ) -> Result<Transformed<Arc<dyn PhysicalExpr>>> {
     // First, try to simplify any NOT expressions in this expression
-    let not_simplified = simplify_not_expr(expr.clone(), schema)?;
+    let not_simplified = simplify_not_expr(Arc::clone(&expr), schema)?;
 
     // If the expression was transformed, we might have created new opportunities for simplification
     if not_simplified.transformed {
         // Recursively simplify the result
         let further_simplified =
-            simplify_not_expr_recursive(not_simplified.data.clone(), schema)?;
+            simplify_not_expr_recursive(Arc::clone(&not_simplified.data), schema)?;
         if further_simplified.transformed {
             return Ok(Transformed::yes(further_simplified.data));
         } else {
@@ -202,12 +202,12 @@ mod tests {
         let schema = test_schema();
 
         // Create NOT(NOT(b > 5))
-        let inner_expr = Arc::new(BinaryExpr::new(
+        let inner_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
             col("b", &schema)?,
             Operator::Gt,
             lit(ScalarValue::Int32(Some(5))),
         ));
-        let inner_not = Arc::new(NotExpr::new(inner_expr.clone()));
+        let inner_not = Arc::new(NotExpr::new(Arc::clone(&inner_expr)));
         let double_not = Arc::new(NotExpr::new(inner_not));
 
         let result = simplify_not_expr_recursive(double_not, &schema)?;

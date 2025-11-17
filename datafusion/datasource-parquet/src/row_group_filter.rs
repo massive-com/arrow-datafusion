@@ -204,14 +204,14 @@ impl RowGroupAccessPlanFilter {
                 if !fully_contained_candidates_original_idx.is_empty() {
                     // Use NotExpr to create the inverted predicate
                     let inverted_expr =
-                        Arc::new(NotExpr::new(predicate.orig_expr().clone()));
+                        Arc::new(NotExpr::new(Arc::clone(predicate.orig_expr())));
                     // Simplify the NOT expression (e.g., NOT(c1 = 0) -> c1 != 0)
                     // before building the pruning predicate
                     let mut simplifier = PhysicalExprSimplifier::new(arrow_schema);
                     let inverted_expr = simplifier.simplify(inverted_expr).unwrap();
                     if let Ok(inverted_predicate) = PruningPredicate::try_new(
                         inverted_expr,
-                        predicate.schema().clone(),
+                        Arc::clone(predicate.schema()),
                     ) {
                         let inverted_pruning_stats = RowGroupPruningStatistics {
                             parquet_schema,
