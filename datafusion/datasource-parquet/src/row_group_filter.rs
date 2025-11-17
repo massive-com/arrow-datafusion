@@ -166,8 +166,6 @@ impl RowGroupAccessPlanFilter {
 
         assert_eq!(groups.len(), self.access_plan.len());
         // Indexes of row groups still to scan
-        let row_group_indexes_to_consider = self.access_plan.row_group_indexes();
-        // Indexes of row groups still to scan
         let row_group_indexes = self.access_plan.row_group_indexes();
         let row_group_metadatas = row_group_indexes
             .iter()
@@ -190,7 +188,7 @@ impl RowGroupAccessPlanFilter {
                     values.iter().enumerate()
                 {
                     let original_row_group_idx =
-                        row_group_indexes_to_consider[idx_in_pruning_stats_result];
+                        row_group_indexes[idx_in_pruning_stats_result];
                     if !pruning_result {
                         new_access_plan.skip(original_row_group_idx);
                         metrics.row_groups_pruned_statistics.add(1);
@@ -201,6 +199,8 @@ impl RowGroupAccessPlanFilter {
                     }
                 }
 
+                // Note: this part of code shouldn't be expensive with a limited number of row groups
+                // If we do find it's expensive, we can consider optimizing it further.
                 if !fully_contained_candidates_original_idx.is_empty() {
                     // Use NotExpr to create the inverted predicate
                     let inverted_expr =
@@ -232,6 +232,7 @@ impl RowGroupAccessPlanFilter {
                                 // it implies that *all* rows in this group satisfy the original predicate.
                                 if !inverted_values[i] {
                                     self.is_fully_matched[original_row_group_idx] = true;
+                                    metrics.row_groups_fully_matched_statistics.add(1);
                                 }
                             }
                         }

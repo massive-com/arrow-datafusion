@@ -34,6 +34,7 @@ struct RowGroupPruningTest {
     query: String,
     expected_errors: Option<usize>,
     expected_row_group_matched_by_statistics: Option<usize>,
+    expected_row_group_fully_matched_by_statistics: Option<usize>,
     expected_row_group_pruned_by_statistics: Option<usize>,
     expected_files_pruned_by_statistics: Option<usize>,
     expected_row_group_matched_by_bloom_filter: Option<usize>,
@@ -50,6 +51,7 @@ impl RowGroupPruningTest {
             expected_errors: None,
             expected_row_group_matched_by_statistics: None,
             expected_row_group_pruned_by_statistics: None,
+            expected_row_group_fully_matched_by_statistics: None,
             expected_files_pruned_by_statistics: None,
             expected_row_group_matched_by_bloom_filter: None,
             expected_row_group_pruned_by_bloom_filter: None,
@@ -79,6 +81,15 @@ impl RowGroupPruningTest {
     // Set the expected matched row groups by statistics
     fn with_matched_by_stats(mut self, matched_by_stats: Option<usize>) -> Self {
         self.expected_row_group_matched_by_statistics = matched_by_stats;
+        self
+    }
+
+    // Set the expected fully matched row groups by statistics
+    fn with_fully_matched_by_stats(
+        mut self,
+        fully_matched_by_stats: Option<usize>,
+    ) -> Self {
+        self.expected_row_group_fully_matched_by_statistics = fully_matched_by_stats;
         self
     }
 
@@ -196,6 +207,11 @@ impl RowGroupPruningTest {
             output.row_groups_matched_statistics(),
             self.expected_row_group_matched_by_statistics,
             "mismatched row_groups_matched_statistics",
+        );
+        assert_eq!(
+            output.row_groups_fully_matched_statistics(),
+            self.expected_row_group_fully_matched_by_statistics,
+            "mismatched row_groups_fully_matched_statistics",
         );
         assert_eq!(
             output.row_groups_pruned_statistics(),
@@ -1719,8 +1735,24 @@ fn make_i32_batch(
     RecordBatch::try_new(schema, vec![array]).map_err(DataFusionError::from)
 }
 
+// Helper function to create a batch with two Int32 columns
+fn make_two_col_i32_batch(
+    name_a: &str,
+    name_b: &str,
+    values_a: Vec<i32>,
+    values_b: Vec<i32>,
+) -> datafusion_common::error::Result<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(name_a, DataType::Int32, false),
+        Field::new(name_b, DataType::Int32, false),
+    ]));
+    let array_a: ArrayRef = Arc::new(Int32Array::from(values_a));
+    let array_b: ArrayRef = Arc::new(Int32Array::from(values_b));
+    RecordBatch::try_new(schema, vec![array_a, array_b]).map_err(DataFusionError::from)
+}
+
 #[tokio::test]
-async fn test_limit_pruning() -> datafusion_common::error::Result<()> {
+async fn test_limit_pruning_basic() -> datafusion_common::error::Result<()> {
     // Scenario: Simple integer column, multiple row groups
     // Query: SELECT c1 FROM  t WHERE c1 = 0 LIMIT 2
     // We expect 2 rows in total.
@@ -1754,28 +1786,13 @@ async fn test_limit_pruning() -> datafusion_common::error::Result<()> {
         .with_expected_rows(2)
         .with_pruned_files(Some(0))
         .with_matched_by_stats(Some(4))
+        .with_fully_matched_by_stats(Some(3))
         .with_pruned_by_stats(Some(1))
         .with_limit_pruned_row_groups(Some(3))
         .test_row_group_prune_with_custom_data(schema, batches, 2)
         .await;
 
     Ok(())
-}
-
-// Helper function to create a batch with two Int32 columns
-fn make_two_col_i32_batch(
-    name_a: &str,
-    name_b: &str,
-    values_a: Vec<i32>,
-    values_b: Vec<i32>,
-) -> datafusion_common::error::Result<RecordBatch> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(name_a, DataType::Int32, false),
-        Field::new(name_b, DataType::Int32, false),
-    ]));
-    let array_a: ArrayRef = Arc::new(Int32Array::from(values_a));
-    let array_b: ArrayRef = Arc::new(Int32Array::from(values_b));
-    RecordBatch::try_new(schema, vec![array_a, array_b]).map_err(DataFusionError::from)
 }
 
 #[tokio::test]
@@ -1815,6 +1832,7 @@ async fn test_limit_pruning_complex_filter() -> datafusion_common::error::Result
         .with_expected_rows(5)
         .with_pruned_files(Some(0))
         .with_matched_by_stats(Some(4)) // RG0,1,2,3 are matched
+        .with_fully_matched_by_stats(Some(3))
         .with_pruned_by_stats(Some(2)) // RG4,5 are pruned
         .with_limit_pruned_row_groups(Some(2)) // RG0, RG3 is pruned by limit
         .test_row_group_prune_with_custom_data(schema, batches, 3)
@@ -1855,6 +1873,7 @@ async fn test_limit_pruning_multiple_fully_matched(
         .with_expected_rows(8)
         .with_pruned_files(Some(0))
         .with_matched_by_stats(Some(4)) // RG0,1,2,3 matched
+        .with_fully_matched_by_stats(Some(4))
         .with_pruned_by_stats(Some(1)) // RG4 pruned
         .with_limit_pruned_row_groups(Some(2)) // RG2,3 pruned by limit
         .test_row_group_prune_with_custom_data(schema, batches, 4)
@@ -1894,6 +1913,7 @@ async fn test_limit_pruning_no_fully_matched() -> datafusion_common::error::Resu
         .with_expected_rows(3)
         .with_pruned_files(Some(0))
         .with_matched_by_stats(Some(4)) // RG0,1,2,3 matched
+        .with_fully_matched_by_stats(Some(0))
         .with_pruned_by_stats(Some(1)) // RG4 pruned
         .with_limit_pruned_row_groups(Some(0)) // RG3 pruned by limit
         .test_row_group_prune_with_custom_data(schema, batches, 3)
@@ -1934,6 +1954,7 @@ async fn test_limit_pruning_exceeds_fully_matched() -> datafusion_common::error:
         .with_expected_rows(10) // Total: 1 + 3 + 4 + 1 = 9 (less than limit)
         .with_pruned_files(Some(0))
         .with_matched_by_stats(Some(4)) // RG0,1,2,3 matched
+        .with_fully_matched_by_stats(Some(2))
         .with_pruned_by_stats(Some(1)) // RG4 pruned
         .with_limit_pruned_row_groups(Some(0)) // No limit pruning since we need all RGs
         .test_row_group_prune_with_custom_data(schema, batches, 4)

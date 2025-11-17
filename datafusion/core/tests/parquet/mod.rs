@@ -150,6 +150,11 @@ impl TestOutput {
         self.metric_value("row_groups_matched_statistics")
     }
 
+    /// The number of row_groups fully matched by statistics
+    fn row_groups_fully_matched_statistics(&self) -> Option<usize> {
+        self.metric_value("row_groups_fully_matched_statistics")
+    }
+
     /// The number of row_groups pruned by statistics
     fn row_groups_pruned_statistics(&self) -> Option<usize> {
         self.metric_value("row_groups_pruned_statistics")
