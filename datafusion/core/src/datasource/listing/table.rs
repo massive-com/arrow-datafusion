@@ -1253,6 +1253,7 @@ impl TableProvider for ListingTable {
                 .with_output_ordering(output_ordering)
                 .with_table_partition_cols(table_partition_cols)
                 .with_expr_adapter(self.expr_adapter_factory.clone())
+                .with_limit_pruning(limit.is_some())
                 .build(),
             )
             .await
