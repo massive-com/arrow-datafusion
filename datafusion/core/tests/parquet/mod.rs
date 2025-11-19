@@ -150,10 +150,17 @@ impl TestOutput {
         self.metric_value("row_groups_matched_statistics")
     }
 
+    /*
     /// The number of row_groups fully matched by statistics
     fn row_groups_fully_matched_statistics(&self) -> Option<usize> {
         self.metric_value("row_groups_fully_matched_statistics")
     }
+
+    /// The number of row groups pruned by limit pruning
+    fn limit_pruned_row_groups(&self) -> Option<usize> {
+        self.metric_value("limit_pruned_row_groups")
+    }
+    */
 
     /// The number of row_groups pruned by statistics
     fn row_groups_pruned_statistics(&self) -> Option<usize> {
@@ -183,11 +190,6 @@ impl TestOutput {
         self.metric_value("page_index_rows_pruned")
     }
 
-    /// The number of row groups pruned by limit pruning
-    fn limit_pruned_row_groups(&self) -> Option<usize> {
-        self.metric_value("limit_pruned_row_groups")
-    }
-
     fn description(&self) -> String {
         format!(
             "Input:\n{}\nQuery:\n{}\nOutput:\n{}\nMetrics:\n{}",
@@ -204,7 +206,8 @@ impl ContextWithParquet {
         Self::with_config(scenario, unit, SessionConfig::new(), None, None).await
     }
 
-    /// Set custom schema and batches for the test
+    // Set custom schema and batches for the test
+    /*
     pub async fn with_custom_data(
         scenario: Scenario,
         unit: Unit,
@@ -220,6 +223,7 @@ impl ContextWithParquet {
         )
         .await
     }
+    */
 
     async fn with_config(
         scenario: Scenario,
