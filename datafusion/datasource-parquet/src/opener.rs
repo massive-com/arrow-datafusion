@@ -99,6 +99,8 @@ pub(super) struct ParquetOpener {
     pub enable_row_group_stats_pruning: bool,
     /// Coerce INT96 timestamps to specific TimeUnit
     pub coerce_int96: Option<TimeUnit>,
+    /// Should limit pruning be applied
+    pub enable_limit_pruning: bool,
     /// Optional parquet FileDecryptionProperties
     #[cfg(feature = "parquet_encryption")]
     pub file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
@@ -151,6 +153,7 @@ impl FileOpener for ParquetOpener {
         let enable_bloom_filter = self.enable_bloom_filter;
         let enable_row_group_stats_pruning = self.enable_row_group_stats_pruning;
         let limit = self.limit;
+        let enable_limit_pruning = self.enable_limit_pruning;
 
         let predicate_creation_errors = MetricBuilder::new(&self.metrics)
             .global_counter("num_predicate_creation_errors");
@@ -408,8 +411,10 @@ impl FileOpener for ParquetOpener {
             }
 
             // Prune by limit
-            if let Some(limit) = limit {
-                row_groups.prune_by_limit(limit, rg_metadata, &file_metrics);
+            if enable_limit_pruning {
+                if let Some(limit) = limit {
+                    row_groups.prune_by_limit(limit, rg_metadata, &file_metrics);
+                }
             }
 
             let mut access_plan = row_groups.build();
@@ -893,6 +898,7 @@ mod test {
                 reorder_filters: false,
                 enable_page_index: false,
                 enable_bloom_filter: false,
+                enable_limit_pruning: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
                 coerce_int96: None,
@@ -966,6 +972,7 @@ mod test {
                 reorder_filters: false,
                 enable_page_index: false,
                 enable_bloom_filter: false,
+                enable_limit_pruning: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
                 coerce_int96: None,
@@ -1055,6 +1062,7 @@ mod test {
                 reorder_filters: false,
                 enable_page_index: false,
                 enable_bloom_filter: false,
+                enable_limit_pruning: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
                 coerce_int96: None,
@@ -1147,6 +1155,7 @@ mod test {
                 reorder_filters: true,
                 enable_page_index: false,
                 enable_bloom_filter: false,
+                enable_limit_pruning: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: false, // note that this is false!
                 coerce_int96: None,
@@ -1239,6 +1248,7 @@ mod test {
                 reorder_filters: false,
                 enable_page_index: false,
                 enable_bloom_filter: false,
+                enable_limit_pruning: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
                 coerce_int96: None,
@@ -1389,6 +1399,7 @@ mod test {
             reorder_filters: false,
             enable_page_index: false,
             enable_bloom_filter: false,
+            enable_limit_pruning: false,
             schema_adapter_factory: Arc::new(CustomSchemaAdapterFactory),
             enable_row_group_stats_pruning: false,
             coerce_int96: None,

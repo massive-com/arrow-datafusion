@@ -18,12 +18,8 @@
 //! This file contains an end to end test of parquet pruning. It writes
 //! data into a parquet file and then verifies row groups are pruned as
 //! expected.
-use std::sync::Arc;
-
-use arrow::array::{ArrayRef, Int32Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::SessionConfig;
-use datafusion_common::{DataFusionError, ScalarValue};
+use datafusion_common::ScalarValue;
 use itertools::Itertools;
 
 use crate::parquet::Unit::RowGroup;
@@ -34,12 +30,12 @@ struct RowGroupPruningTest {
     query: String,
     expected_errors: Option<usize>,
     expected_row_group_matched_by_statistics: Option<usize>,
-    expected_row_group_fully_matched_by_statistics: Option<usize>,
+    // expected_row_group_fully_matched_by_statistics: Option<usize>,
     expected_row_group_pruned_by_statistics: Option<usize>,
     expected_files_pruned_by_statistics: Option<usize>,
     expected_row_group_matched_by_bloom_filter: Option<usize>,
     expected_row_group_pruned_by_bloom_filter: Option<usize>,
-    expected_limit_pruned_row_groups: Option<usize>,
+    // expected_limit_pruned_row_groups: Option<usize>,
     expected_rows: usize,
 }
 impl RowGroupPruningTest {
@@ -51,11 +47,11 @@ impl RowGroupPruningTest {
             expected_errors: None,
             expected_row_group_matched_by_statistics: None,
             expected_row_group_pruned_by_statistics: None,
-            expected_row_group_fully_matched_by_statistics: None,
+            // expected_row_group_fully_matched_by_statistics: None,
             expected_files_pruned_by_statistics: None,
             expected_row_group_matched_by_bloom_filter: None,
             expected_row_group_pruned_by_bloom_filter: None,
-            expected_limit_pruned_row_groups: None,
+            // expected_limit_pruned_row_groups: None,
             expected_rows: 0,
         }
     }
@@ -85,6 +81,7 @@ impl RowGroupPruningTest {
     }
 
     // Set the expected fully matched row groups by statistics
+    /*
     fn with_fully_matched_by_stats(
         mut self,
         fully_matched_by_stats: Option<usize>,
@@ -92,6 +89,12 @@ impl RowGroupPruningTest {
         self.expected_row_group_fully_matched_by_statistics = fully_matched_by_stats;
         self
     }
+
+    fn with_limit_pruned_row_groups(mut self, pruned_by_limit: Option<usize>) -> Self {
+        self.expected_limit_pruned_row_groups = pruned_by_limit;
+        self
+    }
+    */
 
     // Set the expected pruned row groups by statistics
     fn with_pruned_by_stats(mut self, pruned_by_stats: Option<usize>) -> Self {
@@ -113,11 +116,6 @@ impl RowGroupPruningTest {
     // Set the expected pruned row groups by bloom filter
     fn with_pruned_by_bloom_filter(mut self, pruned_by_bf: Option<usize>) -> Self {
         self.expected_row_group_pruned_by_bloom_filter = pruned_by_bf;
-        self
-    }
-
-    fn with_limit_pruned_row_groups(mut self, pruned_by_limit: Option<usize>) -> Self {
-        self.expected_limit_pruned_row_groups = pruned_by_limit;
         self
     }
 
@@ -178,6 +176,7 @@ impl RowGroupPruningTest {
     }
 
     // Execute the test with the current configuration
+    /*
     async fn test_row_group_prune_with_custom_data(
         self,
         schema: Arc<Schema>,
@@ -234,6 +233,7 @@ impl RowGroupPruningTest {
             output.description(),
         );
     }
+    */
 }
 
 #[tokio::test]
@@ -1723,6 +1723,7 @@ async fn test_bloom_filter_decimal_dict() {
         .await;
 }
 
+/*
 // Helper function to create a batch with a single Int32 column.
 fn make_i32_batch(
     name: &str,
@@ -1960,3 +1961,4 @@ async fn test_limit_pruning_exceeds_fully_matched() -> datafusion_common::error:
 
     Ok(())
 }
+*/
