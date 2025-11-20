@@ -520,6 +520,14 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Unknown
     }
+    /// If supported, returns a copy of this `ExecutionPlan` node with the specified
+    /// node_id. Returns `None` otherwise.
+    fn with_node_id(
+        self: Arc<Self>,
+        _node_id: usize,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
 
     /// Attempts to push down the given projection into the input of this `ExecutionPlan`.
     ///
@@ -742,6 +750,11 @@ pub trait ExecutionPlanProperties {
     ///
     /// [`FilterExec`]: crate::filter::FilterExec
     fn equivalence_properties(&self) -> &EquivalenceProperties;
+
+    // Node Id of this ExecutionPlan node. See also [`ExecutionPlan::with_node_id`]
+    fn node_id(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl ExecutionPlanProperties for Arc<dyn ExecutionPlan> {
@@ -764,6 +777,10 @@ impl ExecutionPlanProperties for Arc<dyn ExecutionPlan> {
     fn equivalence_properties(&self) -> &EquivalenceProperties {
         self.properties().equivalence_properties()
     }
+
+    fn node_id(&self) -> Option<usize> {
+        self.properties().node_id()
+    }
 }
 
 impl ExecutionPlanProperties for &dyn ExecutionPlan {
@@ -785,6 +802,10 @@ impl ExecutionPlanProperties for &dyn ExecutionPlan {
 
     fn equivalence_properties(&self) -> &EquivalenceProperties {
         self.properties().equivalence_properties()
+    }
+
+    fn node_id(&self) -> Option<usize> {
+        self.properties().node_id()
     }
 }
 
@@ -989,6 +1010,8 @@ pub struct PlanProperties {
     pub scheduling_type: SchedulingType,
     /// See [ExecutionPlanProperties::output_ordering]
     output_ordering: Option<LexOrdering>,
+    /// See [ExecutionPlanProperties::node_id]
+    node_id: Option<usize>,
 }
 
 impl PlanProperties {
@@ -1009,6 +1032,7 @@ impl PlanProperties {
             evaluation_type: EvaluationType::Lazy,
             scheduling_type: SchedulingType::NonCooperative,
             output_ordering,
+            node_id: None,
         }
     }
 
@@ -1024,6 +1048,12 @@ impl PlanProperties {
         // make sure to overwrite it:
         self.output_ordering = eq_properties.output_ordering();
         self.eq_properties = eq_properties;
+        self
+    }
+
+    /// Overwrite node id with its new value.
+    pub fn with_node_id(mut self, node_id: usize) -> Self {
+        self.node_id = Some(node_id);
         self
     }
 
@@ -1071,6 +1101,10 @@ impl PlanProperties {
 
     pub fn output_ordering(&self) -> Option<&LexOrdering> {
         self.output_ordering.as_ref()
+    }
+
+    pub fn node_id(&self) -> Option<usize> {
+        self.node_id
     }
 
     /// Get schema of the node.

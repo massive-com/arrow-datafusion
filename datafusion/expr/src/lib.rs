@@ -85,6 +85,7 @@ pub use datafusion_doc::{
     Documentation, DocumentationBuilder,
 };
 pub use datafusion_expr_common::accumulator::Accumulator;
+pub use datafusion_expr_common::accumulator::SerializableAccumulator;
 pub use datafusion_expr_common::columnar_value::ColumnarValue;
 pub use datafusion_expr_common::groups_accumulator::{EmitTo, GroupsAccumulator};
 pub use datafusion_expr_common::operator::Operator;

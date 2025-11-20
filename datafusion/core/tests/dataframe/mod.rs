@@ -66,8 +66,13 @@ use datafusion::test_util::{
 use datafusion_catalog::TableProvider;
 use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
 use datafusion_common::{
+<<<<<<< HEAD
     assert_contains, internal_datafusion_err, Constraint, Constraints, DFSchema,
     DataFusionError, ScalarValue, SchemaError, TableReference, UnnestOptions,
+=======
+    assert_contains, Constraint, Constraints, DFSchema, DataFusionError, ParamValues,
+    ScalarValue, TableReference, UnnestOptions,
+>>>>>>> origin/branch-50
 };
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_datasource::file_format::format_as_file_type;
@@ -91,9 +96,12 @@ use datafusion_physical_plan::aggregates::{
 };
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::{displayable, ExecutionPlan, ExecutionPlanProperties};
+<<<<<<< HEAD
 
 use datafusion::error::Result as DataFusionResult;
 use datafusion_functions_window::expr_fn::lag;
+=======
+>>>>>>> origin/branch-50
 
 // Get string representation of the plan
 async fn physical_plan_to_string(df: &DataFrame) -> String {
@@ -6747,10 +6755,17 @@ async fn test_duplicate_state_fields_for_dfschema_construct() -> Result<()> {
         "ticker",
         "first_value(value)[first_value]",
         "timestamp@0",
+<<<<<<< HEAD
         "first_value(value)[first_value_is_set]",
         "last_value(value)[last_value]",
         "timestamp@0",
         "last_value(value)[last_value_is_set]",
+=======
+        "is_set",
+        "last_value(value)[last_value]",
+        "timestamp@0",
+        "is_set",
+>>>>>>> origin/branch-50
     ];
 
     let binding = partial_agg.schema();

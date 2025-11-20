@@ -582,11 +582,11 @@ mod tests {
         assert_eq!(string_truncation_stats.null_count, Precision::Exact(2));
         assert_eq!(
             string_truncation_stats.max_value,
-            Precision::Inexact(ScalarValue::Utf8View(Some("b".repeat(63) + "c")))
+            Precision::Inexact(Utf8(Some("b".repeat(63) + "c")))
         );
         assert_eq!(
             string_truncation_stats.min_value,
-            Precision::Inexact(ScalarValue::Utf8View(Some("a".repeat(64))))
+            Precision::Inexact(Utf8(Some("a".repeat(64))))
         );
 
         Ok(())
