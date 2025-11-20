@@ -15,223 +15,42 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The table implementation.
-
-use super::{
-    helpers::{expr_applicable_for_cols, pruned_partition_list},
-    ListingTableUrl, PartitionedFile,
-};
-use crate::{
-    datasource::file_format::{file_compression_type::FileCompressionType, FileFormat},
-    datasource::{create_ordering, physical_plan::FileSinkConfig},
-    execution::context::SessionState,
-};
-use arrow::datatypes::{DataType, Field, SchemaBuilder, SchemaRef};
-use arrow_schema::Schema;
+use crate::execution::SessionState;
 use async_trait::async_trait;
-use datafusion_catalog::{Session, TableProvider};
-use datafusion_common::{
-    config_datafusion_err, config_err, internal_err, plan_err, project_schema,
-    stats::Precision, Constraints, DataFusionError, Result, SchemaExt,
-};
-use datafusion_datasource::{
-    compute_all_files_statistics,
-    file::FileSource,
-    file_groups::FileGroup,
-    file_scan_config::{FileScanConfig, FileScanConfigBuilder},
-    schema_adapter::{DefaultSchemaAdapterFactory, SchemaAdapter, SchemaAdapterFactory},
-};
-use datafusion_execution::{
-    cache::{cache_manager::FileStatisticsCache, cache_unit::DefaultFileStatisticsCache},
-    config::SessionConfig,
-};
-use datafusion_expr::{
-    dml::InsertOp, Expr, SortExpr, TableProviderFilterPushDown, TableType,
-};
-use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
-use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use datafusion_physical_plan::{empty::EmptyExec, ExecutionPlan, Statistics};
-use futures::{future, stream, Stream, StreamExt, TryStreamExt};
-use itertools::Itertools;
-use object_store::ObjectStore;
-use std::{any::Any, collections::HashMap, str::FromStr, sync::Arc};
-/// Indicates the source of the schema for a [`ListingTable`]
-// PartialEq required for assert_eq! in tests
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub enum SchemaSource {
-    /// Schema is not yet set (initial state)
-    #[default]
-    Unset,
-    /// Schema was inferred from first table_path
-    Inferred,
-    /// Schema was specified explicitly via with_schema
-    Specified,
-}
+use datafusion_catalog_listing::{ListingOptions, ListingTableConfig};
+use datafusion_common::{config_datafusion_err, internal_datafusion_err};
+use datafusion_session::Session;
+use futures::StreamExt;
+use std::collections::HashMap;
 
-/// Configuration for creating a [`ListingTable`]
+/// Extension trait for [`ListingTableConfig`] that supports inferring schemas
 ///
-/// # Schema Evolution Support
-///
-/// This configuration supports schema evolution through the optional
-/// [`SchemaAdapterFactory`]. You might want to override the default factory when you need:
-///
-/// - **Type coercion requirements**: When you need custom logic for converting between
-///   different Arrow data types (e.g., Int32 ↔ Int64, Utf8 ↔ LargeUtf8)
-/// - **Column mapping**: You need to map columns with a legacy name to a new name
-/// - **Custom handling of missing columns**: By default they are filled in with nulls, but you may e.g. want to fill them in with `0` or `""`.
-///
-/// If not specified, a [`DefaultSchemaAdapterFactory`] will be used, which handles
-/// basic schema compatibility cases.
-///
-#[derive(Debug, Clone, Default)]
-pub struct ListingTableConfig {
-    /// Paths on the `ObjectStore` for creating `ListingTable`.
-    /// They should share the same schema and object store.
-    pub table_paths: Vec<ListingTableUrl>,
-    /// Optional `SchemaRef` for the to be created `ListingTable`.
-    ///
-    /// See details on [`ListingTableConfig::with_schema`]
-    pub file_schema: Option<SchemaRef>,
-    /// Optional [`ListingOptions`] for the to be created [`ListingTable`].
-    ///
-    /// See details on [`ListingTableConfig::with_listing_options`]
-    pub options: Option<ListingOptions>,
-    /// Tracks the source of the schema information
-    schema_source: SchemaSource,
-    /// Optional [`SchemaAdapterFactory`] for creating schema adapters
-    schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
-    /// Optional [`PhysicalExprAdapterFactory`] for creating physical expression adapters
-    expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
-}
-
-impl ListingTableConfig {
-    /// Creates new [`ListingTableConfig`] for reading the specified URL
-    pub fn new(table_path: ListingTableUrl) -> Self {
-        Self {
-            table_paths: vec![table_path],
-            ..Default::default()
-        }
-    }
-
-    /// Creates new [`ListingTableConfig`] with multiple table paths.
-    ///
-    /// See [`Self::infer_options`] for details on what happens with multiple paths
-    pub fn new_with_multi_paths(table_paths: Vec<ListingTableUrl>) -> Self {
-        Self {
-            table_paths,
-            ..Default::default()
-        }
-    }
-
-    /// Returns the source of the schema for this configuration
-    pub fn schema_source(&self) -> SchemaSource {
-        self.schema_source
-    }
-    /// Set the `schema` for the overall [`ListingTable`]
-    ///
-    /// [`ListingTable`] will automatically coerce, when possible, the schema
-    /// for individual files to match this schema.
-    ///
-    /// If a schema is not provided, it is inferred using
-    /// [`Self::infer_schema`].
-    ///
-    /// If the schema is provided, it must contain only the fields in the file
-    /// without the table partitioning columns.
-    ///
-    /// # Example: Specifying Table Schema
-    /// ```rust
-    /// # use std::sync::Arc;
-    /// # use datafusion::datasource::listing::{ListingTableConfig, ListingOptions, ListingTableUrl};
-    /// # use datafusion::datasource::file_format::parquet::ParquetFormat;
-    /// # use arrow::datatypes::{Schema, Field, DataType};
-    /// # let table_paths = ListingTableUrl::parse("file:///path/to/data").unwrap();
-    /// # let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()));
-    /// let schema = Arc::new(Schema::new(vec![
-    ///     Field::new("id", DataType::Int64, false),
-    ///     Field::new("name", DataType::Utf8, true),
-    /// ]));
-    ///
-    /// let config = ListingTableConfig::new(table_paths)
-    ///     .with_listing_options(listing_options)  // Set options first
-    ///     .with_schema(schema);                    // Then set schema
-    /// ```
-    pub fn with_schema(self, schema: SchemaRef) -> Self {
-        // Note: We preserve existing options state, but downstream code may expect
-        // options to be set. Consider calling with_listing_options() or infer_options()
-        // before operations that require options to be present.
-        debug_assert!(
-            self.options.is_some() || cfg!(test),
-            "ListingTableConfig::with_schema called without options set. \
-             Consider calling with_listing_options() or infer_options() first to avoid panics in downstream code."
-        );
-
-        Self {
-            file_schema: Some(schema),
-            schema_source: SchemaSource::Specified,
-            ..self
-        }
-    }
-
-    /// Add `listing_options` to [`ListingTableConfig`]
-    ///
-    /// If not provided, format and other options are inferred via
-    /// [`Self::infer_options`].
-    ///
-    /// # Example: Configuring Parquet Files with Custom Options
-    /// ```rust
-    /// # use std::sync::Arc;
-    /// # use datafusion::datasource::listing::{ListingTableConfig, ListingOptions, ListingTableUrl};
-    /// # use datafusion::datasource::file_format::parquet::ParquetFormat;
-    /// # let table_paths = ListingTableUrl::parse("file:///path/to/data").unwrap();
-    /// let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-    ///     .with_file_extension(".parquet")
-    ///     .with_collect_stat(true);
-    ///
-    /// let config = ListingTableConfig::new(table_paths)
-    ///     .with_listing_options(options);  // Configure file format and options
-    /// ```
-    pub fn with_listing_options(self, listing_options: ListingOptions) -> Self {
-        // Note: This method properly sets options, but be aware that downstream
-        // methods like infer_schema() and try_new() require both schema and options
-        // to be set to function correctly.
-        debug_assert!(
-            !self.table_paths.is_empty() || cfg!(test),
-            "ListingTableConfig::with_listing_options called without table_paths set. \
-             Consider calling new() or new_with_multi_paths() first to establish table paths."
-        );
-
-        Self {
-            options: Some(listing_options),
-            ..self
-        }
-    }
-
-    /// Returns a tuple of `(file_extension, optional compression_extension)`
-    ///
-    /// For example a path ending with blah.test.csv.gz returns `("csv", Some("gz"))`
-    /// For example a path ending with blah.test.csv returns `("csv", None)`
-    fn infer_file_extension_and_compression_type(
-        path: &str,
-    ) -> Result<(String, Option<String>)> {
-        let mut exts = path.rsplit('.');
-
-        let split = exts.next().unwrap_or("");
-
-        let file_compression_type = FileCompressionType::from_str(split)
-            .unwrap_or(FileCompressionType::UNCOMPRESSED);
-
-        if file_compression_type.is_compressed() {
-            let split2 = exts.next().unwrap_or("");
-            Ok((split2.to_string(), Some(split.to_string())))
-        } else {
-            Ok((split.to_string(), None))
-        }
-    }
-
+/// This trait exists because the following inference methods only
+/// work for [`SessionState`] implementations of [`Session`].
+/// See [`ListingTableConfig`] for the remaining inference methods.
+#[async_trait]
+pub trait ListingTableConfigExt {
     /// Infer `ListingOptions` based on `table_path` and file suffix.
     ///
     /// The format is inferred based on the first `table_path`.
-    pub async fn infer_options(self, state: &dyn Session) -> Result<Self> {
+    async fn infer_options(
+        self,
+        state: &dyn Session,
+    ) -> datafusion_common::Result<ListingTableConfig>;
+
+    /// Convenience method to call both [`Self::infer_options`] and [`ListingTableConfig::infer_schema`]
+    async fn infer(
+        self,
+        state: &dyn Session,
+    ) -> datafusion_common::Result<ListingTableConfig>;
+}
+
+#[async_trait]
+impl ListingTableConfigExt for ListingTableConfig {
+    async fn infer_options(
+        self,
+        state: &dyn Session,
+    ) -> datafusion_common::Result<ListingTableConfig> {
         let store = if let Some(url) = self.table_paths.first() {
             state.runtime_env().object_store(url)?
         } else {
@@ -246,7 +65,7 @@ impl ListingTableConfig {
             .await?
             .next()
             .await
-            .ok_or_else(|| DataFusionError::Internal("No files for table".into()))??;
+            .ok_or_else(|| internal_datafusion_err!("No files for table"))??;
 
         let (file_extension, maybe_compression_type) =
             ListingTableConfig::infer_file_extension_and_compression_type(
@@ -278,66 +97,13 @@ impl ListingTableConfig {
             .with_target_partitions(state.config().target_partitions())
             .with_collect_stat(state.config().collect_statistics());
 
-        Ok(Self {
-            table_paths: self.table_paths,
-            file_schema: self.file_schema,
-            options: Some(listing_options),
-            schema_source: self.schema_source,
-            schema_adapter_factory: self.schema_adapter_factory,
-            expr_adapter_factory: self.expr_adapter_factory,
-        })
+        Ok(self.with_listing_options(listing_options))
     }
 
-    /// Infer the [`SchemaRef`] based on `table_path`s.
-    ///
-    /// This method infers the table schema using the first `table_path`.
-    /// See [`ListingOptions::infer_schema`] for more details
-    ///
-    /// # Errors
-    /// * if `self.options` is not set. See [`Self::with_listing_options`]
-    pub async fn infer_schema(self, state: &dyn Session) -> Result<Self> {
-        match self.options {
-            Some(options) => {
-                let ListingTableConfig {
-                    table_paths,
-                    file_schema,
-                    options: _,
-                    schema_source,
-                    schema_adapter_factory,
-                    expr_adapter_factory: physical_expr_adapter_factory,
-                } = self;
-
-                let (schema, new_schema_source) = match file_schema {
-                    Some(schema) => (schema, schema_source), // Keep existing source if schema exists
-                    None => {
-                        if let Some(url) = table_paths.first() {
-                            (
-                                options.infer_schema(state, url).await?,
-                                SchemaSource::Inferred,
-                            )
-                        } else {
-                            (Arc::new(Schema::empty()), SchemaSource::Inferred)
-                        }
-                    }
-                };
-
-                Ok(Self {
-                    table_paths,
-                    file_schema: Some(schema),
-                    options: Some(options),
-                    schema_source: new_schema_source,
-                    schema_adapter_factory,
-                    expr_adapter_factory: physical_expr_adapter_factory,
-                })
-            }
-            None => internal_err!("No `ListingOptions` set for inferring schema"),
-        }
-    }
-
-    /// Convenience method to call both [`Self::infer_options`] and [`Self::infer_schema`]
-    pub async fn infer(self, state: &dyn Session) -> Result<Self> {
+    async fn infer(self, state: &dyn Session) -> datafusion_common::Result<Self> {
         self.infer_options(state).await?.infer_schema(state).await
     }
+<<<<<<< HEAD
 
     /// Infer the partition columns from `table_paths`.
     ///
@@ -1533,13 +1299,15 @@ async fn get_files_with_limit(
     // files in a different order.
     let inexact_stats = all_files.next().await.is_some();
     Ok((file_group, inexact_stats))
+=======
+>>>>>>> upstream/branch-51
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     #[cfg(feature = "parquet")]
     use crate::datasource::file_format::parquet::ParquetFormat;
+    use crate::datasource::listing::table::ListingTableConfigExt;
     use crate::prelude::*;
     use crate::{
         datasource::{
@@ -1553,20 +1321,34 @@ mod tests {
         },
     };
     use arrow::{compute::SortOptions, record_batch::RecordBatch};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
+    use datafusion_catalog::TableProvider;
+    use datafusion_catalog_listing::{
+        ListingOptions, ListingTable, ListingTableConfig, SchemaSource,
+    };
     use datafusion_common::{
-        assert_contains,
+        assert_contains, plan_err,
         stats::Precision,
         test_util::{batches_to_string, datafusion_test_data},
-        ColumnStatistics, ScalarValue,
+        ColumnStatistics, DataFusionError, Result, ScalarValue,
     };
+    use datafusion_datasource::file_compression_type::FileCompressionType;
+    use datafusion_datasource::file_format::FileFormat;
     use datafusion_datasource::schema_adapter::{
         SchemaAdapter, SchemaAdapterFactory, SchemaMapper,
     };
+    use datafusion_datasource::ListingTableUrl;
+    use datafusion_expr::dml::InsertOp;
     use datafusion_expr::{BinaryExpr, LogicalPlanBuilder, Operator};
+    use datafusion_physical_expr::expressions::binary;
     use datafusion_physical_expr::PhysicalSortExpr;
+    use datafusion_physical_expr_common::sort_expr::LexOrdering;
+    use datafusion_physical_plan::empty::EmptyExec;
     use datafusion_physical_plan::{collect, ExecutionPlanProperties};
     use rstest::rstest;
+    use std::collections::HashMap;
     use std::io::Write;
+    use std::sync::Arc;
     use tempfile::TempDir;
     use url::Url;
 
@@ -1603,10 +1385,13 @@ mod tests {
         let ctx = SessionContext::new();
         let testdata = datafusion_test_data();
         let filename = format!("{testdata}/aggregate_simple.csv");
-        let table_path = ListingTableUrl::parse(filename).unwrap();
+        let table_path = ListingTableUrl::parse(filename)?;
 
         // Test default schema source
-        let config = ListingTableConfig::new(table_path.clone());
+        let format = CsvFormat::default();
+        let options = ListingOptions::new(Arc::new(format));
+        let config =
+            ListingTableConfig::new(table_path.clone()).with_listing_options(options);
         assert_eq!(config.schema_source(), SchemaSource::Unset);
 
         // Test schema source after setting a schema explicitly
@@ -1615,18 +1400,13 @@ mod tests {
         assert_eq!(config_with_schema.schema_source(), SchemaSource::Specified);
 
         // Test schema source after inferring schema
-        let format = CsvFormat::default();
-        let options = ListingOptions::new(Arc::new(format));
-        let config_with_options = config.with_listing_options(options.clone());
-        assert_eq!(config_with_options.schema_source(), SchemaSource::Unset);
+        assert_eq!(config.schema_source(), SchemaSource::Unset);
 
-        let config_with_inferred = config_with_options.infer_schema(&ctx.state()).await?;
+        let config_with_inferred = config.infer_schema(&ctx.state()).await?;
         assert_eq!(config_with_inferred.schema_source(), SchemaSource::Inferred);
 
         // Test schema preservation through operations
-        let config_with_schema_and_options = config_with_schema
-            .clone()
-            .with_listing_options(options.clone());
+        let config_with_schema_and_options = config_with_schema.clone();
         assert_eq!(
             config_with_schema_and_options.schema_source(),
             SchemaSource::Specified
@@ -1695,29 +1475,44 @@ mod tests {
 
         use crate::datasource::file_format::parquet::ParquetFormat;
         use datafusion_physical_plan::expressions::col as physical_col;
+        use datafusion_physical_plan::expressions::lit as physical_lit;
         use std::ops::Add;
 
         // (file_sort_order, expected_result)
         let cases = vec![
-            (vec![], Ok(Vec::<LexOrdering>::new())),
+            (
+                vec![],
+                Ok::<Vec<LexOrdering>, DataFusionError>(Vec::<LexOrdering>::new()),
+            ),
             // sort expr, but non column
             (
-                vec![vec![
-                    col("int_col").add(lit(1)).sort(true, true),
-                ]],
-                Err("Expected single column reference in sort_order[0][0], got int_col + Int32(1)"),
+                vec![vec![col("int_col").add(lit(1)).sort(true, true)]],
+                Ok(vec![[PhysicalSortExpr {
+                    expr: binary(
+                        physical_col("int_col", &schema).unwrap(),
+                        Operator::Plus,
+                        physical_lit(1),
+                        &schema,
+                    )
+                    .unwrap(),
+                    options: SortOptions {
+                        descending: false,
+                        nulls_first: true,
+                    },
+                }]
+                .into()]),
             ),
             // ok with one column
             (
                 vec![vec![col("string_col").sort(true, false)]],
                 Ok(vec![[PhysicalSortExpr {
-                            expr: physical_col("string_col", &schema).unwrap(),
-                            options: SortOptions {
-                                descending: false,
-                                nulls_first: false,
-                            },
-                        }].into(),
-                ])
+                    expr: physical_col("string_col", &schema).unwrap(),
+                    options: SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    },
+                }]
+                .into()]),
             ),
             // ok with two columns, different options
             (
@@ -1726,14 +1521,18 @@ mod tests {
                     col("int_col").sort(false, true),
                 ]],
                 Ok(vec![[
-                            PhysicalSortExpr::new_default(physical_col("string_col", &schema).unwrap())
-                                        .asc()
-                                        .nulls_last(),
-                            PhysicalSortExpr::new_default(physical_col("int_col", &schema).unwrap())
-                                        .desc()
-                                        .nulls_first()
-                        ].into(),
-                ])
+                    PhysicalSortExpr::new_default(
+                        physical_col("string_col", &schema).unwrap(),
+                    )
+                    .asc()
+                    .nulls_last(),
+                    PhysicalSortExpr::new_default(
+                        physical_col("int_col", &schema).unwrap(),
+                    )
+                    .desc()
+                    .nulls_first(),
+                ]
+                .into()]),
             ),
         ];
 
@@ -1746,7 +1545,8 @@ mod tests {
 
             let table =
                 ListingTable::try_new(config.clone()).expect("Creating the table");
-            let ordering_result = table.try_create_output_ordering();
+            let ordering_result =
+                table.try_create_output_ordering(state.execution_props());
 
             match (expected_result, ordering_result) {
                 (Ok(expected), Ok(result)) => {
@@ -1781,7 +1581,7 @@ mod tests {
             .with_table_partition_cols(vec![(String::from("p1"), DataType::Utf8)])
             .with_target_partitions(4);
 
-        let table_path = ListingTableUrl::parse("test:///table/").unwrap();
+        let table_path = ListingTableUrl::parse("test:///table/")?;
         let file_schema =
             Arc::new(Schema::new(vec![Field::new("a", DataType::Boolean, false)]));
         let config = ListingTableConfig::new(table_path)
@@ -1817,7 +1617,7 @@ mod tests {
     ) -> Result<Arc<dyn TableProvider>> {
         let testdata = crate::test_util::parquet_test_data();
         let filename = format!("{testdata}/{name}");
-        let table_path = ListingTableUrl::parse(filename).unwrap();
+        let table_path = ListingTableUrl::parse(filename)?;
 
         let config = ListingTableConfig::new(table_path)
             .infer(&ctx.state())
@@ -1844,7 +1644,7 @@ mod tests {
 
         let schema = Schema::new(vec![Field::new("a", DataType::Boolean, false)]);
 
-        let table_path = ListingTableUrl::parse(table_prefix).unwrap();
+        let table_path = ListingTableUrl::parse(table_prefix)?;
         let config = ListingTableConfig::new(table_path)
             .with_listing_options(opt)
             .with_schema(Arc::new(schema));
@@ -2403,7 +2203,7 @@ mod tests {
     async fn test_infer_options_compressed_csv() -> Result<()> {
         let testdata = crate::test_util::arrow_test_data();
         let filename = format!("{testdata}/csv/aggregate_test_100.csv.gz");
-        let table_path = ListingTableUrl::parse(filename).unwrap();
+        let table_path = ListingTableUrl::parse(filename)?;
 
         let ctx = SessionContext::new();
 
@@ -2424,12 +2224,15 @@ mod tests {
 
         let testdata = datafusion_test_data();
         let filename = format!("{testdata}/aggregate_simple.csv");
-        let table_path = ListingTableUrl::parse(filename).unwrap();
+        let table_path = ListingTableUrl::parse(filename)?;
 
         let provided_schema = create_test_schema();
 
-        let config =
-            ListingTableConfig::new(table_path).with_schema(Arc::clone(&provided_schema));
+        let format = CsvFormat::default();
+        let options = ListingOptions::new(Arc::new(format));
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(options)
+            .with_schema(Arc::clone(&provided_schema));
 
         let config = config.infer(&ctx.state()).await?;
 
@@ -2494,8 +2297,8 @@ mod tests {
             table_path1.clone(),
             table_path2.clone(),
         ])
-        .with_schema(schema_3cols)
-        .with_listing_options(options.clone());
+        .with_listing_options(options.clone())
+        .with_schema(schema_3cols);
         let config2 = config2.infer_schema(&ctx.state()).await?;
         assert_eq!(config2.schema_source(), SchemaSource::Specified);
 
@@ -2518,8 +2321,8 @@ mod tests {
             table_path1.clone(),
             table_path2.clone(),
         ])
-        .with_schema(schema_4cols)
-        .with_listing_options(options.clone());
+        .with_listing_options(options.clone())
+        .with_schema(schema_4cols);
         let config3 = config3.infer_schema(&ctx.state()).await?;
         assert_eq!(config3.schema_source(), SchemaSource::Specified);
 
@@ -2677,6 +2480,52 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_listing_table_prunes_extra_files_in_hive() -> Result<()> {
+        let files = [
+            "bucket/test/pid=1/file1",
+            "bucket/test/pid=1/file2",
+            "bucket/test/pid=2/file3",
+            "bucket/test/pid=2/file4",
+            "bucket/test/other/file5",
+        ];
+
+        let ctx = SessionContext::new();
+        register_test_store(&ctx, &files.iter().map(|f| (*f, 10)).collect::<Vec<_>>());
+
+        let opt = ListingOptions::new(Arc::new(JsonFormat::default()))
+            .with_file_extension_opt(Some(""))
+            .with_table_partition_cols(vec![("pid".to_string(), DataType::Int32)]);
+
+        let table_path = ListingTableUrl::parse("test:///bucket/test/").unwrap();
+        let schema = Schema::new(vec![Field::new("a", DataType::Boolean, false)]);
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(opt)
+            .with_schema(Arc::new(schema));
+
+        let table = ListingTable::try_new(config)?;
+
+        let (file_list, _) = table.list_files_for_scan(&ctx.state(), &[], None).await?;
+        assert_eq!(file_list.len(), 1);
+
+        let files = file_list[0].clone();
+
+        assert_eq!(
+            files
+                .iter()
+                .map(|f| f.path().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "bucket/test/pid=1/file1",
+                "bucket/test/pid=1/file2",
+                "bucket/test/pid=2/file3",
+                "bucket/test/pid=2/file4",
+            ]
+        );
+
+        Ok(())
+    }
+
     #[cfg(feature = "parquet")]
     #[tokio::test]
     async fn test_table_stats_behaviors() -> Result<()> {
@@ -2684,7 +2533,7 @@ mod tests {
 
         let testdata = crate::test_util::parquet_test_data();
         let filename = format!("{}/{}", testdata, "alltypes_plain.parquet");
-        let table_path = ListingTableUrl::parse(filename).unwrap();
+        let table_path = ListingTableUrl::parse(filename)?;
 
         let ctx = SessionContext::new();
         let state = ctx.state();
@@ -2695,6 +2544,7 @@ mod tests {
         let config_default = ListingTableConfig::new(table_path.clone())
             .with_listing_options(opt_default)
             .with_schema(schema_default);
+
         let table_default = ListingTable::try_new(config_default)?;
 
         let exec_default = table_default.scan(&state, None, &[], None).await?;
@@ -2830,7 +2680,7 @@ mod tests {
         let format = JsonFormat::default();
         let opt = ListingOptions::new(Arc::new(format)).with_collect_stat(false);
         let schema = Schema::new(vec![Field::new("a", DataType::Boolean, false)]);
-        let table_path = ListingTableUrl::parse("test:///table/").unwrap();
+        let table_path = ListingTableUrl::parse("test:///table/")?;
 
         let config = ListingTableConfig::new(table_path)
             .with_listing_options(opt)
@@ -3044,7 +2894,7 @@ mod tests {
         let format = JsonFormat::default();
         let opt = ListingOptions::new(Arc::new(format)).with_collect_stat(collect_stat);
         let schema = Schema::new(vec![Field::new("a", DataType::Boolean, false)]);
-        let table_path = ListingTableUrl::parse("test:///table/").unwrap();
+        let table_path = ListingTableUrl::parse("test:///table/")?;
 
         let config = ListingTableConfig::new(table_path)
             .with_listing_options(opt)

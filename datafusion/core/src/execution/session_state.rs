@@ -24,26 +24,26 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::catalog::{CatalogProviderList, SchemaProvider, TableProviderFactory};
-use crate::datasource::cte_worktable::CteWorkTable;
-use crate::datasource::file_format::{format_as_file_type, FileFormatFactory};
+use crate::datasource::file_format::FileFormatFactory;
+#[cfg(feature = "sql")]
 use crate::datasource::provider_as_source;
 use crate::execution::context::{EmptySerializerRegistry, FunctionFactory, QueryPlanner};
 use crate::execution::SessionStateDefaults;
 use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+use arrow_schema::{DataType, FieldRef};
 use datafusion_catalog::information_schema::{
     InformationSchemaProvider, INFORMATION_SCHEMA,
 };
-
-use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_catalog::MemoryCatalogProviderList;
 use datafusion_catalog::{TableFunction, TableFunctionImpl};
 use datafusion_common::alias::AliasGenerator;
+#[cfg(feature = "sql")]
+use datafusion_common::config::Dialect;
 use datafusion_common::config::{ConfigExtension, ConfigOptions, TableOptions};
 use datafusion_common::display::{PlanType, StringifiedPlan, ToStringifiedPlan};
-use datafusion_common::file_options::file_type::FileType;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{
-    config_err, exec_err, not_impl_err, plan_datafusion_err, DFSchema, DataFusionError,
+    config_err, exec_err, plan_datafusion_err, DFSchema, DataFusionError,
     ResolvedTableReference, TableReference,
 };
 use datafusion_execution::config::SessionConfig;
@@ -51,13 +51,15 @@ use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_execution::TaskContext;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr_rewriter::FunctionRewrite;
-use datafusion_expr::planner::{ExprPlanner, TypePlanner};
+use datafusion_expr::planner::ExprPlanner;
+#[cfg(feature = "sql")]
+use datafusion_expr::planner::TypePlanner;
 use datafusion_expr::registry::{FunctionRegistry, SerializerRegistry};
 use datafusion_expr::simplify::SimplifyInfo;
-use datafusion_expr::var_provider::{is_system_variables, VarType};
+#[cfg(feature = "sql")]
+use datafusion_expr::TableSource;
 use datafusion_expr::{
-    AggregateUDF, Explain, Expr, ExprSchemable, LogicalPlan, ScalarUDF, TableSource,
-    WindowUDF,
+    AggregateUDF, Explain, Expr, ExprSchemable, LogicalPlan, ScalarUDF, WindowUDF,
 };
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_optimizer::{
@@ -72,16 +74,22 @@ use datafusion_physical_plan::node_id::{
 };
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_session::Session;
-use datafusion_sql::parser::{DFParserBuilder, Statement};
-use datafusion_sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
+#[cfg(feature = "sql")]
+use datafusion_sql::{
+    parser::{DFParserBuilder, Statement},
+    planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel},
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use log::{debug, info};
 use object_store::ObjectStore;
-use sqlparser::ast::{Expr as SQLExpr, ExprWithAlias as SQLExprWithAlias};
-use sqlparser::dialect::dialect_from_str;
+#[cfg(feature = "sql")]
+use sqlparser::{
+    ast::{Expr as SQLExpr, ExprWithAlias as SQLExprWithAlias},
+    dialect::dialect_from_str,
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -111,12 +119,12 @@ use uuid::Uuid;
 /// # use std::sync::Arc;
 /// # #[tokio::main]
 /// # async fn main() -> Result<()> {
-///     let state = SessionStateBuilder::new()
-///         .with_config(SessionConfig::new())  
-///         .with_runtime_env(Arc::new(RuntimeEnv::default()))
-///         .with_default_features()
-///         .build();
-///     Ok(())  
+/// let state = SessionStateBuilder::new()
+///     .with_config(SessionConfig::new())
+///     .with_runtime_env(Arc::new(RuntimeEnv::default()))
+///     .with_default_features()
+///     .build();
+/// Ok(())
 /// # }
 /// ```
 ///
@@ -135,6 +143,7 @@ pub struct SessionState {
     /// Provides support for customizing the SQL planner, e.g. to add support for custom operators like `->>` or `?`
     expr_planners: Vec<Arc<dyn ExprPlanner>>,
     /// Provides support for customizing the SQL type planning
+    #[cfg(feature = "sql")]
     type_planner: Option<Arc<dyn TypePlanner>>,
     /// Responsible for optimizing a logical plan
     optimizer: Optimizer,
@@ -188,7 +197,8 @@ impl Debug for SessionState {
     /// Prefer having short fields at the top and long vector fields near the end
     /// Group fields by
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionState")
+        let mut debug_struct = f.debug_struct("SessionState");
+        let ret = debug_struct
             .field("session_id", &self.session_id)
             .field("config", &self.config)
             .field("runtime_env", &self.runtime_env)
@@ -199,9 +209,12 @@ impl Debug for SessionState {
             .field("table_options", &self.table_options)
             .field("table_factories", &self.table_factories)
             .field("function_factory", &self.function_factory)
-            .field("expr_planners", &self.expr_planners)
-            .field("type_planner", &self.type_planner)
-            .field("query_planners", &self.query_planner)
+            .field("expr_planners", &self.expr_planners);
+
+        #[cfg(feature = "sql")]
+        let ret = ret.field("type_planner", &self.type_planner);
+
+        ret.field("query_planners", &self.query_planner)
             .field("analyzer", &self.analyzer)
             .field("optimizer", &self.optimizer)
             .field("physical_optimizers", &self.physical_optimizers)
@@ -361,10 +374,11 @@ impl SessionState {
     /// [`Statement`]. See [`SessionContext::sql`] for running queries.
     ///
     /// [`SessionContext::sql`]: crate::execution::context::SessionContext::sql
+    #[cfg(feature = "sql")]
     pub fn sql_to_statement(
         &self,
         sql: &str,
-        dialect: &str,
+        dialect: &Dialect,
     ) -> datafusion_common::Result<Statement> {
         let dialect = dialect_from_str(dialect).ok_or_else(|| {
             plan_datafusion_err!(
@@ -383,7 +397,7 @@ impl SessionState {
             .parse_statements()?;
 
         if statements.len() > 1 {
-            return not_impl_err!(
+            return datafusion_common::not_impl_err!(
                 "The context currently only supports a single SQL statement"
             );
         }
@@ -397,10 +411,11 @@ impl SessionState {
     /// parse a sql string into a sqlparser-rs AST [`SQLExpr`].
     ///
     /// See [`Self::create_logical_expr`] for parsing sql to [`Expr`].
+    #[cfg(feature = "sql")]
     pub fn sql_to_expr(
         &self,
         sql: &str,
-        dialect: &str,
+        dialect: &Dialect,
     ) -> datafusion_common::Result<SQLExpr> {
         self.sql_to_expr_with_alias(sql, dialect).map(|x| x.expr)
     }
@@ -408,10 +423,11 @@ impl SessionState {
     /// parse a sql string into a sqlparser-rs AST [`SQLExprWithAlias`].
     ///
     /// See [`Self::create_logical_expr`] for parsing sql to [`Expr`].
+    #[cfg(feature = "sql")]
     pub fn sql_to_expr_with_alias(
         &self,
         sql: &str,
-        dialect: &str,
+        dialect: &Dialect,
     ) -> datafusion_common::Result<SQLExprWithAlias> {
         let dialect = dialect_from_str(dialect).ok_or_else(|| {
             plan_datafusion_err!(
@@ -436,6 +452,7 @@ impl SessionState {
     /// See [`datafusion_sql::resolve::resolve_table_references`] for more information.
     ///
     /// [`datafusion_sql::resolve::resolve_table_references`]: datafusion_sql::resolve::resolve_table_references
+    #[cfg(feature = "sql")]
     pub fn resolve_table_references(
         &self,
         statement: &Statement,
@@ -450,6 +467,7 @@ impl SessionState {
     }
 
     /// Convert an AST Statement into a LogicalPlan
+    #[cfg(feature = "sql")]
     pub async fn statement_to_plan(
         &self,
         statement: Statement,
@@ -477,6 +495,7 @@ impl SessionState {
         query.statement_to_plan(statement)
     }
 
+    #[cfg(feature = "sql")]
     fn get_parser_options(&self) -> ParserOptions {
         let sql_parser_options = &self.config.options().sql_parser;
 
@@ -507,12 +526,13 @@ impl SessionState {
     ///
     /// [`SessionContext::sql`]: crate::execution::context::SessionContext::sql
     /// [`SessionContext::sql_with_options`]: crate::execution::context::SessionContext::sql_with_options
+    #[cfg(feature = "sql")]
     pub async fn create_logical_plan(
         &self,
         sql: &str,
     ) -> datafusion_common::Result<LogicalPlan> {
-        let dialect = self.config.options().sql_parser.dialect.as_str();
-        let statement = self.sql_to_statement(sql, dialect)?;
+        let dialect = self.config.options().sql_parser.dialect;
+        let statement = self.sql_to_statement(sql, &dialect)?;
         let plan = self.statement_to_plan(statement).await?;
         Ok(plan)
     }
@@ -520,14 +540,15 @@ impl SessionState {
     /// Creates a datafusion style AST [`Expr`] from a SQL string.
     ///
     /// See example on  [SessionContext::parse_sql_expr](crate::execution::context::SessionContext::parse_sql_expr)
+    #[cfg(feature = "sql")]
     pub fn create_logical_expr(
         &self,
         sql: &str,
         df_schema: &DFSchema,
     ) -> datafusion_common::Result<Expr> {
-        let dialect = self.config.options().sql_parser.dialect.as_str();
+        let dialect = self.config.options().sql_parser.dialect;
 
-        let sql_expr = self.sql_to_expr_with_alias(sql, dialect)?;
+        let sql_expr = self.sql_to_expr_with_alias(sql, &dialect)?;
 
         let provider = SessionContextProvider {
             state: self,
@@ -859,12 +880,12 @@ impl SessionState {
     pub(crate) fn store_prepared(
         &mut self,
         name: String,
-        data_types: Vec<DataType>,
+        fields: Vec<FieldRef>,
         plan: Arc<LogicalPlan>,
     ) -> datafusion_common::Result<()> {
         match self.prepared_plans.entry(name) {
             Entry::Vacant(e) => {
-                e.insert(Arc::new(PreparedPlan { data_types, plan }));
+                e.insert(Arc::new(PreparedPlan { fields, plan }));
                 Ok(())
             }
             Entry::Occupied(e) => {
@@ -898,6 +919,7 @@ pub struct SessionStateBuilder {
     session_id: Option<String>,
     analyzer: Option<Analyzer>,
     expr_planners: Option<Vec<Arc<dyn ExprPlanner>>>,
+    #[cfg(feature = "sql")]
     type_planner: Option<Arc<dyn TypePlanner>>,
     optimizer: Option<Optimizer>,
     physical_optimizers: Option<PhysicalOptimizer>,
@@ -934,6 +956,7 @@ impl SessionStateBuilder {
             session_id: None,
             analyzer: None,
             expr_planners: None,
+            #[cfg(feature = "sql")]
             type_planner: None,
             optimizer: None,
             physical_optimizers: None,
@@ -983,6 +1006,7 @@ impl SessionStateBuilder {
             session_id: None,
             analyzer: Some(existing.analyzer),
             expr_planners: Some(existing.expr_planners),
+            #[cfg(feature = "sql")]
             type_planner: existing.type_planner,
             optimizer: Some(existing.optimizer),
             physical_optimizers: Some(existing.physical_optimizers),
@@ -1124,6 +1148,7 @@ impl SessionStateBuilder {
     }
 
     /// Set the [`TypePlanner`] used to customize the behavior of the SQL planner.
+    #[cfg(feature = "sql")]
     pub fn with_type_planner(mut self, type_planner: Arc<dyn TypePlanner>) -> Self {
         self.type_planner = Some(type_planner);
         self
@@ -1305,7 +1330,7 @@ impl SessionStateBuilder {
     /// let url = Url::try_from("file://").unwrap();
     /// let object_store = object_store::local::LocalFileSystem::new();
     /// let state = SessionStateBuilder::new()
-    ///     .with_config(SessionConfig::new())  
+    ///     .with_config(SessionConfig::new())
     ///     .with_object_store(&url, Arc::new(object_store))
     ///     .with_default_features()
     ///     .build();
@@ -1335,6 +1360,7 @@ impl SessionStateBuilder {
             session_id,
             analyzer,
             expr_planners,
+            #[cfg(feature = "sql")]
             type_planner,
             optimizer,
             physical_optimizers,
@@ -1364,6 +1390,7 @@ impl SessionStateBuilder {
             session_id: session_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
             analyzer: analyzer.unwrap_or_default(),
             expr_planners: expr_planners.unwrap_or_default(),
+            #[cfg(feature = "sql")]
             type_planner,
             optimizer: optimizer.unwrap_or_default(),
             physical_optimizers: physical_optimizers.unwrap_or_default(),
@@ -1399,12 +1426,31 @@ impl SessionStateBuilder {
         }
 
         if let Some(scalar_functions) = scalar_functions {
-            scalar_functions.into_iter().for_each(|udf| {
-                let existing_udf = state.register_udf(udf);
-                if let Ok(Some(existing_udf)) = existing_udf {
-                    debug!("Overwrote an existing UDF: {}", existing_udf.name());
+            for udf in scalar_functions {
+                let config_options = state.config().options();
+                match udf.inner().with_updated_config(config_options) {
+                    Some(new_udf) => {
+                        if let Err(err) = state.register_udf(Arc::new(new_udf)) {
+                            debug!(
+                                "Failed to re-register updated UDF '{}': {}",
+                                udf.name(),
+                                err
+                            );
+                        }
+                    }
+                    None => match state.register_udf(Arc::clone(&udf)) {
+                        Ok(Some(existing)) => {
+                            debug!("Overwrote existing UDF '{}'", existing.name());
+                        }
+                        Ok(None) => {
+                            debug!("Registered UDF '{}'", udf.name());
+                        }
+                        Err(err) => {
+                            debug!("Failed to register UDF '{}': {}", udf.name(), err);
+                        }
+                    },
                 }
-            });
+            }
         }
 
         if let Some(aggregate_functions) = aggregate_functions {
@@ -1482,6 +1528,7 @@ impl SessionStateBuilder {
     }
 
     /// Returns the current type_planner value
+    #[cfg(feature = "sql")]
     pub fn type_planner(&mut self) -> &mut Option<Arc<dyn TypePlanner>> {
         &mut self.type_planner
     }
@@ -1596,7 +1643,8 @@ impl Debug for SessionStateBuilder {
     /// Prefer having short fields at the top and long vector fields near the end
     /// Group fields by
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SessionStateBuilder")
+        let mut debug_struct = f.debug_struct("SessionStateBuilder");
+        let ret = debug_struct
             .field("session_id", &self.session_id)
             .field("config", &self.config)
             .field("runtime_env", &self.runtime_env)
@@ -1607,9 +1655,10 @@ impl Debug for SessionStateBuilder {
             .field("table_options", &self.table_options)
             .field("table_factories", &self.table_factories)
             .field("function_factory", &self.function_factory)
-            .field("expr_planners", &self.expr_planners)
-            .field("type_planner", &self.type_planner)
-            .field("query_planners", &self.query_planner)
+            .field("expr_planners", &self.expr_planners);
+        #[cfg(feature = "sql")]
+        let ret = ret.field("type_planner", &self.type_planner);
+        ret.field("query_planners", &self.query_planner)
             .field("analyzer_rules", &self.analyzer_rules)
             .field("analyzer", &self.analyzer)
             .field("optimizer_rules", &self.optimizer_rules)
@@ -1640,11 +1689,13 @@ impl From<SessionState> for SessionStateBuilder {
 ///
 /// This is used so the SQL planner can access the state of the session without
 /// having a direct dependency on the [`SessionState`] struct (and core crate)
+#[cfg(feature = "sql")]
 struct SessionContextProvider<'a> {
     state: &'a SessionState,
     tables: HashMap<ResolvedTableReference, Arc<dyn TableSource>>,
 }
 
+#[cfg(feature = "sql")]
 impl ContextProvider for SessionContextProvider<'_> {
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
         self.state.expr_planners()
@@ -1698,9 +1749,11 @@ impl ContextProvider for SessionContextProvider<'_> {
     fn create_cte_work_table(
         &self,
         name: &str,
-        schema: SchemaRef,
+        schema: arrow::datatypes::SchemaRef,
     ) -> datafusion_common::Result<Arc<dyn TableSource>> {
-        let table = Arc::new(CteWorkTable::new(name, schema));
+        let table = Arc::new(crate::datasource::cte_worktable::CteWorkTable::new(
+            name, schema,
+        ));
         Ok(provider_as_source(table))
     }
 
@@ -1717,6 +1770,8 @@ impl ContextProvider for SessionContextProvider<'_> {
     }
 
     fn get_variable_type(&self, variable_names: &[String]) -> Option<DataType> {
+        use datafusion_expr::var_provider::{is_system_variables, VarType};
+
         if variable_names.is_empty() {
             return None;
         }
@@ -1750,14 +1805,21 @@ impl ContextProvider for SessionContextProvider<'_> {
         self.state.window_functions().keys().cloned().collect()
     }
 
-    fn get_file_type(&self, ext: &str) -> datafusion_common::Result<Arc<dyn FileType>> {
+    fn get_file_type(
+        &self,
+        ext: &str,
+    ) -> datafusion_common::Result<
+        Arc<dyn datafusion_common::file_options::file_type::FileType>,
+    > {
         self.state
             .file_formats
             .get(&ext.to_lowercase())
             .ok_or(plan_datafusion_err!(
                 "There is no registered file format with ext {ext}"
             ))
-            .map(|file_type| format_as_file_type(Arc::clone(file_type)))
+            .map(|file_type| {
+                crate::datasource::file_format::format_as_file_type(Arc::clone(file_type))
+            })
     }
 }
 
@@ -1976,7 +2038,7 @@ impl SimplifyInfo for SessionSimplifyProvider<'_> {
 #[derive(Debug)]
 pub(crate) struct PreparedPlan {
     /// Data types of the parameters
-    pub(crate) data_types: Vec<DataType>,
+    pub(crate) fields: Vec<FieldRef>,
     /// The prepared logical plan
     pub(crate) plan: Arc<LogicalPlan>,
 }
@@ -1998,6 +2060,7 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_catalog::MemoryCatalogProviderList;
+    use datafusion_common::config::Dialect;
     use datafusion_common::DFSchema;
     use datafusion_common::Result;
     use datafusion_execution::config::SessionConfig;
@@ -2010,8 +2073,10 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    #[cfg(feature = "sql")]
     fn test_session_state_with_default_features() {
         // test array planners with and without builtin planners
+        #[cfg(feature = "sql")]
         fn sql_to_expr(state: &SessionState) -> Result<Expr> {
             let provider = SessionContextProvider {
                 state,
@@ -2021,8 +2086,8 @@ mod tests {
             let sql = "[1,2,3]";
             let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
             let df_schema = DFSchema::try_from(schema)?;
-            let dialect = state.config.options().sql_parser.dialect.as_str();
-            let sql_expr = state.sql_to_expr(sql, dialect)?;
+            let dialect = state.config.options().sql_parser.dialect;
+            let sql_expr = state.sql_to_expr(sql, &dialect)?;
 
             let query = SqlToRel::new_with_options(&provider, state.get_parser_options());
             query.sql_to_expr(sql_expr, &df_schema, &mut PlannerContext::new())
@@ -2180,7 +2245,8 @@ mod tests {
             }
 
             let state = &context_provider.state;
-            let statement = state.sql_to_statement("select count(*) from t", "mysql")?;
+            let statement =
+                state.sql_to_statement("select count(*) from t", &Dialect::MySQL)?;
             let plan = SqlToRel::new(&context_provider).statement_to_plan(statement)?;
             state.create_physical_plan(&plan).await
         }

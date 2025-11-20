@@ -20,13 +20,15 @@ use arrow::{array::RecordBatch, compute::concat_batches};
 use datafusion::{datasource::object_store::ObjectStoreUrl, physical_plan::PhysicalExpr};
 use datafusion_common::{config::ConfigOptions, internal_err, Result, Statistics};
 use datafusion_datasource::{
-    file::FileSource, file_meta::FileMeta, file_scan_config::FileScanConfig,
+    file::FileSource, file_scan_config::FileScanConfig,
     file_scan_config::FileScanConfigBuilder, file_stream::FileOpenFuture,
     file_stream::FileOpener, schema_adapter::DefaultSchemaAdapterFactory,
     schema_adapter::SchemaAdapterFactory, source::DataSourceExec, PartitionedFile,
+    TableSchema,
 };
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
+use datafusion_physical_plan::filter::batch_filter;
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPhase, PushedDown};
 use datafusion_physical_plan::{
     displayable,
@@ -53,14 +55,11 @@ pub struct TestOpener {
     batch_size: Option<usize>,
     schema: Option<SchemaRef>,
     projection: Option<Vec<usize>>,
+    predicate: Option<Arc<dyn PhysicalExpr>>,
 }
 
 impl FileOpener for TestOpener {
-    fn open(
-        &self,
-        _file_meta: FileMeta,
-        _file: PartitionedFile,
-    ) -> Result<FileOpenFuture> {
+    fn open(&self, _partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
         let mut batches = self.batches.clone();
         if let Some(batch_size) = self.batch_size {
             let batch = concat_batches(&batches[0].schema(), &batches)?;
@@ -77,6 +76,12 @@ impl FileOpener for TestOpener {
             let (mapper, projection) = factory.map_schema(&batches[0].schema()).unwrap();
             let mut new_batches = Vec::new();
             for batch in batches {
+                let batch = if let Some(predicate) = &self.predicate {
+                    batch_filter(&batch, predicate)?
+                } else {
+                    batch
+                };
+
                 let batch = batch.project(&projection).unwrap();
                 let batch = mapper.map_batch(batch).unwrap();
                 new_batches.push(batch);
@@ -133,6 +138,7 @@ impl FileSource for TestSource {
             batch_size: self.batch_size,
             schema: self.schema.clone(),
             projection: self.projection.clone(),
+            predicate: self.predicate.clone(),
         })
     }
 
@@ -151,16 +157,20 @@ impl FileSource for TestSource {
         })
     }
 
-    fn with_schema(&self, schema: SchemaRef) -> Arc<dyn FileSource> {
+    fn with_schema(&self, schema: TableSchema) -> Arc<dyn FileSource> {
+        assert!(
+            schema.table_partition_cols().is_empty(),
+            "TestSource does not support partition columns"
+        );
         Arc::new(TestSource {
-            schema: Some(schema),
+            schema: Some(schema.file_schema().clone()),
             ..self.clone()
         })
     }
 
     fn with_projection(&self, config: &FileScanConfig) -> Arc<dyn FileSource> {
         Arc::new(TestSource {
-            projection: config.projection.clone(),
+            projection: config.projection_exprs.as_ref().map(|p| p.column_indices()),
             ..self.clone()
         })
     }

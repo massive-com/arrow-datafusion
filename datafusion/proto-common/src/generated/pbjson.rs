@@ -2007,8 +2007,12 @@ impl<'de> serde::Deserialize<'de> for CsvOptions {
                             if truncated_rows__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("truncatedRows"));
                             }
+<<<<<<< HEAD
                             
                             truncated_rows__ =
+=======
+                            truncated_rows__ = 
+>>>>>>> upstream/branch-51
                                 Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
                             ;
                         }
@@ -5633,6 +5637,9 @@ impl serde::Serialize for ParquetOptions {
         if self.coerce_int96_opt.is_some() {
             len += 1;
         }
+        if self.max_predicate_cache_size_opt.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion_common.ParquetOptions", len)?;
         if self.enable_page_index {
             struct_ser.serialize_field("enablePageIndex", &self.enable_page_index)?;
@@ -5786,6 +5793,15 @@ impl serde::Serialize for ParquetOptions {
                 }
             }
         }
+        if let Some(v) = self.max_predicate_cache_size_opt.as_ref() {
+            match v {
+                parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(v) => {
+                    #[allow(clippy::needless_borrow)]
+                    #[allow(clippy::needless_borrows_for_generic_args)]
+                    struct_ser.serialize_field("maxPredicateCacheSize", ToString::to_string(&v).as_str())?;
+                }
+            }
+        }
         struct_ser.end()
     }
 }
@@ -5853,6 +5869,8 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             "bloomFilterNdv",
             "coerce_int96",
             "coerceInt96",
+            "max_predicate_cache_size",
+            "maxPredicateCacheSize",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -5887,6 +5905,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             BloomFilterFpp,
             BloomFilterNdv,
             CoerceInt96,
+            MaxPredicateCacheSize,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -5938,6 +5957,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             "bloomFilterFpp" | "bloom_filter_fpp" => Ok(GeneratedField::BloomFilterFpp),
                             "bloomFilterNdv" | "bloom_filter_ndv" => Ok(GeneratedField::BloomFilterNdv),
                             "coerceInt96" | "coerce_int96" => Ok(GeneratedField::CoerceInt96),
+                            "maxPredicateCacheSize" | "max_predicate_cache_size" => Ok(GeneratedField::MaxPredicateCacheSize),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -5987,6 +6007,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                 let mut bloom_filter_fpp_opt__ = None;
                 let mut bloom_filter_ndv_opt__ = None;
                 let mut coerce_int96_opt__ = None;
+                let mut max_predicate_cache_size_opt__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::EnablePageIndex => {
@@ -6183,6 +6204,12 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             }
                             coerce_int96_opt__ = map_.next_value::<::std::option::Option<_>>()?.map(parquet_options::CoerceInt96Opt::CoerceInt96);
                         }
+                        GeneratedField::MaxPredicateCacheSize => {
+                            if max_predicate_cache_size_opt__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("maxPredicateCacheSize"));
+                            }
+                            max_predicate_cache_size_opt__ = map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(x.0));
+                        }
                     }
                 }
                 Ok(ParquetOptions {
@@ -6216,6 +6243,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                     bloom_filter_fpp_opt: bloom_filter_fpp_opt__,
                     bloom_filter_ndv_opt: bloom_filter_ndv_opt__,
                     coerce_int96_opt: coerce_int96_opt__,
+                    max_predicate_cache_size_opt: max_predicate_cache_size_opt__,
                 })
             }
         }

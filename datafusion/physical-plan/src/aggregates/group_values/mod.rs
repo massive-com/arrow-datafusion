@@ -40,13 +40,16 @@ pub(crate) use single_group_by::primitive::HashValue;
 
 use crate::aggregates::{
     group_values::single_group_by::{
-        bytes::GroupValuesByes, bytes_view::GroupValuesBytesView,
-        primitive::GroupValuesPrimitive,
+        boolean::GroupValuesBoolean, bytes::GroupValuesBytes,
+        bytes_view::GroupValuesBytesView, primitive::GroupValuesPrimitive,
     },
     order::GroupOrdering,
 };
 
+mod metrics;
 mod null_builder;
+
+pub(crate) use metrics::GroupByMetrics;
 
 /// Stores the group values during hash aggregation.
 ///
@@ -128,7 +131,6 @@ pub trait GroupValues: Send {
 /// `GroupColumn`:  crate::aggregates::group_values::multi_group_by::GroupColumn
 /// `GroupValuesColumn`: crate::aggregates::group_values::multi_group_by::GroupValuesColumn
 /// `GroupValuesRows`: crate::aggregates::group_values::row::GroupValuesRows
-///
 pub fn new_group_values(
     schema: SchemaRef,
     group_ordering: &GroupOrdering,
@@ -174,22 +176,25 @@ pub fn new_group_values(
                 downcast_helper!(Decimal128Type, d);
             }
             DataType::Utf8 => {
-                return Ok(Box::new(GroupValuesByes::<i32>::new(OutputType::Utf8)));
+                return Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Utf8)));
             }
             DataType::LargeUtf8 => {
-                return Ok(Box::new(GroupValuesByes::<i64>::new(OutputType::Utf8)));
+                return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Utf8)));
             }
             DataType::Utf8View => {
                 return Ok(Box::new(GroupValuesBytesView::new(OutputType::Utf8View)));
             }
             DataType::Binary => {
-                return Ok(Box::new(GroupValuesByes::<i32>::new(OutputType::Binary)));
+                return Ok(Box::new(GroupValuesBytes::<i32>::new(OutputType::Binary)));
             }
             DataType::LargeBinary => {
-                return Ok(Box::new(GroupValuesByes::<i64>::new(OutputType::Binary)));
+                return Ok(Box::new(GroupValuesBytes::<i64>::new(OutputType::Binary)));
             }
             DataType::BinaryView => {
                 return Ok(Box::new(GroupValuesBytesView::new(OutputType::BinaryView)));
+            }
+            DataType::Boolean => {
+                return Ok(Box::new(GroupValuesBoolean::new()));
             }
             _ => {}
         }

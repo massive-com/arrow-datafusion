@@ -253,7 +253,11 @@ physical_plan
 statement ok
 drop table t;
 
+<<<<<<< HEAD
 # Regression test for 
+=======
+# Regression test for
+>>>>>>> upstream/branch-51
 # https://github.com/apache/datafusion/issues/17513
 
 query I

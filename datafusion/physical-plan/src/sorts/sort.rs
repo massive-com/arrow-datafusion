@@ -133,7 +133,6 @@ impl ExternalSorterMetrics {
 ///    └─────┘
 ///
 /// in_mem_batches
-///
 /// ```
 ///
 /// # When data does not fit in available memory
@@ -1291,19 +1290,14 @@ impl ExecutionPlan for SortExec {
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
         if !self.preserve_partitioning() {
-            return self.input.partition_statistics(None)?.with_fetch(
-                self.schema(),
-                self.fetch,
-                0,
-                1,
-            );
+            return self
+                .input
+                .partition_statistics(None)?
+                .with_fetch(self.fetch, 0, 1);
         }
-        self.input.partition_statistics(partition)?.with_fetch(
-            self.schema(),
-            self.fetch,
-            0,
-            1,
-        )
+        self.input
+            .partition_statistics(partition)?
+            .with_fetch(self.fetch, 0, 1)
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {

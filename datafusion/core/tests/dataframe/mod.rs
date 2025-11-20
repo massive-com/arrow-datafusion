@@ -27,24 +27,25 @@ use arrow::array::{
 };
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{
-    DataType, Field, Float32Type, Int32Type, Schema, SchemaRef, UInt64Type, UnionFields,
-    UnionMode,
+    DataType, Field, Float32Type, Int32Type, Schema, UInt64Type, UnionFields, UnionMode,
 };
 use arrow::error::ArrowError;
 use arrow::util::pretty::pretty_format_batches;
 use arrow_schema::{SortOptions, TimeUnit};
 use datafusion::{assert_batches_eq, dataframe};
+use datafusion_common::metadata::FieldMetadata;
 use datafusion_functions_aggregate::count::{count_all, count_all_window};
 use datafusion_functions_aggregate::expr_fn::{
-    array_agg, avg, count, count_distinct, max, median, min, sum,
+    array_agg, avg, avg_distinct, count, count_distinct, max, median, min, sum,
+    sum_distinct,
 };
 use datafusion_functions_nested::make_array::make_array_udf;
-use datafusion_functions_window::expr_fn::{first_value, row_number};
+use datafusion_functions_window::expr_fn::{first_value, lead, row_number};
 use insta::assert_snapshot;
 use object_store::local::LocalFileSystem;
-use sqlparser::ast::NullTreatment;
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 use url::Url;
@@ -65,19 +66,24 @@ use datafusion::test_util::{
 use datafusion_catalog::TableProvider;
 use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
 use datafusion_common::{
+<<<<<<< HEAD
     assert_contains, Constraint, Constraints, DFSchema, DataFusionError, ParamValues,
     ScalarValue, TableReference, UnnestOptions,
+=======
+    assert_contains, internal_datafusion_err, Constraint, Constraints, DFSchema,
+    DataFusionError, ScalarValue, SchemaError, TableReference, UnnestOptions,
+>>>>>>> upstream/branch-51
 };
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_datasource::file_format::format_as_file_type;
 use datafusion_execution::config::SessionConfig;
 use datafusion_execution::runtime_env::RuntimeEnv;
-use datafusion_expr::expr::{FieldMetadata, GroupingSet, Sort, WindowFunction};
+use datafusion_expr::expr::{GroupingSet, NullTreatment, Sort, WindowFunction};
 use datafusion_expr::var_provider::{VarProvider, VarType};
 use datafusion_expr::{
     cast, col, create_udf, exists, in_subquery, lit, out_ref_col, placeholder,
     scalar_subquery, when, wildcard, Expr, ExprFunctionExt, ExprSchemable, LogicalPlan,
-    LogicalPlanBuilder, ScalarFunctionImplementation, SortExpr, WindowFrame,
+    LogicalPlanBuilder, ScalarFunctionImplementation, SortExpr, TableType, WindowFrame,
     WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
 };
 use datafusion_physical_expr::aggregate::AggregateExprBuilder;
@@ -90,6 +96,12 @@ use datafusion_physical_plan::aggregates::{
 };
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::{displayable, ExecutionPlan, ExecutionPlanProperties};
+<<<<<<< HEAD
+=======
+
+use datafusion::error::Result as DataFusionResult;
+use datafusion_functions_window::expr_fn::lag;
+>>>>>>> upstream/branch-51
 
 // Get string representation of the plan
 async fn physical_plan_to_string(df: &DataFrame) -> String {
@@ -125,8 +137,7 @@ pub fn table_with_constraints() -> Arc<dyn TableProvider> {
 }
 
 async fn assert_logical_expr_schema_eq_physical_expr_schema(df: DataFrame) -> Result<()> {
-    let logical_expr_dfschema = df.schema();
-    let logical_expr_schema = SchemaRef::from(logical_expr_dfschema.to_owned());
+    let logical_expr_schema = Arc::clone(df.schema().inner());
     let batches = df.collect().await?;
     let physical_expr_schema = batches[0].schema();
     assert_eq!(logical_expr_schema, physical_expr_schema);
@@ -155,6 +166,46 @@ async fn test_array_agg_ord_schema() -> Result<()> {
 
     let result = ctx.sql(query).await?;
     assert_logical_expr_schema_eq_physical_expr_schema(result).await?;
+    Ok(())
+}
+
+type WindowFnCase = (fn() -> Expr, &'static str);
+
+#[tokio::test]
+async fn with_column_window_functions() -> DataFusionResult<()> {
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+    )?;
+
+    let ctx = SessionContext::new();
+
+    let provider = MemTable::try_new(Arc::new(schema), vec![vec![batch]])?;
+    ctx.register_table("t", Arc::new(provider))?;
+
+    // Define test cases: (expr builder, alias name)
+    let test_cases: Vec<WindowFnCase> = vec![
+        (|| lag(col("a"), Some(1), None), "lag_val"),
+        (|| lead(col("a"), Some(1), None), "lead_val"),
+        (row_number, "row_num"),
+    ];
+
+    for (make_expr, alias) in test_cases {
+        let df = ctx.table("t").await?;
+        let expr = make_expr();
+        let df_with = df.with_column(alias, expr)?;
+        let df_schema = df_with.schema().clone();
+
+        assert!(
+            df_schema.has_column_with_unqualified_name(alias),
+            "Schema does not contain expected column {alias}",
+        );
+
+        assert_eq!(2, df_schema.columns().len());
+    }
+
     Ok(())
 }
 
@@ -263,6 +314,27 @@ async fn select_columns() -> Result<()> {
 }
 
 #[tokio::test]
+async fn select_columns_with_nonexistent_columns() -> Result<()> {
+    let t = test_table().await?;
+    let t2 = t.select_columns(&["canada", "c2", "rocks"]);
+
+    match t2 {
+        Err(DataFusionError::SchemaError(boxed_err, _)) => {
+            // Verify it's the first invalid column
+            match boxed_err.as_ref() {
+                SchemaError::FieldNotFound { field, .. } => {
+                    assert_eq!(field.name(), "canada");
+                }
+                _ => panic!("Expected SchemaError::FieldNotFound for 'canada'"),
+            }
+        }
+        _ => panic!("Expected SchemaError"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn select_expr() -> Result<()> {
     // build plan using Table API
     let t = test_table().await?;
@@ -359,6 +431,55 @@ async fn select_with_periods() -> Result<()> {
     "###
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn select_columns_duplicated_names_from_different_qualifiers() -> Result<()> {
+    let t1 = test_table_with_name("t1")
+        .await?
+        .select_columns(&["c1"])?
+        .limit(0, Some(3))?;
+    let t2 = test_table_with_name("t2")
+        .await?
+        .select_columns(&["c1"])?
+        .limit(3, Some(3))?;
+    let t3 = test_table_with_name("t3")
+        .await?
+        .select_columns(&["c1"])?
+        .limit(6, Some(3))?;
+
+    let join_res = t1
+        .join(t2, JoinType::Left, &["t1.c1"], &["t2.c1"], None)?
+        .join(t3, JoinType::Left, &["t1.c1"], &["t3.c1"], None)?;
+    assert_snapshot!(
+        batches_to_sort_string(&join_res.clone().collect().await.unwrap()),
+        @r"
+    +----+----+----+
+    | c1 | c1 | c1 |
+    +----+----+----+
+    | b  | b  |    |
+    | b  | b  |    |
+    | c  |    |    |
+    | d  |    | d  |
+    +----+----+----+
+    "
+    );
+
+    let select_res = join_res.select_columns(&["c1"])?;
+    assert_snapshot!(
+        batches_to_sort_string(&select_res.clone().collect().await.unwrap()),
+        @r"
+    +----+----+----+
+    | c1 | c1 | c1 |
+    +----+----+----+
+    | b  | b  |    |
+    | b  | b  |    |
+    | c  |    |    |
+    | d  |    | d  |
+    +----+----+----+
+    "
+    );
     Ok(())
 }
 
@@ -501,34 +622,85 @@ async fn drop_with_periods() -> Result<()> {
 }
 
 #[tokio::test]
+async fn drop_columns_duplicated_names_from_different_qualifiers() -> Result<()> {
+    let t1 = test_table_with_name("t1")
+        .await?
+        .select_columns(&["c1"])?
+        .limit(0, Some(3))?;
+    let t2 = test_table_with_name("t2")
+        .await?
+        .select_columns(&["c1"])?
+        .limit(3, Some(3))?;
+    let t3 = test_table_with_name("t3")
+        .await?
+        .select_columns(&["c1"])?
+        .limit(6, Some(3))?;
+
+    let join_res = t1
+        .join(t2, JoinType::LeftMark, &["c1"], &["c1"], None)?
+        .join(t3, JoinType::LeftMark, &["c1"], &["c1"], None)?;
+    assert_snapshot!(
+        batches_to_sort_string(&join_res.clone().collect().await.unwrap()),
+        @r"
+    +----+-------+-------+
+    | c1 | mark  | mark  |
+    +----+-------+-------+
+    | b  | true  | false |
+    | c  | false | false |
+    | d  | false | true  |
+    +----+-------+-------+
+    "
+    );
+
+    let drop_res = join_res.drop_columns(&["mark"])?;
+    assert_snapshot!(
+        batches_to_sort_string(&drop_res.clone().collect().await.unwrap()),
+        @r"
+    +----+
+    | c1 |
+    +----+
+    | b  |
+    | c  |
+    | d  |
+    +----+
+    "
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn aggregate() -> Result<()> {
     // build plan using DataFrame API
-    let df = test_table().await?;
+    // union so some of the distincts have a clearly distinct result
+    let df = test_table().await?.union(test_table().await?)?;
     let group_expr = vec![col("c1")];
     let aggr_expr = vec![
-        min(col("c12")),
-        max(col("c12")),
-        avg(col("c12")),
-        sum(col("c12")),
-        count(col("c12")),
-        count_distinct(col("c12")),
+        min(col("c4")).alias("min(c4)"),
+        max(col("c4")).alias("max(c4)"),
+        avg(col("c4")).alias("avg(c4)"),
+        avg_distinct(col("c4")).alias("avg_distinct(c4)"),
+        sum(col("c4")).alias("sum(c4)"),
+        sum_distinct(col("c4")).alias("sum_distinct(c4)"),
+        count(col("c4")).alias("count(c4)"),
+        count_distinct(col("c4")).alias("count_distinct(c4)"),
     ];
 
     let df: Vec<RecordBatch> = df.aggregate(group_expr, aggr_expr)?.collect().await?;
 
     assert_snapshot!(
         batches_to_sort_string(&df),
-        @r###"
-    +----+-----------------------------+-----------------------------+-----------------------------+-----------------------------+-------------------------------+----------------------------------------+
-    | c1 | min(aggregate_test_100.c12) | max(aggregate_test_100.c12) | avg(aggregate_test_100.c12) | sum(aggregate_test_100.c12) | count(aggregate_test_100.c12) | count(DISTINCT aggregate_test_100.c12) |
-    +----+-----------------------------+-----------------------------+-----------------------------+-----------------------------+-------------------------------+----------------------------------------+
-    | a  | 0.02182578039211991         | 0.9800193410444061          | 0.48754517466109415         | 10.238448667882977          | 21                            | 21                                     |
-    | b  | 0.04893135681998029         | 0.9185813970744787          | 0.41040709263815384         | 7.797734760124923           | 19                            | 19                                     |
-    | c  | 0.0494924465469434          | 0.991517828651004           | 0.6600456536439784          | 13.860958726523545          | 21                            | 21                                     |
-    | d  | 0.061029375346466685        | 0.9748360509016578          | 0.48855379387549824         | 8.793968289758968           | 18                            | 18                                     |
-    | e  | 0.01479305307777301         | 0.9965400387585364          | 0.48600669271341534         | 10.206140546981722          | 21                            | 21                                     |
-    +----+-----------------------------+-----------------------------+-----------------------------+-----------------------------+-------------------------------+----------------------------------------+
-    "###
+        @r"
+    +----+---------+---------+---------------------+---------------------+---------+------------------+-----------+--------------------+
+    | c1 | min(c4) | max(c4) | avg(c4)             | avg_distinct(c4)    | sum(c4) | sum_distinct(c4) | count(c4) | count_distinct(c4) |
+    +----+---------+---------+---------------------+---------------------+---------+------------------+-----------+--------------------+
+    | a  | -28462  | 32064   | 306.04761904761904  | 306.04761904761904  | 12854   | 6427             | 42        | 21                 |
+    | b  | -28070  | 25286   | 7732.315789473684   | 7732.315789473684   | 293828  | 146914           | 38        | 19                 |
+    | c  | -30508  | 29106   | -1320.5238095238096 | -1320.5238095238096 | -55462  | -27731           | 42        | 21                 |
+    | d  | -24558  | 31106   | 10890.111111111111  | 10890.111111111111  | 392044  | 196022           | 36        | 18                 |
+    | e  | -31500  | 32514   | -4268.333333333333  | -4268.333333333333  | -179270 | -89635           | 42        | 21                 |
+    +----+---------+---------+---------------------+---------------------+---------+------------------+-----------+--------------------+
+    "
     );
 
     Ok(())
@@ -543,7 +715,9 @@ async fn aggregate_assert_no_empty_batches() -> Result<()> {
         min(col("c12")),
         max(col("c12")),
         avg(col("c12")),
+        avg_distinct(col("c12")),
         sum(col("c12")),
+        sum_distinct(col("c12")),
         count(col("c12")),
         count_distinct(col("c12")),
         median(col("c12")),
@@ -619,12 +793,12 @@ async fn test_aggregate_with_pk2() -> Result<()> {
     let df = df.filter(predicate)?;
     assert_snapshot!(
         physical_plan_to_string(&df).await,
-        @r###"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: id@0 = 1 AND name@1 = a
-        AggregateExec: mode=Single, gby=[id@0 as id, name@1 as name], aggr=[]
+        @r"
+    AggregateExec: mode=Single, gby=[id@0 as id, name@1 as name], aggr=[], ordering_mode=Sorted
+      CoalesceBatchesExec: target_batch_size=8192
+        FilterExec: id@0 = 1 AND name@1 = a
           DataSourceExec: partitions=1, partition_sizes=[1]
-    "###
+    "
     );
 
     // Since id and name are functionally dependant, we can use name among expression
@@ -668,12 +842,12 @@ async fn test_aggregate_with_pk3() -> Result<()> {
     let df = df.select(vec![col("id"), col("name")])?;
     assert_snapshot!(
         physical_plan_to_string(&df).await,
-        @r###"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: id@0 = 1
-        AggregateExec: mode=Single, gby=[id@0 as id, name@1 as name], aggr=[]
+        @r"
+    AggregateExec: mode=Single, gby=[id@0 as id, name@1 as name], aggr=[], ordering_mode=PartiallySorted([0])
+      CoalesceBatchesExec: target_batch_size=8192
+        FilterExec: id@0 = 1
           DataSourceExec: partitions=1, partition_sizes=[1]
-    "###
+    "
     );
 
     // Since id and name are functionally dependant, we can use name among expression
@@ -719,12 +893,12 @@ async fn test_aggregate_with_pk4() -> Result<()> {
     // columns are not used.
     assert_snapshot!(
         physical_plan_to_string(&df).await,
-        @r###"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: id@0 = 1
-        AggregateExec: mode=Single, gby=[id@0 as id], aggr=[]
+        @r"
+    AggregateExec: mode=Single, gby=[id@0 as id], aggr=[], ordering_mode=Sorted
+      CoalesceBatchesExec: target_batch_size=8192
+        FilterExec: id@0 = 1
           DataSourceExec: partitions=1, partition_sizes=[1]
-    "###
+    "
     );
 
     let df_results = df.collect().await?;
@@ -1482,7 +1656,9 @@ async fn register_table() -> Result<()> {
     let df_impl = DataFrame::new(ctx.state(), df.logical_plan().clone());
 
     // register a dataframe as a table
-    ctx.register_table("test_table", df_impl.clone().into_view())?;
+    let table_provider = df_impl.clone().into_view();
+    assert_eq!(table_provider.table_type(), TableType::View);
+    ctx.register_table("test_table", table_provider)?;
 
     // pull the table out
     let table = ctx.table("test_table").await?;
@@ -1527,6 +1703,23 @@ async fn register_table() -> Result<()> {
     +----+---------------------+
     "###
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn register_temporary_table() -> Result<()> {
+    let df = test_table().await?.select_columns(&["c1", "c12"])?;
+    let ctx = SessionContext::new();
+    let df_impl = DataFrame::new(ctx.state(), df.logical_plan().clone());
+
+    let df_table_provider = df_impl.clone().into_temporary_view();
+
+    // check that we set the correct table_type
+    assert_eq!(df_table_provider.table_type(), TableType::Temporary);
+
+    // check that we can register a dataframe as a temporary table
+    ctx.register_table("test_table", df_table_provider)?;
+
     Ok(())
 }
 
@@ -2417,7 +2610,7 @@ async fn filtered_aggr_with_param_values() -> Result<()> {
     let df = ctx
         .sql("select count (c2) filter (where c3 > $1) from table1")
         .await?
-        .with_param_values(ParamValues::List(vec![ScalarValue::from(10u64)]));
+        .with_param_values(vec![ScalarValue::from(10u64)]);
 
     let df_results = df?.collect().await?;
     assert_snapshot!(
@@ -2897,18 +3090,18 @@ async fn test_count_wildcard_on_window() -> Result<()> {
     assert_snapshot!(
         pretty_format_batches(&sql_results).unwrap(),
         @r#"
-    +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    | plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                         |
-    +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    | logical_plan  | Projection: count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING AS count(*) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING                                                                                                                                                                                                |
-    |               |   WindowAggr: windowExpr=[[count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING]]                                                                                                                                                                                                                                                                      |
-    |               |     TableScan: t1 projection=[a]                                                                                                                                                                                                                                                                                                                                                             |
-    | physical_plan | ProjectionExec: expr=[count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING@1 as count(*) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING]                                                                                                                                                                                   |
-    |               |   BoundedWindowAggExec: wdw=[count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING: Field { name: "count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING", data_type: Int64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }, frame: RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING], mode=[Sorted] |
-    |               |     SortExec: expr=[a@0 DESC], preserve_partitioning=[false]                                                                                                                                                                                                                                                                                                                                 |
-    |               |       DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                                                                                                                                                                                                                                                      |
-    |               |                                                                                                                                                                                                                                                                                                                                                                                              |
-    +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | plan_type     | plan                                                                                                                                                                                                                                                                                                     |
+    +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | logical_plan  | Projection: count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING AS count(*) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING                                                                                                            |
+    |               |   WindowAggr: windowExpr=[[count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING]]                                                                                                                                                                                  |
+    |               |     TableScan: t1 projection=[a]                                                                                                                                                                                                                                                                         |
+    | physical_plan | ProjectionExec: expr=[count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING@1 as count(*) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING]                                                                                               |
+    |               |   BoundedWindowAggExec: wdw=[count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING: Field { "count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING": Int64 }, frame: RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING], mode=[Sorted] |
+    |               |     SortExec: expr=[a@0 DESC], preserve_partitioning=[false]                                                                                                                                                                                                                                             |
+    |               |       DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                                                                                                                                                                  |
+    |               |                                                                                                                                                                                                                                                                                                          |
+    +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
     "#
     );
 
@@ -2931,22 +3124,172 @@ async fn test_count_wildcard_on_window() -> Result<()> {
     assert_snapshot!(
         pretty_format_batches(&df_results).unwrap(),
         @r#"
-    +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    | plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                                         |
-    +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-    | logical_plan  | Projection: count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING                                                                                                                                                                                                                                                                                       |
-    |               |   WindowAggr: windowExpr=[[count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING]]                                                                                                                                                                                                                                                                      |
-    |               |     TableScan: t1 projection=[a]                                                                                                                                                                                                                                                                                                                                                             |
-    | physical_plan | ProjectionExec: expr=[count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING@1 as count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING]                                                                                                                                                                            |
-    |               |   BoundedWindowAggExec: wdw=[count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING: Field { name: "count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING", data_type: Int64, nullable: false, dict_id: 0, dict_is_ordered: false, metadata: {} }, frame: RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING], mode=[Sorted] |
-    |               |     SortExec: expr=[a@0 DESC], preserve_partitioning=[false]                                                                                                                                                                                                                                                                                                                                 |
-    |               |       DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                                                                                                                                                                                                                                                      |
-    |               |                                                                                                                                                                                                                                                                                                                                                                                              |
-    +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | plan_type     | plan                                                                                                                                                                                                                                                                                                     |
+    +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    | logical_plan  | Projection: count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING                                                                                                                                                                                                   |
+    |               |   WindowAggr: windowExpr=[[count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING]]                                                                                                                                                                                  |
+    |               |     TableScan: t1 projection=[a]                                                                                                                                                                                                                                                                         |
+    | physical_plan | ProjectionExec: expr=[count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING@1 as count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING]                                                                                        |
+    |               |   BoundedWindowAggExec: wdw=[count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING: Field { "count(Int64(1)) ORDER BY [t1.a DESC NULLS FIRST] RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING": Int64 }, frame: RANGE BETWEEN 6 PRECEDING AND 2 FOLLOWING], mode=[Sorted] |
+    |               |     SortExec: expr=[a@0 DESC], preserve_partitioning=[false]                                                                                                                                                                                                                                             |
+    |               |       DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                                                                                                                                                                  |
+    |               |                                                                                                                                                                                                                                                                                                          |
+    +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
     "#
     );
 
     Ok(())
+}
+
+#[tokio::test]
+// Test with `repartition_sorts` disabled, causing a full resort of the data
+async fn union_with_mix_of_presorted_and_explicitly_resorted_inputs_with_repartition_sorts_false(
+) -> Result<()> {
+    assert_snapshot!(
+        union_with_mix_of_presorted_and_explicitly_resorted_inputs_impl(false).await?,
+        @r#"
+    AggregateExec: mode=Final, gby=[id@0 as id], aggr=[], ordering_mode=Sorted
+      SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
+        CoalescePartitionsExec
+          AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[]
+            UnionExec
+              DataSourceExec: file_groups={1 group: [[{testdata}/alltypes_tiny_pages.parquet]]}, projection=[id], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet
+              DataSourceExec: file_groups={1 group: [[{testdata}/alltypes_tiny_pages.parquet]]}, projection=[id], file_type=parquet
+    "#);
+    Ok(())
+}
+
+#[ignore] // See https://github.com/apache/datafusion/issues/18380
+#[tokio::test]
+// Test with `repartition_sorts` enabled to preserve pre-sorted partitions and avoid resorting
+async fn union_with_mix_of_presorted_and_explicitly_resorted_inputs_with_repartition_sorts_true(
+) -> Result<()> {
+    assert_snapshot!(
+        union_with_mix_of_presorted_and_explicitly_resorted_inputs_impl(true).await?,
+        @r#"
+    AggregateExec: mode=Final, gby=[id@0 as id], aggr=[], ordering_mode=Sorted
+      SortPreservingMergeExec: [id@0 ASC NULLS LAST]
+        AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[], ordering_mode=Sorted
+          UnionExec
+            DataSourceExec: file_groups={1 group: [[{testdata}/alltypes_tiny_pages.parquet]]}, projection=[id], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet
+            SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]
+              DataSourceExec: file_groups={1 group: [[{testdata}/alltypes_tiny_pages.parquet]]}, projection=[id], file_type=parquet
+    "#);
+
+    // 💥 Doesn't pass, and generates this plan:
+    //
+    // AggregateExec: mode=Final, gby=[id@0 as id], aggr=[], ordering_mode=Sorted
+    //   SortPreservingMergeExec: [id@0 ASC NULLS LAST]
+    //     SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]
+    //       AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[]
+    //         UnionExec
+    //           DataSourceExec: file_groups={1 group: [[{testdata}/alltypes_tiny_pages.parquet]]}, projection=[id], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet
+    //           DataSourceExec: file_groups={1 group: [[{testdata}/alltypes_tiny_pages.parquet]]}, projection=[id], file_type=parquet
+    //
+    //
+    // === Excerpt from the verbose explain ===
+    //
+    // +------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    // | plan_type                                                  | plan                                                                                                                                                                                                                                                                                                                                        |
+    // +------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+    // | initial_physical_plan                                      | AggregateExec: mode=Final, gby=[id@0 as id], aggr=[], ordering_mode=Sorted                                                                                                                                                                                                                                                                  |
+    // |                                                            |   AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[], ordering_mode=Sorted                                                                                                                                                                                                                                                              |
+    // |                                                            |     UnionExec                                                                                                                                                                                                                                                                                                                               |
+    // |                                                            |       DataSourceExec: file_groups={1 group: [[{testdata}/alltypes_tiny_pages.parquet]]}, projection=[id], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet                                                                                                                               |
+    // |                                                            |       SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                                                                                                                                                                   |
+    // |                                                            |         DataSourceExec: file_groups={1 group: [[{testdata}/alltypes_tiny_pages.parquet]]}, projection=[id], file_type=parquet                                                                                                                                                                    |
+    // ...
+    // | physical_plan after EnforceDistribution                    | OutputRequirementExec: order_by=[], dist_by=Unspecified                                                                                                                                                                                                                                                                                     |
+    // |                                                            |   AggregateExec: mode=Final, gby=[id@0 as id], aggr=[], ordering_mode=Sorted                                                                                                                                                                                                                                                                |
+    // |                                                            |     SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                                                                                                                                                                     |
+    // |                                                            |       CoalescePartitionsExec                                                                                                                                                                                                                                                                                                                |
+    // |                                                            |         AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[], ordering_mode=Sorted                                                                                                                                                                                                                                                        |
+    // |                                                            |           UnionExec                                                                                                                                                                                                                                                                                                                         |
+    // |                                                            |             DataSourceExec: file_groups={1 group: [[{testdata}/alltypes_tiny_pages.parquet]]}, projection=[id], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet                                                                                                                         |
+    // |                                                            |             SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                                                                                                                                                             |
+    // |                                                            |               DataSourceExec: file_groups={1 group: [[{testdata}/alltypes_tiny_pages.parquet]]}, projection=[id], file_type=parquet                                                                                                                                                              |
+    // |                                                            |                                                                                                                                                                                                                                                                                                                                             |
+    // | physical_plan after CombinePartialFinalAggregate           | SAME TEXT AS ABOVE
+    // |                                                            |                                                                                                                                                                                                                                                                                                                                             |
+    // | physical_plan after EnforceSorting                         | OutputRequirementExec: order_by=[], dist_by=Unspecified                                                                                                                                                                                                                                                                                     |
+    // |                                                            |   AggregateExec: mode=Final, gby=[id@0 as id], aggr=[], ordering_mode=Sorted                                                                                                                                                                                                                                                                |
+    // |                                                            |     SortPreservingMergeExec: [id@0 ASC NULLS LAST]                                                                                                                                                                                                                                                                                          |
+    // |                                                            |       SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                                                                                                                                                                                    |
+    // |                                                            |         AggregateExec: mode=Partial, gby=[id@0 as id], aggr=[]                                                                                                                                                                                                                                                                              |
+    // |                                                            |           UnionExec                                                                                                                                                                                                                                                                                                                         |
+    // |                                                            |             DataSourceExec: file_groups={1 group: [[{testdata}/alltypes_tiny_pages.parquet]]}, projection=[id], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet                                                                                                                         |
+    // |                                                            |             DataSourceExec: file_groups={1 group: [[{testdata}/alltypes_tiny_pages.parquet]]}, projection=[id], file_type=parquet                                                                                                                                                                |
+    // ...
+    // +------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+
+    Ok(())
+}
+
+async fn union_with_mix_of_presorted_and_explicitly_resorted_inputs_impl(
+    repartition_sorts: bool,
+) -> Result<String> {
+    let config = SessionConfig::default()
+        .with_target_partitions(1)
+        .with_repartition_sorts(repartition_sorts);
+    let ctx = SessionContext::new_with_config(config);
+
+    let testdata = parquet_test_data();
+
+    // Register "sorted" table, that is sorted
+    ctx.register_parquet(
+        "sorted",
+        &format!("{testdata}/alltypes_tiny_pages.parquet"),
+        ParquetReadOptions::default()
+            .file_sort_order(vec![vec![col("id").sort(true, false)]]),
+    )
+    .await?;
+
+    // Register "unsorted" table
+    ctx.register_parquet(
+        "unsorted",
+        &format!("{testdata}/alltypes_tiny_pages.parquet"),
+        ParquetReadOptions::default(),
+    )
+    .await?;
+
+    let source_sorted = ctx
+        .table("sorted")
+        .await
+        .unwrap()
+        .select(vec![col("id")])
+        .unwrap();
+
+    let source_unsorted = ctx
+        .table("unsorted")
+        .await
+        .unwrap()
+        .select(vec![col("id")])
+        .unwrap();
+
+    let source_unsorted_resorted =
+        source_unsorted.sort(vec![col("id").sort(true, false)])?;
+
+    let union = source_sorted.union(source_unsorted_resorted)?;
+
+    let agg = union.aggregate(vec![col("id")], vec![])?;
+
+    let df = agg;
+
+    // To be able to remove user specific paths from the plan, for stable assertions
+    let testdata_clean = Path::new(&testdata).canonicalize()?.display().to_string();
+    let testdata_clean = testdata_clean.strip_prefix("/").unwrap_or(&testdata_clean);
+
+    // Use displayable() rather than explain().collect() to avoid table formatting issues. We need
+    // to replace machine-specific paths with variable lengths, which breaks table alignment and
+    // causes snapshot mismatches.
+    let physical_plan = df.create_physical_plan().await?;
+    let displayable_plan = displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string()
+        .replace(testdata_clean, "{testdata}");
+
+    Ok(displayable_plan)
 }
 
 #[tokio::test]
@@ -4388,12 +4731,12 @@ async fn unnest_with_redundant_columns() -> Result<()> {
     let actual = formatted.trim();
     assert_snapshot!(
         actual,
-        @r###"
+        @r"
     Projection: shapes.shape_id [shape_id:UInt32]
       Unnest: lists[shape_id2|depth=1] structs[] [shape_id:UInt32, shape_id2:UInt32;N]
-        Aggregate: groupBy=[[shapes.shape_id]], aggr=[[array_agg(shapes.shape_id) AS shape_id2]] [shape_id:UInt32, shape_id2:List(Field { name: "item", data_type: UInt32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} });N]
+        Aggregate: groupBy=[[shapes.shape_id]], aggr=[[array_agg(shapes.shape_id) AS shape_id2]] [shape_id:UInt32, shape_id2:List(Field { data_type: UInt32, nullable: true });N]
           TableScan: shapes projection=[shape_id] [shape_id:UInt32]
-    "###
+    "
     );
 
     let results = df.collect().await?;
@@ -5398,11 +5741,11 @@ async fn union_literal_is_null_and_not_null() -> Result<()> {
     for batch in batches {
         // Verify schema is the same for all batches
         if !schema.contains(&batch.schema()) {
-            return Err(DataFusionError::Internal(format!(
+            return Err(internal_datafusion_err!(
                 "Schema mismatch. Previously had\n{:#?}\n\nGot:\n{:#?}",
                 &schema,
                 batch.schema()
-            )));
+            ));
         }
     }
 
@@ -6264,7 +6607,7 @@ async fn test_copy_schema() -> Result<()> {
     let target_path = tmp_dir.path().join("target.csv");
 
     let query = format!(
-        "COPY source_table TO '{:?}' STORED AS csv",
+        "COPY source_table TO '{}' STORED AS csv",
         target_path.to_str().unwrap()
     );
 
@@ -6412,10 +6755,17 @@ async fn test_duplicate_state_fields_for_dfschema_construct() -> Result<()> {
         "ticker",
         "first_value(value)[first_value]",
         "timestamp@0",
+<<<<<<< HEAD
         "is_set",
         "last_value(value)[last_value]",
         "timestamp@0",
         "is_set",
+=======
+        "first_value(value)[first_value_is_set]",
+        "last_value(value)[last_value]",
+        "timestamp@0",
+        "last_value(value)[last_value_is_set]",
+>>>>>>> upstream/branch-51
     ];
 
     let binding = partial_agg.schema();
