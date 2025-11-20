@@ -93,6 +93,10 @@ impl ParquetFileMetrics {
         // -----------------------
         // 'summary' level metrics
         // -----------------------
+        let row_groups_matched_bloom_filter = MetricBuilder::new(metrics)
+            .with_new_label("filename", filename.to_string())
+            .counter("row_groups_matched_bloom_filter", partition);
+
         let row_groups_pruned_bloom_filter = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
             .with_type(MetricType::SUMMARY)
@@ -173,6 +177,7 @@ impl ParquetFileMetrics {
         Self {
             files_ranges_pruned_statistics,
             predicate_evaluation_errors,
+            row_groups_matched_bloom_filter,
             row_groups_pruned_bloom_filter,
             row_groups_fully_matched_statistics,
             row_groups_matched_statistics,
