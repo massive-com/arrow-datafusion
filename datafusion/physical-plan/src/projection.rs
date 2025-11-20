@@ -306,8 +306,9 @@ impl ExecutionPlan for ProjectionExec {
         self: Arc<Self>,
         node_id: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // https://docs.rs/datafusion/51.0.0/datafusion/physical_plan/projection/struct.ProjectionExec.html#method.expr
         let mut new_plan =
-            ProjectionExec::try_new(self.expr.clone(), Arc::clone(self.input()))?;
+            ProjectionExec::try_new(self.expr().to_vec(), Arc::clone(self.input()))?;
         let new_props = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
