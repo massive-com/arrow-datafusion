@@ -334,10 +334,13 @@ impl ExecutionPlan for UnionExec {
         true
     }
 
+    #[allow(deprecated)]
     fn with_node_id(
         self: Arc<Self>,
         node_id: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // UnionExec::try_new returns Arc<dyn ExecutionPlan>, so we continue to use
+        // the deprecated `UnionExec::new` for now.
         let mut new_plan = UnionExec::new(self.inputs.clone());
         let new_props = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
