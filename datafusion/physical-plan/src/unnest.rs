@@ -278,7 +278,7 @@ impl ExecutionPlan for UnnestExec {
             self.struct_column_indices.clone(),
             Arc::clone(&self.schema),
             self.options.clone(),
-        );
+        )?;
         let new_props = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
