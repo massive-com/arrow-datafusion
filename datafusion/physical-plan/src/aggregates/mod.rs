@@ -1031,7 +1031,6 @@ impl ExecutionPlan for AggregateExec {
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::LowerEqual
     }
-<<<<<<< HEAD
     fn with_node_id(
         self: Arc<Self>,
         node_id: usize,
@@ -1054,7 +1053,7 @@ impl ExecutionPlan for AggregateExec {
         let new_props: PlanProperties = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
-=======
+    }
 
     /// Push down parent filters when possible (see implementation comment for details),
     /// but do not introduce any new self filters.
@@ -1136,7 +1135,6 @@ impl ExecutionPlan for AggregateExec {
         );
 
         Ok(FilterDescription::new().with_child(child_desc))
->>>>>>> upstream/branch-51
     }
 }
 
