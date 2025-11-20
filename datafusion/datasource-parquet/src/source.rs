@@ -53,11 +53,6 @@ use datafusion_physical_plan::metrics::Count;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::DisplayFormatType;
 
-<<<<<<< HEAD
-#[cfg(feature = "parquet_encryption")]
-use datafusion_common::encryption::map_config_decryption_to_decryption;
-=======
->>>>>>> upstream/branch-51
 #[cfg(feature = "parquet_encryption")]
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use itertools::Itertools;
