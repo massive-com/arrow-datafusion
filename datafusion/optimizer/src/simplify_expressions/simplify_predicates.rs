@@ -204,14 +204,6 @@ fn find_most_restrictive_predicate(
 
             if let Some(scalar) = scalar_value {
                 if let Some(current_best) = best_value {
-<<<<<<< HEAD
-                    if let Some(comparison) = scalar.partial_cmp(current_best) {
-                        let is_better = if find_greater {
-                            comparison == std::cmp::Ordering::Greater
-                        } else {
-                            comparison == std::cmp::Ordering::Less
-                        };
-=======
                     let comparison = scalar.try_cmp(current_best)?;
                     let is_better = if find_greater {
                         comparison == std::cmp::Ordering::Greater
@@ -222,12 +214,10 @@ fn find_most_restrictive_predicate(
                             || (comparison == std::cmp::Ordering::Equal
                                 && op == &Operator::Lt)
                     };
->>>>>>> upstream/branch-51
 
-                        if is_better {
-                            best_value = Some(scalar);
-                            most_restrictive_idx = idx;
-                        }
+                    if is_better {
+                        best_value = Some(scalar);
+                        most_restrictive_idx = idx;
                     }
                 } else {
                     best_value = Some(scalar);
