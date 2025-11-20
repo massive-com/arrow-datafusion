@@ -97,8 +97,6 @@
 //!  assert_eq!(format!("{:?}", plan), format!("{:?}", logical_round_trip));
 //! # Ok(())
 //! # }
-<<<<<<< HEAD
-=======
 //! ```
 //! # Example: Serializing [`ExecutionPlan`]s
 //!
@@ -122,7 +120,6 @@
 //! # Ok(())
 //! # }
 //! ```
->>>>>>> upstream/branch-51
 pub mod bytes;
 pub mod common;
 pub mod generated;
