@@ -225,6 +225,8 @@ impl ExecutionPlan for AnalyzeExec {
         let mut new_plan = AnalyzeExec::new(
             self.verbose,
             self.show_statistics,
+            // https://docs.rs/datafusion/51.0.0/datafusion/physical_plan/analyze/struct.AnalyzeExec.html#method.new
+            self.metric_types.clone(),
             Arc::clone(self.input()),
             Arc::clone(&self.schema),
         );
