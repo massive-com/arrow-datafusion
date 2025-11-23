@@ -2296,13 +2296,10 @@ impl DefaultPhysicalPlanner {
             displayable(new_plan.as_ref()).indent(false)
         );
 
-<<<<<<< HEAD
         // Don't print new_plan directly, as that may overflow the stack.
         // For example:
         // thread 'tokio-runtime-worker' has overflowed its stack
         // fatal runtime error: stack overflow, aborting
-=======
->>>>>>> origin/branch-51
         debug!(
             "Detailed optimized physical plan:\n{}\n",
             displayable(new_plan.as_ref()).indent(true)
