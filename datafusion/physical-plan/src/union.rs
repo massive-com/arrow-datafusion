@@ -334,6 +334,7 @@ impl ExecutionPlan for UnionExec {
         true
     }
 
+    #[allow(deprecated)]
     fn with_node_id(
         self: Arc<Self>,
         node_id: usize,
