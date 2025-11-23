@@ -307,7 +307,7 @@ impl ExecutionPlan for ProjectionExec {
         node_id: usize,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let mut new_plan =
-            ProjectionExec::try_new(self.expr.clone(), Arc::clone(self.input()))?;
+            ProjectionExec::try_new(self.expr().to_vec(), Arc::clone(self.input()))?;
         let new_props = new_plan.cache.clone().with_node_id(node_id);
         new_plan.cache = new_props;
         Ok(Some(Arc::new(new_plan)))
