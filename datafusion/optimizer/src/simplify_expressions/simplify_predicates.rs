@@ -215,11 +215,10 @@ fn find_most_restrictive_predicate(
                                 && op == &Operator::Lt)
                     };
 
-                        if is_better {
-                            best_value = Some(scalar);
-                            most_restrictive_idx = idx;
-                        }
-
+                    if is_better {
+                        best_value = Some(scalar);
+                        most_restrictive_idx = idx;
+                    }
                 } else {
                     best_value = Some(scalar);
                     most_restrictive_idx = idx;
