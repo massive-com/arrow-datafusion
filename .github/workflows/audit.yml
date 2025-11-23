@@ -36,8 +36,6 @@ on:
   
   merge_group:
 
-  merge_group:
-
 jobs:
   security_audit:
     runs-on: ubuntu-latest
