@@ -225,6 +225,7 @@ impl ExecutionPlan for AnalyzeExec {
         let mut new_plan = AnalyzeExec::new(
             self.verbose,
             self.show_statistics,
+            self.metric_types.clone(),
             Arc::clone(self.input()),
             Arc::clone(&self.schema),
         );
