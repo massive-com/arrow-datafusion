@@ -192,12 +192,8 @@ impl RowGroupAccessPlanFilter {
                         self.access_plan.skip(*idx);
                         metrics.row_groups_pruned_statistics.add_pruned(1);
                     } else {
-<<<<<<< HEAD
                         metrics.row_groups_pruned_statistics.add_matched(1);
-=======
                         fully_contained_candidates_original_idx.push(*idx);
-                        metrics.row_groups_matched_statistics.add(1);
->>>>>>> origin/branch-51
                     }
                 }
 
