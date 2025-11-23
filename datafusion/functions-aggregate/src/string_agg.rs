@@ -222,6 +222,10 @@ impl AggregateUDFImpl for StringAgg {
         datafusion_expr::ReversedUDAF::Reversed(string_agg_udaf())
     }
 
+    fn reverse_expr(&self) -> datafusion_expr::ReversedUDAF {
+        datafusion_expr::ReversedUDAF::Reversed(string_agg_udaf())
+    }
+
     fn documentation(&self) -> Option<&Documentation> {
         self.doc()
     }

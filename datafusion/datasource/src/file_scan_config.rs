@@ -201,6 +201,8 @@ pub struct FileScanConfig {
     /// Expression adapter used to adapt filters and projections that are pushed down into the scan
     /// from the logical schema to the physical schema of the file.
     pub expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    /// If there is a limit pushed down at the logical plan level, we can enable limit_pruning
+    pub limit_pruning: bool,
 }
 
 /// A builder for [`FileScanConfig`]'s.
@@ -276,6 +278,8 @@ pub struct FileScanConfigBuilder {
     new_lines_in_values: Option<bool>,
     batch_size: Option<usize>,
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    /// If there is a limit pushed down at the logical plan level, we can enable limit_pruning
+    limit_pruning: bool,
 }
 
 impl FileScanConfigBuilder {
@@ -304,6 +308,7 @@ impl FileScanConfigBuilder {
             constraints: None,
             batch_size: None,
             expr_adapter_factory: None,
+            limit_pruning: false,
         }
     }
 
@@ -444,6 +449,12 @@ impl FileScanConfigBuilder {
         self
     }
 
+    /// Enable or disable limit pruning.
+    pub fn with_limit_pruning(mut self, limit_pruning: bool) -> Self {
+        self.limit_pruning = limit_pruning;
+        self
+    }
+
     /// Build the final [`FileScanConfig`] with all the configured settings.
     ///
     /// This method takes ownership of the builder and returns the constructed `FileScanConfig`.
@@ -463,6 +474,7 @@ impl FileScanConfigBuilder {
             new_lines_in_values,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            limit_pruning,
         } = self;
 
         let constraints = constraints.unwrap_or_default();
@@ -495,6 +507,7 @@ impl FileScanConfigBuilder {
             new_lines_in_values,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            limit_pruning,
         }
     }
 }
@@ -517,6 +530,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             constraints: Some(config.constraints),
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
+            limit_pruning: config.limit_pruning,
         }
     }
 }
@@ -611,8 +625,26 @@ impl DataSource for FileScanConfig {
         if let Some(filter) = self.file_source.filter() {
             // We need to remap column indexes to match the projected schema since that's what the equivalence properties deal with.
             // Note that this will *ignore* any non-projected columns: these don't factor into ordering / equivalence.
+<<<<<<< HEAD
             match Self::add_filter_equivalence_info(filter, &mut eq_properties, &schema) {
                 Ok(()) => {}
+=======
+            match reassign_predicate_columns(filter, &schema, true) {
+                Ok(filter) => {
+                    match Self::add_filter_equivalence_info(
+                        filter,
+                        &mut eq_properties,
+                        &schema,
+                    ) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            warn!("Failed to add filter equivalence info: {e}");
+                            #[cfg(debug_assertions)]
+                            panic!("Failed to add filter equivalence info: {e}");
+                        }
+                    }
+                }
+>>>>>>> origin/branch-51
                 Err(e) => {
                     warn!("Failed to add filter equivalence info: {e}");
                     #[cfg(debug_assertions)]
@@ -816,6 +848,7 @@ impl FileScanConfig {
         eq_properties: &mut EquivalenceProperties,
         schema: &Schema,
     ) -> Result<()> {
+<<<<<<< HEAD
         // Gather valid equality pairs from the filter expression
         let equal_pairs = split_conjunction(&filter).into_iter().filter_map(|expr| {
             // Ignore any binary expressions that reference non-existent columns in the current schema
@@ -832,6 +865,25 @@ impl FileScanConfig {
 
         for (lhs, rhs) in equal_pairs {
             eq_properties.add_equal_conditions(lhs, rhs)?
+=======
+        macro_rules! ignore_dangling_col {
+            ($col:expr) => {
+                if let Some(col) = $col.as_any().downcast_ref::<Column>() {
+                    if schema.index_of(col.name()).is_err() {
+                        continue;
+                    }
+                }
+            };
+        }
+
+        let (equal_pairs, _) = collect_columns_from_predicate(&filter);
+        for (lhs, rhs) in equal_pairs {
+            // Ignore any binary expressions that reference non-existent columns in the current schema
+            // (e.g. due to unnecessary projections being removed)
+            ignore_dangling_col!(lhs);
+            ignore_dangling_col!(rhs);
+            eq_properties.add_equal_conditions(Arc::clone(lhs), Arc::clone(rhs))?
+>>>>>>> origin/branch-51
         }
 
         Ok(())
@@ -1519,8 +1571,12 @@ mod tests {
     use datafusion_common::{assert_batches_eq, internal_err};
     use datafusion_expr::{Operator, SortExpr};
     use datafusion_physical_expr::create_physical_sort_expr;
+<<<<<<< HEAD
     use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
     use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
+=======
+    use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
+>>>>>>> origin/branch-51
 
     /// Returns the column names on the schema
     pub fn columns(schema: &Schema) -> Vec<String> {
@@ -2296,7 +2352,11 @@ mod tests {
             Arc::clone(&file_schema),
             Arc::clone(&file_source),
         )
+<<<<<<< HEAD
         .with_projection_indices(Some(vec![0, 1, 2]))
+=======
+        .with_projection(Some(vec![0, 1, 2]))
+>>>>>>> origin/branch-51
         .build();
 
         // Simulate projection being updated. Since the filter has already been pushed down,

@@ -223,7 +223,17 @@ impl ExecutionPlan for CoalesceBatchesExec {
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Equal
     }
-
+    fn with_node_id(
+        self: Arc<Self>,
+        node_id: usize,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let mut new_plan =
+            CoalesceBatchesExec::new(Arc::clone(self.input()), self.target_batch_size)
+                .with_fetch(self.fetch());
+        let new_props = new_plan.cache.clone().with_node_id(node_id);
+        new_plan.cache = new_props;
+        Ok(Some(Arc::new(new_plan)))
+    }
     fn gather_filters_for_pushdown(
         &self,
         _phase: FilterPushdownPhase,

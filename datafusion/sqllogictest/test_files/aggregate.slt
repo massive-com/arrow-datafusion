@@ -6601,7 +6601,11 @@ query TT
 explain select string_agg(k, ',' order by v) from t;
 ----
 logical_plan
+<<<<<<< HEAD
 01)Aggregate: groupBy=[[]], aggr=[[string_agg(t.k, Utf8(",")) ORDER BY [t.v ASC NULLS LAST]]]
+=======
+01)Aggregate: groupBy=[[]], aggr=[[string_agg(t.k, Utf8(",")) ORDER BY [t.v ASC NULLS LAST]]]     
+>>>>>>> origin/branch-51
 02)--TableScan: t projection=[k, v]
 physical_plan
 01)AggregateExec: mode=Single, gby=[], aggr=[string_agg(t.k,Utf8(",")) ORDER BY [t.v ASC NULLS LAST]]
@@ -6617,7 +6621,11 @@ query TT
 explain select string_agg(k, ',' order by v desc) from t;
 ----
 logical_plan
+<<<<<<< HEAD
 01)Aggregate: groupBy=[[]], aggr=[[string_agg(t.k, Utf8(",")) ORDER BY [t.v DESC NULLS FIRST]]]
+=======
+01)Aggregate: groupBy=[[]], aggr=[[string_agg(t.k, Utf8(",")) ORDER BY [t.v DESC NULLS FIRST]]]   
+>>>>>>> origin/branch-51
 02)--TableScan: t projection=[k, v]
 physical_plan
 01)AggregateExec: mode=Single, gby=[], aggr=[string_agg(t.k,Utf8(",")) ORDER BY [t.v DESC NULLS FIRST]]

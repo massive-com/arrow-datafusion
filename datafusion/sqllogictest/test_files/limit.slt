@@ -733,7 +733,7 @@ explain select * from testSubQueryLimit as t1 join (select * from testSubQueryLi
 ----
 logical_plan
 01)Limit: skip=0, fetch=10
-02)--Cross Join: 
+02)--Cross Join:
 03)----SubqueryAlias: t1
 04)------Limit: skip=0, fetch=10
 05)--------TableScan: testsubquerylimit projection=[a, b], fetch=10
@@ -758,7 +758,7 @@ explain select * from testSubQueryLimit as t1 join (select * from testSubQueryLi
 ----
 logical_plan
 01)Limit: skip=0, fetch=2
-02)--Cross Join: 
+02)--Cross Join:
 03)----SubqueryAlias: t1
 04)------Limit: skip=0, fetch=2
 05)--------TableScan: testsubquerylimit projection=[a, b], fetch=2
