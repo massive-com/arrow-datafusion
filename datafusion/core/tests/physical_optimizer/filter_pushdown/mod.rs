@@ -906,11 +906,7 @@ async fn test_topk_filter_passes_through_coalesce_partitions() {
         Ok:
           - SortExec: TopK(fetch=1), expr=[b@1 DESC NULLS LAST], preserve_partitioning=[false]
           -   CoalescePartitionsExec
-<<<<<<< HEAD
           -     DataSourceExec: file_groups={2 groups: [[test1.parquet], [test2.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
-=======
-          -     DataSourceExec: file_groups={2 groups: [[test1.parquet], [test2.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=DynamicFilterPhysicalExpr [ true ]
->>>>>>> origin/branch-51
     "
     );
 }
@@ -965,11 +961,7 @@ async fn test_topk_filter_passes_through_coalesce_batches() {
         Ok:
           - SortExec: TopK(fetch=1), expr=[b@1 DESC NULLS LAST], preserve_partitioning=[false]
           -   CoalesceBatchesExec: target_batch_size=1024
-<<<<<<< HEAD
           -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
-=======
-          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true, predicate=DynamicFilterPhysicalExpr [ true ]
->>>>>>> origin/branch-51
     "
     );
 }
