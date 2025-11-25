@@ -363,6 +363,17 @@ impl ExecutionPlan for SortPreservingMergeExec {
         true
     }
 
+    fn with_node_id(
+        self: Arc<Self>,
+        node_id: usize,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let mut new_plan =
+            SortPreservingMergeExec::new(self.expr.clone(), Arc::clone(self.input()))
+                .with_fetch(self.fetch());
+        let new_props = new_plan.cache.clone().with_node_id(node_id);
+        new_plan.cache = new_props;
+        Ok(Some(Arc::new(new_plan)))
+    }
     /// Tries to swap the projection with its input [`SortPreservingMergeExec`].
     /// If this is possible, it returns the new [`SortPreservingMergeExec`] whose
     /// child is a projection. Otherwise, it returns None.

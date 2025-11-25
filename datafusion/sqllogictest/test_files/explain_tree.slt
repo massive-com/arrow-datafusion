@@ -818,7 +818,7 @@ physical_plan
 40)└───────────────────────────┘
 
 query TT
-explain select 
+explain select
   count(*) over(),
   row_number() over ()
 from table1
@@ -931,7 +931,7 @@ physical_plan
 27)└───────────────────────────┘
 
 query TT
-explain select 
+explain select
   rank() over(ORDER BY int_col DESC),
   row_number() over (ORDER BY int_col ASC)
 from table1
@@ -1470,8 +1470,8 @@ drop table t2;
 # prepare table
 statement ok
 CREATE UNBOUNDED EXTERNAL TABLE data (
-    "date"   DATE, 
-    "ticker" VARCHAR, 
+    "date"   DATE,
+    "ticker" VARCHAR,
     "time"   TIMESTAMP,
 ) STORED AS CSV
 WITH ORDER ("date", "ticker", "time")
@@ -1480,8 +1480,8 @@ LOCATION './a.parquet';
 
 # query
 query TT
-explain SELECT * FROM data 
-WHERE ticker = 'A' 
+explain SELECT * FROM data
+WHERE ticker = 'A'
 ORDER BY "date", "time";
 ----
 physical_plan
@@ -1643,7 +1643,7 @@ physical_plan
 
 # same thing but order by time, date
 query TT
-explain SELECT * FROM data 
+explain SELECT * FROM data
 WHERE ticker = 'A' AND CAST(time AS DATE) = date
 ORDER BY "time", "date";
 ----
@@ -1736,8 +1736,8 @@ physical_plan
 
 # query
 query TT
-explain SELECT * FROM data 
-WHERE date = '2006-01-02' 
+explain SELECT * FROM data
+WHERE date = '2006-01-02'
 ORDER BY "ticker", "time";
 ----
 physical_plan

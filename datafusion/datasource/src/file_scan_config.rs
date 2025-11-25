@@ -201,6 +201,8 @@ pub struct FileScanConfig {
     /// Expression adapter used to adapt filters and projections that are pushed down into the scan
     /// from the logical schema to the physical schema of the file.
     pub expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    /// If there is a limit pushed down at the logical plan level, we can enable limit_pruning
+    pub limit_pruning: bool,
 }
 
 /// A builder for [`FileScanConfig`]'s.
@@ -276,6 +278,8 @@ pub struct FileScanConfigBuilder {
     new_lines_in_values: Option<bool>,
     batch_size: Option<usize>,
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    /// If there is a limit pushed down at the logical plan level, we can enable limit_pruning
+    limit_pruning: bool,
 }
 
 impl FileScanConfigBuilder {
@@ -304,6 +308,7 @@ impl FileScanConfigBuilder {
             constraints: None,
             batch_size: None,
             expr_adapter_factory: None,
+            limit_pruning: false,
         }
     }
 
@@ -444,6 +449,12 @@ impl FileScanConfigBuilder {
         self
     }
 
+    /// Enable or disable limit pruning.
+    pub fn with_limit_pruning(mut self, limit_pruning: bool) -> Self {
+        self.limit_pruning = limit_pruning;
+        self
+    }
+
     /// Build the final [`FileScanConfig`] with all the configured settings.
     ///
     /// This method takes ownership of the builder and returns the constructed `FileScanConfig`.
@@ -463,6 +474,7 @@ impl FileScanConfigBuilder {
             new_lines_in_values,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            limit_pruning,
         } = self;
 
         let constraints = constraints.unwrap_or_default();
@@ -495,6 +507,7 @@ impl FileScanConfigBuilder {
             new_lines_in_values,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            limit_pruning,
         }
     }
 }
@@ -517,6 +530,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             constraints: Some(config.constraints),
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
+            limit_pruning: config.limit_pruning,
         }
     }
 }
