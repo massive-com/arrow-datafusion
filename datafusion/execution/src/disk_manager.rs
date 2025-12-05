@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::{Builder, NamedTempFile, TempDir};
 
-use crate::memory_pool::human_readable_size;
+use datafusion_common::human_readable_size;
 
 const DEFAULT_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
 

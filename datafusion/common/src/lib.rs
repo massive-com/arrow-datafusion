@@ -72,6 +72,9 @@ pub use dfschema::{
     qualified_name, DFSchema, DFSchemaRef, ExprSchema, SchemaExt, ToDFSchema,
 };
 pub use diagnostic::Diagnostic;
+pub use display::human_readable::{
+    human_readable_count, human_readable_duration, human_readable_size, units,
+};
 pub use error::{
     field_not_found, unqualified_field_not_found, DataFusionError, Result, SchemaError,
     SharedResult,
