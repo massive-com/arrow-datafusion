@@ -29,6 +29,7 @@ use super::common::SharedMemoryReservation;
 use super::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use super::{
     DisplayAs, ExecutionPlanProperties, RecordBatchStream, SendableRecordBatchStream,
+    SortOrderPushdownResult,
 };
 use crate::execution_plan::{CardinalityEffect, EvaluationType, SchedulingType};
 use crate::hash_utils::create_hashes;
@@ -52,7 +53,7 @@ use datafusion_common_runtime::SpawnedTask;
 use datafusion_execution::memory_pool::MemoryConsumer;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
-use datafusion_physical_expr_common::sort_expr::LexOrdering;
+use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 
 use crate::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase,
@@ -1085,6 +1086,27 @@ impl ExecutionPlan for RepartitionExec {
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        // RepartitionExec only maintains input order if preserve_order is set
+        // or if there's only one partition
+        if !self.maintains_input_order()[0] {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+
+        // Delegate to the child and wrap with a new RepartitionExec
+        self.input.try_pushdown_sort(order)?.try_map(|new_input| {
+            let mut new_repartition =
+                RepartitionExec::try_new(new_input, self.partitioning().clone())?;
+            if self.preserve_order {
+                new_repartition = new_repartition.with_preserve_order();
+            }
+            Ok(Arc::new(new_repartition) as Arc<dyn ExecutionPlan>)
+        })
     }
 
     fn repartitioned(

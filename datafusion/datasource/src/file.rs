@@ -30,10 +30,11 @@ use crate::TableSchema;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{not_impl_err, Result, Statistics};
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
+use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 use datafusion_physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_physical_plan::DisplayFormatType;
-
+use datafusion_physical_plan::SortOrderPushdownResult;
 use object_store::ObjectStore;
 
 /// Helper function to convert any type implementing FileSource to Arc&lt;dyn FileSource&gt;
@@ -129,6 +130,21 @@ pub trait FileSource: Send + Sync {
         ))
     }
 
+    /// Try to create a new FileSource that can produce data in the specified sort order.
+    ///
+    /// # Returns
+    /// * `Exact` - Created a source that guarantees perfect ordering
+    /// * `Inexact` - Created a source optimized for ordering (e.g., reordered files) but not perfectly sorted
+    /// * `Unsupported` - Cannot optimize for this ordering
+    ///
+    /// Default implementation returns `Unsupported`.
+    fn try_reverse_output(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn FileSource>>> {
+        Ok(SortOrderPushdownResult::Unsupported)
+    }
+
     /// Set optional schema adapter factory.
     ///
     /// [`SchemaAdapterFactory`] allows user to specify how fields from the
@@ -153,5 +169,23 @@ pub trait FileSource: Send + Sync {
     /// Default implementation returns `None`.
     fn schema_adapter_factory(&self) -> Option<Arc<dyn SchemaAdapterFactory>> {
         None
+    }
+
+    /// Set the file ordering information
+    ///
+    /// This allows the file source to know how the files are sorted,
+    /// enabling it to make informed decisions about sort pushdown.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `not_impl_err!`. FileSource implementations that support
+    /// sort optimization should override this method.
+    fn with_file_ordering_info(
+        &self,
+        _ordering: Option<LexOrdering>,
+    ) -> Result<Arc<dyn FileSource>> {
+        // Default: clone self without modification
+        // ParquetSource will override this
+        not_impl_err!("with_file_ordering_info not implemented for this FileSource")
     }
 }
