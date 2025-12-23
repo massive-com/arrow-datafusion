@@ -41,7 +41,7 @@ use datafusion_common::{DataFusionError, Statistics};
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::TableSchema;
-use datafusion_physical_expr::conjunction;
+use datafusion_physical_expr::{conjunction, EquivalenceProperties};
 use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::{fmt_sql, PhysicalExpr};
 use datafusion_physical_plan::filter_pushdown::PushedDown;
@@ -57,6 +57,7 @@ use datafusion_physical_plan::SortOrderPushdownResult;
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use itertools::Itertools;
+use log::info;
 use object_store::ObjectStore;
 #[cfg(feature = "parquet_encryption")]
 use parquet::encryption::decrypt::FileDecryptionProperties;
@@ -290,9 +291,6 @@ pub struct ParquetSource {
     pub(crate) projected_statistics: Option<Statistics>,
     #[cfg(feature = "parquet_encryption")]
     pub(crate) encryption_factory: Option<Arc<dyn EncryptionFactory>>,
-    /// The ordering of data within the files
-    /// This is set by FileScanConfig when it knows the file ordering
-    file_ordering: Option<LexOrdering>,
     /// If true, read files in reverse order and reverse row groups within files.
     /// But it's not guaranteed that rows within row groups are in reverse order,
     /// so we still need to sort them after reading, so the reverse scan is inexact.
@@ -317,7 +315,6 @@ impl ParquetSource {
             projected_statistics: None,
             #[cfg(feature = "parquet_encryption")]
             encryption_factory: None,
-            file_ordering: None,
             reverse_row_groups: false,
         }
     }
@@ -384,11 +381,6 @@ impl ParquetSource {
         self
     }
 
-    /// If set, indicates the ordering of data within the files being read.
-    pub fn with_file_ordering(mut self, ordering: Option<LexOrdering>) -> Self {
-        self.file_ordering = ordering;
-        self
-    }
 
     /// Return the value described in [`Self::with_pushdown_filters`]
     pub(crate) fn pushdown_filters(&self) -> bool {
@@ -487,12 +479,12 @@ impl ParquetSource {
         }
     }
 
-    pub(crate) fn with_reverse_row_groups(mut self, reverse_row_groups: bool) -> Self {
+    pub fn with_reverse_row_groups(mut self, reverse_row_groups: bool) -> Self {
         self.reverse_row_groups = reverse_row_groups;
         self
     }
-    #[cfg(test)]
-    pub(crate) fn reverse_row_groups(&self) -> bool {
+
+    pub fn reverse_row_groups(&self) -> bool {
         self.reverse_row_groups
     }
 }
@@ -854,44 +846,61 @@ impl FileSource for ParquetSource {
     fn try_reverse_output(
         &self,
         order: &[PhysicalSortExpr],
+        eq_properties: &EquivalenceProperties,
     ) -> datafusion_common::Result<SortOrderPushdownResult<Arc<dyn FileSource>>> {
-        // Check if we have file ordering information
-        let file_ordering = match &self.file_ordering {
-            Some(ordering) => ordering,
-            None => return Ok(SortOrderPushdownResult::Unsupported),
-        };
-
-        // Create a LexOrdering from the requested order to use the is_reverse method
-        let Some(requested_ordering) = LexOrdering::new(order.to_vec()) else {
-            // Empty ordering requested, cannot optimize
+        if order.is_empty() {
             return Ok(SortOrderPushdownResult::Unsupported);
+        }
+
+        // Build new equivalence properties with the reversed ordering.
+        // This allows us to check if the reversed ordering satisfies the request
+        // by leveraging:
+        // - Function monotonicity (e.g., extract_year_month preserves ordering)
+        // - Constant columns (from filters)
+        // - Other equivalence relationships
+        //
+        // Example flow:
+        // 1. File ordering: [extract_year_month(ws) DESC, ws DESC]
+        // 2. After reversal: [extract_year_month(ws) ASC, ws ASC]
+        // 3. Requested: [ws ASC]
+        // 4. Through extract_year_month's monotonicity property, the reversed
+        //    ordering satisfies [ws ASC] even though it has additional prefix
+        let reversed_eq_properties = {
+            let mut new = eq_properties.clone();
+            new.clear_orderings();
+
+            // Reverse each ordering in the equivalence properties
+            let reversed_orderings = eq_properties
+                .oeq_class()
+                .iter()
+                .map(|ordering| {
+                    ordering
+                        .iter()
+                        .map(|expr| expr.reverse())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            new.add_orderings(reversed_orderings);
+            new
         };
 
-        // Check if reversing the file ordering would satisfy the requested ordering
-        if file_ordering.is_reverse(&requested_ordering) {
-            // Phase 1: Enable reverse row group scanning
-            let new_source = self.clone().with_reverse_row_groups(true);
-
-            // Return Inexact because we're only reversing row group order,
-            // not guaranteeing perfect row-level ordering
-            return Ok(SortOrderPushdownResult::Inexact {
-                inner: Arc::new(new_source) as Arc<dyn FileSource>,
-            });
+        // Check if the reversed ordering satisfies the requested ordering
+        if !reversed_eq_properties.ordering_satisfy(order.iter().cloned())? {
+            return Ok(SortOrderPushdownResult::Unsupported);
         }
+
+        // Return Inexact because we're only reversing row group order,
+        // not guaranteeing perfect row-level ordering
+        let new_source = self.clone().with_reverse_row_groups(true);
+        Ok(SortOrderPushdownResult::Inexact {
+            inner: Arc::new(new_source) as Arc<dyn FileSource>,
+        })
 
         // TODO Phase 2: Add support for other optimizations:
         // - File reordering based on min/max statistics
         // - Detection of exact ordering (return Exact to remove Sort operator)
         // - Partial sort pushdown for prefix matches
-
-        Ok(SortOrderPushdownResult::Unsupported)
-    }
-
-    fn with_file_ordering_info(
-        &self,
-        ordering: Option<LexOrdering>,
-    ) -> datafusion_common::Result<Arc<dyn FileSource>> {
-        Ok(Arc::new(self.clone().with_file_ordering(ordering)))
     }
 }
 

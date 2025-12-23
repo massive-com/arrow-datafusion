@@ -52,7 +52,7 @@ use datafusion_common::config::EncryptionFactoryOptions;
 use datafusion_execution::parquet_encryption::EncryptionFactory;
 use futures::{ready, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use log::debug;
+use log::{debug, info};
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::AsyncFileReader;
@@ -495,8 +495,11 @@ impl FileOpener for ParquetOpener {
 
             // If reverse scanning is enabled, reverse the prepared plan
             if reverse_row_groups {
+                info!("reversing parquet file scan for file {}", file_name);
                 prepared_plan = prepared_plan.reverse(file_metadata.as_ref())?;
             }
+
+            info!("parquet file scan for file {}", file_name);
 
             // Apply the prepared plan to the builder
             builder = prepared_plan.apply_to_builder(builder);

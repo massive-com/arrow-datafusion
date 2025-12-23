@@ -79,10 +79,7 @@ use crate::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation,
 };
-use crate::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream,
-};
+use crate::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream, SendableRecordBatchStream, SortOrderPushdownResult};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
 use datafusion_common::{internal_err, Result, Statistics};
@@ -91,6 +88,8 @@ use datafusion_execution::TaskContext;
 use crate::execution_plan::SchedulingType;
 use crate::stream::RecordBatchStreamAdapter;
 use futures::{Stream, StreamExt};
+use log::info;
+use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 
 /// A stream that passes record batches through unchanged while cooperating with the Tokio runtime.
 /// It consumes cooperative scheduling budget for each returned [`RecordBatch`],
@@ -312,6 +311,15 @@ impl ExecutionPlan for CooperativeExec {
         _config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
+    }
+
+    fn try_pushdown_sort(&self, order: &[PhysicalSortExpr]) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        info!("CooperativeExec trying to pushdown sort: {:?}", order);
+        self.input
+            .try_pushdown_sort(order)?
+            .try_map(|inner| {
+                Ok(Arc::new(CooperativeExec::new(inner)) as Arc<dyn ExecutionPlan>)
+            })
     }
 }
 
