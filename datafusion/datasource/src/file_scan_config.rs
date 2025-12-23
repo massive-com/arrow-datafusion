@@ -66,7 +66,7 @@ use datafusion_physical_plan::execution_plan::SchedulingType;
 use datafusion_physical_plan::projection::{
     all_alias_free_columns, new_projections_for_columns,
 };
-use log::{debug, info, warn};
+use log::{debug, warn};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::marker::PhantomData;

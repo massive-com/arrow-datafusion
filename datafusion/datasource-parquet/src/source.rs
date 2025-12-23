@@ -55,9 +55,8 @@ use datafusion_physical_plan::SortOrderPushdownResult;
 
 #[cfg(feature = "parquet_encryption")]
 use datafusion_execution::parquet_encryption::EncryptionFactory;
-use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 use itertools::Itertools;
-use log::info;
 use object_store::ObjectStore;
 #[cfg(feature = "parquet_encryption")]
 use parquet::encryption::decrypt::FileDecryptionProperties;
@@ -380,7 +379,6 @@ impl ParquetSource {
         self.table_parquet_options.global.pushdown_filters = pushdown_filters;
         self
     }
-
 
     /// Return the value described in [`Self::with_pushdown_filters`]
     pub(crate) fn pushdown_filters(&self) -> bool {

@@ -22,28 +22,28 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use datafusion_physical_plan::execution_plan::{
-    Boundedness, EmissionType, SchedulingType,
-};
-use datafusion_physical_plan::metrics::SplitMetrics;
-use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
-use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
-use datafusion_physical_plan::stream::BatchSplitStream;
-use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-};
-use itertools::Itertools;
-use log::info;
 use crate::file_scan_config::FileScanConfig;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Constraints, Result, Statistics};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion_physical_plan::execution_plan::{
+    Boundedness, EmissionType, SchedulingType,
+};
 use datafusion_physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
 };
+use datafusion_physical_plan::metrics::SplitMetrics;
+use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
+use datafusion_physical_plan::stream::BatchSplitStream;
 use datafusion_physical_plan::SortOrderPushdownResult;
+use datafusion_physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+};
+use itertools::Itertools;
+use log::info;
 
 /// A source of data, typically a list of files or memory
 ///
@@ -396,7 +396,7 @@ impl ExecutionPlan for DataSourceExec {
         &self,
         order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
-        info!("trying to pushdown sort in DataSource: {:?}", order);
+        info!("trying to pushdown sort in DataSource: {order:?}");
         // Delegate to the data source and wrap result with DataSourceExec
         self.data_source
             .try_pushdown_sort(order)?

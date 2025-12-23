@@ -57,7 +57,6 @@ use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::SortOrderPushdownResult;
 use std::sync::Arc;
-use log::info;
 
 /// A PhysicalOptimizerRule that attempts to push down sort requirements to data sources.
 ///
@@ -92,8 +91,6 @@ impl PhysicalOptimizerRule for PushdownSort {
             let sort_input = Arc::clone(sort_exec.input());
             let required_ordering = sort_exec.expr();
 
-            info!("trying to pushdown sort: {:?}", required_ordering);
-
             // Try to push the sort requirement down through the plan tree
             // Each node type defines its own pushdown behavior via try_pushdown_sort()
             match sort_input.try_pushdown_sort(required_ordering)? {
@@ -102,7 +99,6 @@ impl PhysicalOptimizerRule for PushdownSort {
                     Ok(Transformed::yes(inner))
                 }
                 SortOrderPushdownResult::Inexact { inner } => {
-                    info!("inexact pushdown sort : {:?}", required_ordering);
                     // Data source is optimized for the ordering but not perfectly sorted
                     // Keep the Sort operator but use the optimized input
                     // Benefits: TopK queries can terminate early, better cache locality
@@ -115,7 +111,6 @@ impl PhysicalOptimizerRule for PushdownSort {
                     )))
                 }
                 SortOrderPushdownResult::Unsupported => {
-                    info!("unsupported pushdown sort : {:?}", required_ordering);
                     // Cannot optimize for this ordering - no change
                     Ok(Transformed::no(plan))
                 }

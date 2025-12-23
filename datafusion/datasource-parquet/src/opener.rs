@@ -495,11 +495,11 @@ impl FileOpener for ParquetOpener {
 
             // If reverse scanning is enabled, reverse the prepared plan
             if reverse_row_groups {
-                info!("reversing parquet file scan for file {}", file_name);
+                info!("reversing parquet file scan for file {file_name}");
                 prepared_plan = prepared_plan.reverse(file_metadata.as_ref())?;
             }
 
-            info!("parquet file scan for file {}", file_name);
+            info!("parquet file scan for file {file_name}");
 
             // Apply the prepared plan to the builder
             builder = prepared_plan.apply_to_builder(builder);
