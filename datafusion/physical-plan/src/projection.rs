@@ -354,7 +354,53 @@ impl ExecutionPlan for ProjectionExec {
         order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         let child = self.input();
-        match child.try_pushdown_sort(order)? {
+        let mut child_order = Vec::new();
+
+        // Check and transform sort expressions
+        for sort_expr in order {
+            // Recursively transform the expression
+            let mut can_pushdown = true;
+            let transformed = Arc::clone(&sort_expr.expr).transform(|expr| {
+                if let Some(col) = expr.as_any().downcast_ref::<Column>() {
+                    // Check if column index is valid.
+                    // This should always be true but fail gracefully if it's not.
+                    if col.index() >= self.expr().len() {
+                        can_pushdown = false;
+                        return Ok(Transformed::no(expr));
+                    }
+
+                    let proj_expr = &self.expr()[col.index()];
+
+                    // Check if projection expression is a simple column
+                    // We cannot push down order by clauses that depend on
+                    // projected computations as they would have nothing to reference.
+                    if let Some(child_col) =
+                        proj_expr.expr.as_any().downcast_ref::<Column>()
+                    {
+                        // Replace with the child column
+                        Ok(Transformed::yes(Arc::new(child_col.clone()) as _))
+                    } else {
+                        // Projection involves computation, cannot push down
+                        can_pushdown = false;
+                        Ok(Transformed::no(expr))
+                    }
+                } else {
+                    Ok(Transformed::no(expr))
+                }
+            })?;
+
+            if !can_pushdown {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            }
+
+            child_order.push(PhysicalSortExpr {
+                expr: transformed.data,
+                options: sort_expr.options,
+            });
+        }
+
+        // Recursively push down to child node
+        match child.try_pushdown_sort(&child_order)? {
             SortOrderPushdownResult::Exact { inner } => {
                 let new_exec = Arc::new(self.clone()).with_new_children(vec![inner])?;
                 Ok(SortOrderPushdownResult::Exact { inner: new_exec })

@@ -571,25 +571,6 @@ impl ExecutionPlan for FilterExec {
             updated_node,
         })
     }
-    fn try_pushdown_sort(
-        &self,
-        order: &[PhysicalSortExpr],
-    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
-        let child = self.input();
-        match child.try_pushdown_sort(order)? {
-            SortOrderPushdownResult::Exact { inner } => {
-                let new_exec = Arc::new(self.clone()).with_new_children(vec![inner])?;
-                Ok(SortOrderPushdownResult::Exact { inner: new_exec })
-            }
-            SortOrderPushdownResult::Inexact { inner } => {
-                let new_exec = Arc::new(self.clone()).with_new_children(vec![inner])?;
-                Ok(SortOrderPushdownResult::Inexact { inner: new_exec })
-            }
-            SortOrderPushdownResult::Unsupported => {
-                Ok(SortOrderPushdownResult::Unsupported)
-            }
-        }
-    }
 }
 
 impl EmbeddedProjection for FilterExec {
