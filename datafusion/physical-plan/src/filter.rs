@@ -24,7 +24,7 @@ use itertools::Itertools;
 
 use super::{
     ColumnStatistics, DisplayAs, ExecutionPlanProperties, PlanProperties,
-    RecordBatchStream, SendableRecordBatchStream, SortOrderPushdownResult, Statistics,
+    RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
 use crate::common::can_project;
 use crate::execution_plan::CardinalityEffect;
@@ -63,7 +63,6 @@ use datafusion_physical_expr::{
 };
 
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
-use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 use futures::stream::{Stream, StreamExt};
 use log::trace;
 

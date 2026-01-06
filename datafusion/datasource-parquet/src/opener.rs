@@ -832,9 +832,8 @@ fn should_enable_page_index(
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
+    use crate::{opener::ParquetOpener, DefaultParquetFileReaderFactory, RowGroupAccess};
     use arrow::compute::cast;
-    use crate::{DefaultParquetFileReaderFactory, RowGroupAccess, opener::ParquetOpener};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use bytes::{BufMut, BytesMut};
     use datafusion_common::{
@@ -858,6 +857,7 @@ mod test {
     use object_store::{memory::InMemory, path::Path, ObjectStore};
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
+    use std::sync::Arc;
 
     async fn count_batches_and_rows(
         mut stream: std::pin::Pin<

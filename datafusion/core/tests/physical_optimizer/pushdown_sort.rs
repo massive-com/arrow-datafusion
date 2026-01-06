@@ -27,15 +27,15 @@
 use datafusion_physical_expr::expressions;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_optimizer::pushdown_sort::PushdownSort;
+use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use std::sync::Arc;
 
 use crate::physical_optimizer::test_utils::{
-    OptimizationTest, coalesce_batches_exec, coalesce_partitions_exec, parquet_exec,
+    coalesce_batches_exec, coalesce_partitions_exec, parquet_exec,
     parquet_exec_with_sort, projection_exec, projection_exec_with_alias,
     repartition_exec, schema, simple_projection_exec, sort_exec, sort_exec_with_fetch,
-    sort_expr, sort_expr_named, test_scan_with_ordering,
+    sort_expr, sort_expr_named, test_scan_with_ordering, OptimizationTest,
 };
 
 #[test]
@@ -632,10 +632,10 @@ fn test_pushdown_through_blocking_node() {
             count_udaf(),
             vec![Arc::new(expressions::Column::new("b", 1)) as _],
         )
-            .schema(Arc::clone(&schema))
-            .alias("COUNT(b)")
-            .build()
-            .unwrap(),
+        .schema(Arc::clone(&schema))
+        .alias("COUNT(b)")
+        .build()
+        .unwrap(),
     );
 
     let aggregate = Arc::new(
@@ -647,7 +647,7 @@ fn test_pushdown_through_blocking_node() {
             inner_sort,
             Arc::clone(&schema),
         )
-            .unwrap(),
+        .unwrap(),
     );
 
     // Outer Sort: [a ASC] - this CANNOT push down through aggregate
@@ -776,7 +776,7 @@ fn test_no_sort_pushdown_through_computed_projection() {
         ],
         source,
     )
-        .unwrap();
+    .unwrap();
 
     // Request [sum DESC] - should NOT push down (sum is computed)
     let sum_expr = sort_expr_named("sum", 0);

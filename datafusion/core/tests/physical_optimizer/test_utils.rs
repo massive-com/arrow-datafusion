@@ -42,8 +42,8 @@ use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::{WindowFrame, WindowFunctionDefinition};
 use datafusion_functions_aggregate::count::count_udaf;
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
-use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::expressions::{self, col};
+use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::{
     LexOrdering, OrderingRequirements, PhysicalSortExpr,
@@ -55,6 +55,7 @@ use datafusion_physical_plan::aggregates::{
 };
 use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::utils::{JoinFilter, JoinOn};
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
@@ -67,8 +68,10 @@ use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion_physical_plan::tree_node::PlanContext;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::windows::{create_window_expr, BoundedWindowAggExec};
-use datafusion_physical_plan::{displayable, DisplayAs, DisplayFormatType, ExecutionPlan, InputOrderMode, Partitioning, PlanProperties, SortOrderPushdownResult};
-use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion_physical_plan::{
+    displayable, DisplayAs, DisplayFormatType, ExecutionPlan, InputOrderMode,
+    Partitioning, PlanProperties, SortOrderPushdownResult,
+};
 
 /// Create a non sorted parquet exec
 pub fn parquet_exec(schema: SchemaRef) -> Arc<DataSourceExec> {

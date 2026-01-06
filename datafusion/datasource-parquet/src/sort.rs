@@ -120,13 +120,13 @@ pub fn reverse_row_selection(
 
 #[cfg(test)]
 mod tests {
+    use crate::opener::PreparedAccessPlan;
     use crate::ParquetAccessPlan;
     use crate::RowGroupAccess;
-    use crate::opener::PreparedAccessPlan;
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
-    use parquet::arrow::ArrowWriter;
     use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+    use parquet::arrow::ArrowWriter;
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
     use std::sync::Arc;
