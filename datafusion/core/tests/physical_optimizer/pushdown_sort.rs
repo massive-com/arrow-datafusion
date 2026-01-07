@@ -244,7 +244,7 @@ fn test_prefix_match_through_transparent_nodes() {
     OptimizationTest:
       input:
         - SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
-        -   RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1, maintains_sort_order=true
+        -   RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
         -     CoalesceBatchesExec: target_batch_size=1024
         -       DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 DESC NULLS LAST, b@1 ASC, c@2 DESC NULLS LAST], file_type=parquet
       output:
@@ -369,7 +369,7 @@ fn test_sort_through_repartition() {
     OptimizationTest:
       input:
         - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
-        -   RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1, maintains_sort_order=true
+        -   RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
         -     DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet
       output:
         Ok:
@@ -463,7 +463,7 @@ fn test_sort_through_coalesce_partitions() {
       input:
         - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
         -   CoalescePartitionsExec
-        -     RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1, maintains_sort_order=true
+        -     RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
         -       DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet
       output:
         Ok:
@@ -496,7 +496,7 @@ fn test_complex_plan_with_multiple_operators() {
       input:
         - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
         -   CoalescePartitionsExec
-        -     RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1, maintains_sort_order=true
+        -     RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
         -       CoalesceBatchesExec: target_batch_size=1024
         -         DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet
       output:
