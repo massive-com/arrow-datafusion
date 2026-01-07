@@ -51,7 +51,6 @@ datafusion-physical-expr-common = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 datafusion-pruning = { workspace = true }
 itertools = { workspace = true }
-log = "0.4.28"
 recursive = { workspace = true, optional = true }
 
 [dev-dependencies]
