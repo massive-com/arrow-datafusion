@@ -61,13 +61,15 @@ use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 /// Implements [`FileOpener`] for a parquet file
 pub(super) struct ParquetOpener {
     /// Execution partition index
-    pub partition_index: usize,
-    /// Column indexes in `table_schema` needed by the query
-    pub projection: Arc<[usize]>,
+    pub(crate) partition_index: usize,
+    /// Projection to apply on top of the table schema (i.e. can reference partition columns).
+    pub projection: ProjectionExprs,
     /// Target number of rows in each output RecordBatch
     pub batch_size: usize,
     /// Optional limit on the number of rows to read
-    pub limit: Option<usize>,
+    pub(crate) limit: Option<usize>,
+    /// If should keep the output rows in order
+    pub preserve_order: bool,
     /// Optional predicate to apply during the scan
     pub predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Schema of the output table without partition columns.
@@ -165,6 +167,9 @@ impl FileOpener for ParquetOpener {
         #[cfg(feature = "parquet_encryption")]
         let encryption_context = self.get_encryption_context();
         let max_predicate_cache_size = self.max_predicate_cache_size;
+
+        let reverse_row_groups = self.reverse_row_groups;
+        let preserve_order = self.preserve_order;
 
         Ok(Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
@@ -410,13 +415,14 @@ impl FileOpener for ParquetOpener {
                     .add_matched(n_remaining_row_groups);
             }
 
-            // Prune by limit
-            if enable_limit_pruning {
-                if let Some(limit) = limit {
-                    row_groups.prune_by_limit(limit, rg_metadata, &file_metrics);
-                }
+            // Prune by limit if limit is set and limit order is not sensitive
+            if let (Some(limit), false) = (limit, preserve_order) {
+                row_groups.prune_by_limit(limit, rg_metadata, &file_metrics);
             }
 
+            // --------------------------------------------------------
+            // Step: prune pages from the kept row groups
+            //
             let mut access_plan = row_groups.build();
             // page index pruning: if all data on individual pages can
             // be ruled using page metadata, rows from other columns
@@ -792,7 +798,249 @@ mod test {
     use object_store::{memory::InMemory, path::Path, ObjectStore};
     use parquet::arrow::ArrowWriter;
 
-    use crate::{opener::ParquetOpener, DefaultParquetFileReaderFactory};
+    /// Builder for creating [`ParquetOpener`] instances with sensible defaults for tests.
+    /// This helps reduce code duplication and makes it clear what differs between test cases.
+    struct ParquetOpenerBuilder {
+        store: Option<Arc<dyn ObjectStore>>,
+        table_schema: Option<TableSchema>,
+        partition_index: usize,
+        projection_indices: Option<Vec<usize>>,
+        projection: Option<ProjectionExprs>,
+        batch_size: usize,
+        limit: Option<usize>,
+        predicate: Option<Arc<dyn PhysicalExpr>>,
+        metadata_size_hint: Option<usize>,
+        metrics: ExecutionPlanMetricsSet,
+        pushdown_filters: bool,
+        reorder_filters: bool,
+        force_filter_selections: bool,
+        enable_page_index: bool,
+        enable_bloom_filter: bool,
+        enable_row_group_stats_pruning: bool,
+        coerce_int96: Option<arrow::datatypes::TimeUnit>,
+        max_predicate_cache_size: Option<usize>,
+        reverse_row_groups: bool,
+        preserve_order: bool,
+    }
+
+    impl ParquetOpenerBuilder {
+        /// Create a new builder with sensible defaults for tests.
+        fn new() -> Self {
+            Self {
+                store: None,
+                table_schema: None,
+                partition_index: 0,
+                projection_indices: None,
+                projection: None,
+                batch_size: 1024,
+                limit: None,
+                predicate: None,
+                metadata_size_hint: None,
+                metrics: ExecutionPlanMetricsSet::new(),
+                pushdown_filters: false,
+                reorder_filters: false,
+                force_filter_selections: false,
+                enable_page_index: false,
+                enable_bloom_filter: false,
+                enable_row_group_stats_pruning: false,
+                coerce_int96: None,
+                max_predicate_cache_size: None,
+                reverse_row_groups: false,
+                preserve_order: false,
+            }
+        }
+
+        /// Set the object store (required for building).
+        fn with_store(mut self, store: Arc<dyn ObjectStore>) -> Self {
+            self.store = Some(store);
+            self
+        }
+
+        /// Create a simple table schema from a file schema (for files without partition columns).
+        fn with_schema(mut self, file_schema: SchemaRef) -> Self {
+            self.table_schema = Some(TableSchema::from_file_schema(file_schema));
+            self
+        }
+
+        /// Set a custom table schema (for files with partition columns).
+        fn with_table_schema(mut self, table_schema: TableSchema) -> Self {
+            self.table_schema = Some(table_schema);
+            self
+        }
+
+        /// Set projection by column indices (convenience method for common case).
+        fn with_projection_indices(mut self, indices: &[usize]) -> Self {
+            self.projection_indices = Some(indices.to_vec());
+            self
+        }
+
+        /// Set the predicate.
+        fn with_predicate(mut self, predicate: Arc<dyn PhysicalExpr>) -> Self {
+            self.predicate = Some(predicate);
+            self
+        }
+
+        /// Enable pushdown filters.
+        fn with_pushdown_filters(mut self, enable: bool) -> Self {
+            self.pushdown_filters = enable;
+            self
+        }
+
+        /// Enable filter reordering.
+        fn with_reorder_filters(mut self, enable: bool) -> Self {
+            self.reorder_filters = enable;
+            self
+        }
+
+        /// Enable row group stats pruning.
+        fn with_row_group_stats_pruning(mut self, enable: bool) -> Self {
+            self.enable_row_group_stats_pruning = enable;
+            self
+        }
+
+        /// Set reverse row groups flag.
+        fn with_reverse_row_groups(mut self, enable: bool) -> Self {
+            self.reverse_row_groups = enable;
+            self
+        }
+
+        /// Build the ParquetOpener instance.
+        ///
+        /// # Panics
+        ///
+        /// Panics if required fields (store, schema/table_schema) are not set.
+        fn build(self) -> ParquetOpener {
+            let store = self
+                .store
+                .expect("ParquetOpenerBuilder: store must be set via with_store()");
+            let table_schema = self.table_schema.expect(
+                "ParquetOpenerBuilder: table_schema must be set via with_schema() or with_table_schema()",
+            );
+            let file_schema = Arc::clone(table_schema.file_schema());
+
+            let projection = if let Some(projection) = self.projection {
+                projection
+            } else if let Some(indices) = self.projection_indices {
+                ProjectionExprs::from_indices(&indices, &file_schema)
+            } else {
+                // Default: project all columns
+                let all_indices: Vec<usize> = (0..file_schema.fields().len()).collect();
+                ProjectionExprs::from_indices(&all_indices, &file_schema)
+            };
+
+            ParquetOpener {
+                partition_index: self.partition_index,
+                projection,
+                batch_size: self.batch_size,
+                limit: self.limit,
+                predicate: self.predicate,
+                table_schema,
+                metadata_size_hint: self.metadata_size_hint,
+                metrics: self.metrics,
+                parquet_file_reader_factory: Arc::new(
+                    DefaultParquetFileReaderFactory::new(store),
+                ),
+                pushdown_filters: self.pushdown_filters,
+                reorder_filters: self.reorder_filters,
+                force_filter_selections: self.force_filter_selections,
+                enable_page_index: self.enable_page_index,
+                enable_bloom_filter: self.enable_bloom_filter,
+                enable_row_group_stats_pruning: self.enable_row_group_stats_pruning,
+                coerce_int96: self.coerce_int96,
+                #[cfg(feature = "parquet_encryption")]
+                file_decryption_properties: None,
+                expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
+                #[cfg(feature = "parquet_encryption")]
+                encryption_factory: None,
+                max_predicate_cache_size: self.max_predicate_cache_size,
+                reverse_row_groups: self.reverse_row_groups,
+                preserve_order: self.preserve_order,
+            }
+        }
+    }
+
+    fn constant_int_stats() -> (Statistics, SchemaRef) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let statistics = Statistics {
+            num_rows: Precision::Exact(3),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    max_value: Precision::Exact(ScalarValue::from(5i32)),
+                    min_value: Precision::Exact(ScalarValue::from(5i32)),
+                    sum_value: Precision::Absent,
+                    distinct_count: Precision::Absent,
+                    byte_size: Precision::Absent,
+                },
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+        (statistics, schema)
+    }
+
+    #[test]
+    fn extract_constant_columns_non_null() {
+        let (statistics, schema) = constant_int_stats();
+        let constants = constant_columns_from_stats(Some(&statistics), &schema);
+        assert_eq!(constants.len(), 1);
+        assert_eq!(constants.get("a"), Some(&ScalarValue::from(5i32)));
+        assert!(!constants.contains_key("b"));
+    }
+
+    #[test]
+    fn extract_constant_columns_all_null() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
+        let statistics = Statistics {
+            num_rows: Precision::Exact(2),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(2),
+                max_value: Precision::Absent,
+                min_value: Precision::Absent,
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
+            }],
+        };
+
+        let constants = constant_columns_from_stats(Some(&statistics), &schema);
+        assert_eq!(
+            constants.get("a"),
+            Some(&ScalarValue::Utf8(None)),
+            "all-null column should be treated as constant null"
+        );
+    }
+
+    #[test]
+    fn rewrite_projection_to_literals() {
+        let (statistics, schema) = constant_int_stats();
+        let constants = constant_columns_from_stats(Some(&statistics), &schema);
+        let projection = ProjectionExprs::from_indices(&[0, 1], &schema);
+
+        let rewritten = projection
+            .try_map_exprs(|expr| replace_columns_with_literals(expr, &constants))
+            .unwrap();
+        let exprs = rewritten.as_ref();
+        assert!(exprs[0].expr.as_any().downcast_ref::<Literal>().is_some());
+        assert!(exprs[1].expr.as_any().downcast_ref::<Column>().is_some());
+
+        // Only column `b` should remain in the projection mask
+        assert_eq!(rewritten.column_indices(), vec![1]);
+    }
+
+    #[test]
+    fn rewrite_physical_expr_literal() {
+        let mut constants = ConstantColumns::new();
+        constants.insert("a".to_string(), ScalarValue::from(7i32));
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+
+        let rewritten = replace_columns_with_literals(expr, &constants).unwrap();
+        assert!(rewritten.as_any().downcast_ref::<Literal>().is_some());
+    }
 
     async fn count_batches_and_rows(
         mut stream: std::pin::Pin<
