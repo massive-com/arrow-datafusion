@@ -24,8 +24,8 @@ use log::debug;
 use parking_lot::Mutex;
 use rand::{rng, Rng};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tempfile::{Builder, NamedTempFile, TempDir};
 
 use crate::memory_pool::human_readable_size;
