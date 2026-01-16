@@ -187,6 +187,11 @@ pub struct FileScanConfig {
     /// The maximum number of records to read from this plan. If `None`,
     /// all records after filtering are returned.
     pub limit: Option<usize>,
+    /// Whether the scan's limit is order sensitive
+    /// When `true`, files must be read in the exact order specified to produce
+    /// correct results (e.g., for `ORDER BY ... LIMIT` queries). When `false`,
+    /// DataFusion may reorder file processing for optimization without affecting correctness.
+    pub preserve_order: bool,
     /// All equivalent lexicographical orderings that describe the schema.
     pub output_ordering: Vec<LexOrdering>,
     /// File compression type
@@ -269,7 +274,7 @@ pub struct FileScanConfigBuilder {
     table_schema: TableSchema,
     file_source: Arc<dyn FileSource>,
     limit: Option<usize>,
-    projection_indices: Option<Vec<usize>>,
+    preserve_order: bool,
     constraints: Option<Constraints>,
     file_groups: Vec<FileGroup>,
     statistics: Option<Statistics>,
@@ -304,7 +309,7 @@ impl FileScanConfigBuilder {
             file_compression_type: None,
             new_lines_in_values: None,
             limit: None,
-            projection_indices: None,
+            preserve_order: false,
             constraints: None,
             batch_size: None,
             expr_adapter_factory: None,
@@ -316,6 +321,15 @@ impl FileScanConfigBuilder {
     /// all records after filtering are returned.
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Set whether the limit should be order-sensitive.
+    /// When `true`, files must be read in the exact order specified to produce
+    /// correct results (e.g., for `ORDER BY ... LIMIT` queries). When `false`,
+    /// DataFusion may reorder file processing for optimization without affecting correctness.
+    pub fn with_preserve_order(mut self, order_sensitive: bool) -> Self {
+        self.preserve_order = order_sensitive;
         self
     }
 
@@ -465,7 +479,7 @@ impl FileScanConfigBuilder {
             table_schema,
             file_source,
             limit,
-            projection_indices,
+            preserve_order,
             constraints,
             file_groups,
             statistics,
@@ -494,12 +508,15 @@ impl FileScanConfigBuilder {
             ProjectionExprs::from_indices(&indices, table_schema.table_schema())
         });
 
+        // If there is an output ordering, we should preserve it.
+        let preserve_order = preserve_order || !output_ordering.is_empty();
+
         FileScanConfig {
             object_store_url,
             table_schema,
             file_source,
             limit,
-            projection_exprs,
+            preserve_order,
             constraints,
             file_groups,
             output_ordering,
@@ -524,9 +541,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             file_compression_type: Some(config.file_compression_type),
             new_lines_in_values: Some(config.new_lines_in_values),
             limit: config.limit,
-            projection_indices: config
-                .projection_exprs
-                .map(|p| p.ordered_column_indices()),
+            preserve_order: config.preserve_order,
             constraints: Some(config.constraints),
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
@@ -756,6 +771,44 @@ impl DataSource for FileScanConfig {
                 })
             }
         }
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn DataSource>>> {
+        // Delegate to FileSource to check if reverse scanning can satisfy the request.
+        let pushdown_result = self
+            .file_source
+            .try_reverse_output(order, &self.eq_properties())?;
+
+        match pushdown_result {
+            SortOrderPushdownResult::Exact { inner } => {
+                Ok(SortOrderPushdownResult::Exact {
+                    inner: self.rebuild_with_source(inner, true)?,
+                })
+            }
+            SortOrderPushdownResult::Inexact { inner } => {
+                Ok(SortOrderPushdownResult::Inexact {
+                    inner: self.rebuild_with_source(inner, false)?,
+                })
+            }
+            SortOrderPushdownResult::Unsupported => {
+                Ok(SortOrderPushdownResult::Unsupported)
+            }
+        }
+    }
+
+    fn with_preserve_order(&self, preserve_order: bool) -> Option<Arc<dyn DataSource>> {
+        if self.preserve_order == preserve_order {
+            return Some(Arc::new(self.clone()));
+        }
+
+        let new_config = FileScanConfig {
+            preserve_order,
+            ..self.clone()
+        };
+        Some(Arc::new(new_config))
     }
 }
 

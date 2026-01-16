@@ -18,8 +18,12 @@
 //! This file contains an end to end test of parquet pruning. It writes
 //! data into a parquet file and then verifies row groups are pruned as
 //! expected.
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, Int32Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::SessionConfig;
-use datafusion_common::ScalarValue;
+use datafusion_common::{DataFusionError, ScalarValue};
 use itertools::Itertools;
 
 use crate::parquet::Unit::RowGroup;
@@ -30,12 +34,12 @@ struct RowGroupPruningTest {
     query: String,
     expected_errors: Option<usize>,
     expected_row_group_matched_by_statistics: Option<usize>,
-    // expected_row_group_fully_matched_by_statistics: Option<usize>,
+    expected_row_group_fully_matched_by_statistics: Option<usize>,
     expected_row_group_pruned_by_statistics: Option<usize>,
     expected_files_pruned_by_statistics: Option<usize>,
     expected_row_group_matched_by_bloom_filter: Option<usize>,
     expected_row_group_pruned_by_bloom_filter: Option<usize>,
-    // expected_limit_pruned_row_groups: Option<usize>,
+    expected_limit_pruned_row_groups: Option<usize>,
     expected_rows: usize,
 }
 impl RowGroupPruningTest {
@@ -47,11 +51,11 @@ impl RowGroupPruningTest {
             expected_errors: None,
             expected_row_group_matched_by_statistics: None,
             expected_row_group_pruned_by_statistics: None,
-            // expected_row_group_fully_matched_by_statistics: None,
+            expected_row_group_fully_matched_by_statistics: None,
             expected_files_pruned_by_statistics: None,
             expected_row_group_matched_by_bloom_filter: None,
             expected_row_group_pruned_by_bloom_filter: None,
-            // expected_limit_pruned_row_groups: None,
+            expected_limit_pruned_row_groups: None,
             expected_rows: 0,
         }
     }
@@ -81,7 +85,6 @@ impl RowGroupPruningTest {
     }
 
     // Set the expected fully matched row groups by statistics
-    /*
     fn with_fully_matched_by_stats(
         mut self,
         fully_matched_by_stats: Option<usize>,
@@ -89,12 +92,6 @@ impl RowGroupPruningTest {
         self.expected_row_group_fully_matched_by_statistics = fully_matched_by_stats;
         self
     }
-
-    fn with_limit_pruned_row_groups(mut self, pruned_by_limit: Option<usize>) -> Self {
-        self.expected_limit_pruned_row_groups = pruned_by_limit;
-        self
-    }
-    */
 
     // Set the expected pruned row groups by statistics
     fn with_pruned_by_stats(mut self, pruned_by_stats: Option<usize>) -> Self {
@@ -116,6 +113,11 @@ impl RowGroupPruningTest {
     // Set the expected pruned row groups by bloom filter
     fn with_pruned_by_bloom_filter(mut self, pruned_by_bf: Option<usize>) -> Self {
         self.expected_row_group_pruned_by_bloom_filter = pruned_by_bf;
+        self
+    }
+
+    fn with_limit_pruned_row_groups(mut self, pruned_by_limit: Option<usize>) -> Self {
+        self.expected_limit_pruned_row_groups = pruned_by_limit;
         self
     }
 
@@ -155,16 +157,74 @@ impl RowGroupPruningTest {
         );
         let bloom_filter_metrics = output.row_groups_bloom_filter();
         assert_eq!(
-            bloom_filter_metrics.map(|(_pruned, matched)| matched),
+            bloom_filter_metrics.as_ref().map(|pm| pm.total_matched()),
             self.expected_row_group_matched_by_bloom_filter,
             "mismatched row_groups_matched_bloom_filter",
         );
         assert_eq!(
-            bloom_filter_metrics.map(|(pruned, _matched)| pruned),
+            bloom_filter_metrics.map(|pm| pm.total_pruned()),
             self.expected_row_group_pruned_by_bloom_filter,
             "mismatched row_groups_pruned_bloom_filter",
         );
 
+        assert_eq!(
+            output.result_rows,
+            self.expected_rows,
+            "Expected {} rows, got {}: {}",
+            output.result_rows,
+            self.expected_rows,
+            output.description(),
+        );
+    }
+
+    // Execute the test with the current configuration
+    async fn test_row_group_prune_with_custom_data(
+        self,
+        schema: Arc<Schema>,
+        batches: Vec<RecordBatch>,
+        max_row_per_group: usize,
+    ) {
+        let output = ContextWithParquet::with_custom_data(
+            self.scenario,
+            RowGroup(max_row_per_group),
+            schema,
+            batches,
+        )
+        .await
+        .query(&self.query)
+        .await;
+
+        println!("{}", output.description());
+        assert_eq!(
+            output.predicate_evaluation_errors(),
+            self.expected_errors,
+            "mismatched predicate_evaluation error"
+        );
+        assert_eq!(
+            output.row_groups_matched_statistics(),
+            self.expected_row_group_matched_by_statistics,
+            "mismatched row_groups_matched_statistics",
+        );
+        assert_eq!(
+            output.row_groups_fully_matched_statistics(),
+            self.expected_row_group_fully_matched_by_statistics,
+            "mismatched row_groups_fully_matched_statistics",
+        );
+        assert_eq!(
+            output.row_groups_pruned_statistics(),
+            self.expected_row_group_pruned_by_statistics,
+            "mismatched row_groups_pruned_statistics",
+        );
+        assert_eq!(
+            output.files_ranges_pruned_statistics(),
+            self.expected_files_pruned_by_statistics,
+            "mismatched files_ranges_pruned_statistics",
+        );
+        assert_eq!(
+            output.limit_pruned_row_groups(),
+            self.expected_limit_pruned_row_groups,
+            "mismatched limit_pruned_row_groups",
+        );
         assert_eq!(
             output.result_rows,
             self.expected_rows,
@@ -1723,7 +1783,6 @@ async fn test_bloom_filter_decimal_dict() {
         .await;
 }
 
-/*
 // Helper function to create a batch with a single Int32 column.
 fn make_i32_batch(
     name: &str,
@@ -1841,8 +1900,8 @@ async fn test_limit_pruning_complex_filter() -> datafusion_common::error::Result
 }
 
 #[tokio::test]
-async fn test_limit_pruning_multiple_fully_matched(
-) -> datafusion_common::error::Result<()> {
+async fn test_limit_pruning_multiple_fully_matched()
+-> datafusion_common::error::Result<()> {
     // Test Case 2: Limit requires multiple fully matched row groups
     // Row Group 0: a=[5,5,5,5] -> Fully matched, 4 rows
     // Row Group 1: a=[5,5,5,5] -> Fully matched, 4 rows
@@ -1950,7 +2009,7 @@ async fn test_limit_pruning_exceeds_fully_matched() -> datafusion_common::error:
         .with_scenario(Scenario::Int)
         .with_query(query)
         .with_expected_errors(Some(0))
-        .with_expected_rows(10) // Total: 1 + 3 + 4 + 1 = 9 (less than limit)
+        .with_expected_rows(10) // Total: 1 + 4 + 4 + 1 = 10
         .with_pruned_files(Some(0))
         .with_matched_by_stats(Some(4)) // RG0,1,2,3 matched
         .with_fully_matched_by_stats(Some(2))
@@ -1958,7 +2017,5 @@ async fn test_limit_pruning_exceeds_fully_matched() -> datafusion_common::error:
         .with_limit_pruned_row_groups(Some(0)) // No limit pruning since we need all RGs
         .test_row_group_prune_with_custom_data(schema, batches, 4)
         .await;
-
     Ok(())
 }
-*/
