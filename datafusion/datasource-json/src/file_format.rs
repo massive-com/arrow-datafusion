@@ -329,9 +329,8 @@ impl FileFormat for JsonFormat {
         _state: &dyn Session,
         conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let source = Arc::new(
-            JsonSource::new().with_format_array(self.options.format_array)
-        );
+        let source =
+            Arc::new(JsonSource::new().with_format_array(self.options.format_array));
         let conf = FileScanConfigBuilder::from(conf)
             .with_file_compression_type(FileCompressionType::from(
                 self.options.compression,
@@ -360,9 +359,7 @@ impl FileFormat for JsonFormat {
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(
-            JsonSource::new().with_format_array(self.options.format_array),
-        )
+        Arc::new(JsonSource::new().with_format_array(self.options.format_array))
     }
 }
 

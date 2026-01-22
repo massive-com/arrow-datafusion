@@ -444,12 +444,10 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("JSON array is empty")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("JSON array is empty"));
 
         Ok(())
     }
@@ -623,8 +621,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_ndjson_read_options_format_array_with_compression() -> Result<()> {
-        use flate2::Compression;
         use flate2::write::GzEncoder;
+        use flate2::Compression;
         use std::io::Write;
 
         let ctx = SessionContext::new();
