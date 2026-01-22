@@ -1092,6 +1092,7 @@ impl TryFrom<&protobuf::JsonOptions> for JsonOptions {
         Ok(JsonOptions {
             compression: compression.into(),
             schema_infer_max_rec: proto_opts.schema_infer_max_rec.map(|h| h as usize),
+            compression_level: proto_opts.compression_level.map(|h| h as usize),
             format_array: proto_opts.format_array,
         })
     }
