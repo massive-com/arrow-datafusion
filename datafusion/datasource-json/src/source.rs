@@ -36,6 +36,7 @@ use datafusion_datasource::{
 };
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
+use arrow::array::RecordBatch;
 use arrow::json::ReaderBuilder;
 use arrow::{datatypes::SchemaRef, json};
 use datafusion_common::Statistics;
@@ -55,6 +56,7 @@ pub struct JsonOpener {
     projected_schema: SchemaRef,
     file_compression_type: FileCompressionType,
     object_store: Arc<dyn ObjectStore>,
+    format_array: bool,
 }
 
 impl JsonOpener {
@@ -64,12 +66,14 @@ impl JsonOpener {
         projected_schema: SchemaRef,
         file_compression_type: FileCompressionType,
         object_store: Arc<dyn ObjectStore>,
+        format_array: bool,
     ) -> Self {
         Self {
             batch_size,
             projected_schema,
             file_compression_type,
             object_store,
+            format_array,
         }
     }
 }
@@ -81,12 +85,19 @@ pub struct JsonSource {
     metrics: ExecutionPlanMetricsSet,
     projected_statistics: Option<Statistics>,
     schema_adapter_factory: Option<Arc<dyn SchemaAdapterFactory>>,
+    format_array: bool,
 }
 
 impl JsonSource {
     /// Initialize a JsonSource with default values
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set whether to expect JSON array format
+    pub fn with_format_array(mut self, format_array: bool) -> Self {
+        self.format_array = format_array;
+        self
     }
 }
 
@@ -110,6 +121,7 @@ impl FileSource for JsonSource {
             projected_schema: base_config.projected_file_schema(),
             file_compression_type: base_config.file_compression_type,
             object_store,
+            format_array: self.format_array,
         })
     }
 
@@ -181,6 +193,16 @@ impl FileOpener for JsonOpener {
         let schema = Arc::clone(&self.projected_schema);
         let batch_size = self.batch_size;
         let file_compression_type = self.file_compression_type.to_owned();
+        let format_array = self.format_array;
+
+        // JSON array format requires reading the complete file
+        if format_array && partitioned_file.range.is_some() {
+            return Err(DataFusionError::NotImplemented(
+                "JSON array format does not support range-based file scanning. \
+                 Disable repartition_file_scans or use line-delimited JSON format."
+                    .to_string(),
+            ));
+        }
 
         Ok(Box::pin(async move {
             let calculated_range =
@@ -217,31 +239,92 @@ impl FileOpener for JsonOpener {
                         }
                     };
 
-                    let reader = ReaderBuilder::new(schema)
-                        .with_batch_size(batch_size)
-                        .build(BufReader::new(bytes))?;
-
-                    Ok(futures::stream::iter(reader)
-                        .map(|r| r.map_err(Into::into))
-                        .boxed())
+                    if format_array {
+                        // Handle JSON array format
+                        let batches = read_json_array_to_batches(
+                            BufReader::new(bytes),
+                            schema,
+                            batch_size,
+                        )?;
+                        Ok(futures::stream::iter(batches.into_iter().map(Ok)).boxed())
+                    } else {
+                        let reader = ReaderBuilder::new(schema)
+                            .with_batch_size(batch_size)
+                            .build(BufReader::new(bytes))?;
+                        Ok(futures::stream::iter(reader)
+                            .map(|r| r.map_err(Into::into))
+                            .boxed())
+                    }
                 }
                 GetResultPayload::Stream(s) => {
-                    let s = s.map_err(DataFusionError::from);
-
-                    let decoder = ReaderBuilder::new(schema)
-                        .with_batch_size(batch_size)
-                        .build_decoder()?;
-                    let input = file_compression_type.convert_stream(s.boxed())?.fuse();
-
-                    let stream = deserialize_stream(
-                        input,
-                        DecoderDeserializer::new(JsonDecoder::new(decoder)),
-                    );
-                    Ok(stream.map_err(Into::into).boxed())
+                    if format_array {
+                        // For streaming, we need to collect all bytes first
+                        let bytes = s
+                            .map_err(DataFusionError::from)
+                            .try_fold(Vec::new(), |mut acc, chunk| async move {
+                                acc.extend_from_slice(&chunk);
+                                Ok(acc)
+                            })
+                            .await?;
+                        let decompressed = file_compression_type
+                            .convert_read(std::io::Cursor::new(bytes))?;
+                        let batches = read_json_array_to_batches(
+                            BufReader::new(decompressed),
+                            schema,
+                            batch_size,
+                        )?;
+                        Ok(futures::stream::iter(batches.into_iter().map(Ok)).boxed())
+                    } else {
+                        let s = s.map_err(DataFusionError::from);
+                        let decoder = ReaderBuilder::new(schema)
+                            .with_batch_size(batch_size)
+                            .build_decoder()?;
+                        let input =
+                            file_compression_type.convert_stream(s.boxed())?.fuse();
+                        let stream = deserialize_stream(
+                            input,
+                            DecoderDeserializer::new(JsonDecoder::new(decoder)),
+                        );
+                        Ok(stream.map_err(Into::into).boxed())
+                    }
                 }
             }
         }))
     }
+}
+
+/// Read JSON array format and convert to RecordBatches
+fn read_json_array_to_batches<R: Read>(
+    mut reader: R,
+    schema: SchemaRef,
+    batch_size: usize,
+) -> Result<Vec<RecordBatch>> {
+    use arrow::json::ReaderBuilder;
+
+    let mut content = String::new();
+    reader.read_to_string(&mut content)?;
+
+    // Parse JSON array
+    let values: Vec<serde_json::Value> = serde_json::from_str(&content)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    if values.is_empty() {
+        return Ok(vec![RecordBatch::new_empty(schema)]);
+    }
+
+    // Convert to NDJSON string for arrow-json reader
+    let ndjson: String = values
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let cursor = std::io::Cursor::new(ndjson);
+    let reader = ReaderBuilder::new(schema)
+        .with_batch_size(batch_size)
+        .build(cursor)?;
+
+    reader.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 pub async fn plan_to_json(
