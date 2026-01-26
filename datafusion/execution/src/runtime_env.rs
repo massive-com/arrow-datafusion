@@ -18,8 +18,8 @@
 //! Execution [`RuntimeEnv`] environment that manages access to object
 //! store, memory manager, disk manager.
 
-#[allow(deprecated)]
-use crate::disk_manager::DiskManagerConfig;
+#[expect(deprecated)]
+use crate::disk_manager::{DiskManagerConfig, SpillingProgress};
 use crate::{
     disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode},
     memory_pool::{
@@ -150,6 +150,11 @@ impl RuntimeEnv {
     /// details.
     pub fn object_store(&self, url: impl AsRef<Url>) -> Result<Arc<dyn ObjectStore>> {
         self.object_store_registry.get_store(url.as_ref())
+    }
+
+    /// Returns the current spilling progress
+    pub fn spilling_progress(&self) -> SpillingProgress {
+        self.disk_manager.spilling_progress()
     }
 
     /// Register an [`EncryptionFactory`] with an associated identifier that can be later

@@ -2828,6 +2828,23 @@ config_namespace! {
     pub struct JsonOptions {
         pub compression: CompressionTypeVariant, default = CompressionTypeVariant::UNCOMPRESSED
         pub schema_infer_max_rec: Option<usize>, default = None
+        pub compression_level: Option<usize>, default = None
+        /// The format of JSON input files.
+        ///
+        /// When `false` (default), expects newline-delimited JSON (NDJSON):
+        /// ```text
+        /// {"key1": 1, "key2": "val"}
+        /// {"key1": 2, "key2": "vals"}
+        /// ```
+        ///
+        /// When `true`, expects JSON array format:
+        /// ```text
+        /// [
+        ///     {"key1": 1, "key2": "val"},
+        ///     {"key1": 2, "key2": "vals"}
+        /// ]
+        /// ```
+        pub format_array: bool, default = false
     }
 }
 
