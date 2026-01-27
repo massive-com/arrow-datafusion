@@ -215,18 +215,6 @@ impl TestOutput {
             .map(|pm| pm.total_fully_matched())
     }
 
-    /*
-    /// The number of row_groups fully matched by statistics
-    fn row_groups_fully_matched_statistics(&self) -> Option<usize> {
-        self.metric_value("row_groups_fully_matched_statistics")
-    }
-
-    /// The number of row groups pruned by limit pruning
-    fn limit_pruned_row_groups(&self) -> Option<usize> {
-        self.metric_value("limit_pruned_row_groups")
-    }
-    */
-
     /// The number of row_groups pruned by statistics
     fn row_groups_pruned_statistics(&self) -> Option<usize> {
         self.pruning_metric("row_groups_pruned_statistics")

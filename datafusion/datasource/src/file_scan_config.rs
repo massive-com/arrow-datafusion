@@ -773,32 +773,6 @@ impl DataSource for FileScanConfig {
         }
     }
 
-    fn try_pushdown_sort(
-        &self,
-        order: &[PhysicalSortExpr],
-    ) -> Result<SortOrderPushdownResult<Arc<dyn DataSource>>> {
-        // Delegate to FileSource to check if reverse scanning can satisfy the request.
-        let pushdown_result = self
-            .file_source
-            .try_reverse_output(order, &self.eq_properties())?;
-
-        match pushdown_result {
-            SortOrderPushdownResult::Exact { inner } => {
-                Ok(SortOrderPushdownResult::Exact {
-                    inner: self.rebuild_with_source(inner, true)?,
-                })
-            }
-            SortOrderPushdownResult::Inexact { inner } => {
-                Ok(SortOrderPushdownResult::Inexact {
-                    inner: self.rebuild_with_source(inner, false)?,
-                })
-            }
-            SortOrderPushdownResult::Unsupported => {
-                Ok(SortOrderPushdownResult::Unsupported)
-            }
-        }
-    }
-
     fn with_preserve_order(&self, preserve_order: bool) -> Option<Arc<dyn DataSource>> {
         if self.preserve_order == preserve_order {
             return Some(Arc::new(self.clone()));

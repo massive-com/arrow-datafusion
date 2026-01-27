@@ -689,29 +689,6 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
         None
     }
 
-    /// Try to push down sort ordering requirements to this node.
-    ///
-    /// This method is called during sort pushdown optimization to determine if this
-    /// node can optimize for a requested sort ordering. Implementations should:
-    ///
-    /// - Return [`SortOrderPushdownResult::Exact`] if the node can guarantee the exact
-    ///   ordering (allowing the Sort operator to be removed)
-    /// - Return [`SortOrderPushdownResult::Inexact`] if the node can optimize for the
-    ///   ordering but cannot guarantee perfect sorting (Sort operator is kept)
-    /// - Return [`SortOrderPushdownResult::Unsupported`] if the node cannot optimize
-    ///   for the ordering
-    ///
-    /// For transparent nodes (that preserve ordering), implement this to delegate to
-    /// children and wrap the result with a new instance of this node.
-    ///
-    /// Default implementation returns `Unsupported`.
-    fn try_pushdown_sort(
-        &self,
-        _order: &[PhysicalSortExpr],
-    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
-        Ok(SortOrderPushdownResult::Unsupported)
-    }
-
     /// Returns a variant of this `ExecutionPlan` that is aware of order-sensitivity.
     ///
     /// This is used to signal to data sources that the output ordering must be
