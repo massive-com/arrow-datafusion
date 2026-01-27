@@ -385,17 +385,10 @@ impl Display for PruningMetrics {
             write!(
                 f,
                 "{} total → {} matched -> {} fully matched",
-                human_readable_count(total),
-                human_readable_count(matched),
-                human_readable_count(fully_matched)
+                total, matched, fully_matched
             )
         } else {
-            write!(
-                f,
-                "{} total → {} matched",
-                human_readable_count(total),
-                human_readable_count(matched)
-            )
+            write!(f, "{} total → {} matched", total, matched)
         }
     }
 }

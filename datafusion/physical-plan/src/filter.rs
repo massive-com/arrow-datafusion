@@ -571,19 +571,6 @@ impl ExecutionPlan for FilterExec {
         })
     }
 
-    fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        Some(Arc::new(Self {
-            predicate: Arc::clone(&self.predicate),
-            input: Arc::clone(&self.input),
-            metrics: self.metrics.clone(),
-            default_selectivity: self.default_selectivity,
-            cache: self.cache.clone(),
-            projection: self.projection.clone(),
-            batch_size: self.batch_size,
-            fetch,
-        }))
-    }
-
     fn with_preserve_order(
         &self,
         preserve_order: bool,

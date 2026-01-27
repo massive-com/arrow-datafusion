@@ -173,12 +173,13 @@ impl TestOutput {
                 if let MetricValue::PruningMetrics {
                     pruning_metrics, ..
                 } = metric.value()
-            {
-                total_pruned += pruning_metrics.pruned();
-                total_matched += pruning_metrics.matched();
-                total_fully_matched += pruning_metrics.fully_matched();
+                {
+                    total_pruned += pruning_metrics.pruned();
+                    total_matched += pruning_metrics.matched();
+                    total_fully_matched += pruning_metrics.fully_matched();
 
-                found = true;
+                    found = true;
+                }
             }
         }
 
@@ -214,18 +215,6 @@ impl TestOutput {
         self.pruning_metric("row_groups_pruned_statistics")
             .map(|pm| pm.total_fully_matched())
     }
-
-    /*
-    /// The number of row_groups fully matched by statistics
-    fn row_groups_fully_matched_statistics(&self) -> Option<usize> {
-        self.metric_value("row_groups_fully_matched_statistics")
-    }
-
-    /// The number of row groups pruned by limit pruning
-    fn limit_pruned_row_groups(&self) -> Option<usize> {
-        self.metric_value("limit_pruned_row_groups")
-    }
-    */
 
     /// The number of row_groups pruned by statistics
     fn row_groups_pruned_statistics(&self) -> Option<usize> {

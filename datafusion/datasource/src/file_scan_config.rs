@@ -273,6 +273,7 @@ pub struct FileScanConfigBuilder {
     /// [`DataSourceExec`]: crate::source::DataSourceExec
     table_schema: TableSchema,
     file_source: Arc<dyn FileSource>,
+    projection_indices: Option<Vec<usize>>,
     limit: Option<usize>,
     preserve_order: bool,
     constraints: Option<Constraints>,
@@ -309,6 +310,7 @@ impl FileScanConfigBuilder {
             file_compression_type: None,
             new_lines_in_values: None,
             limit: None,
+            projection_indices: None,
             preserve_order: false,
             constraints: None,
             batch_size: None,
@@ -479,6 +481,7 @@ impl FileScanConfigBuilder {
             table_schema,
             file_source,
             limit,
+            projection_indices,
             preserve_order,
             constraints,
             file_groups,
@@ -516,6 +519,7 @@ impl FileScanConfigBuilder {
             table_schema,
             file_source,
             limit,
+            projection_exprs,
             preserve_order,
             constraints,
             file_groups,
@@ -531,6 +535,7 @@ impl FileScanConfigBuilder {
 
 impl From<FileScanConfig> for FileScanConfigBuilder {
     fn from(config: FileScanConfig) -> Self {
+        let projection_indices = config.projection_indices();
         Self {
             object_store_url: config.object_store_url,
             table_schema: config.table_schema,
@@ -541,6 +546,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             file_compression_type: Some(config.file_compression_type),
             new_lines_in_values: Some(config.new_lines_in_values),
             limit: config.limit,
+            projection_indices: Some(projection_indices),
             preserve_order: config.preserve_order,
             constraints: Some(config.constraints),
             batch_size: config.batch_size,
@@ -769,32 +775,6 @@ impl DataSource for FileScanConfig {
                     filters: result.filters,
                     updated_node: None,
                 })
-            }
-        }
-    }
-
-    fn try_pushdown_sort(
-        &self,
-        order: &[PhysicalSortExpr],
-    ) -> Result<SortOrderPushdownResult<Arc<dyn DataSource>>> {
-        // Delegate to FileSource to check if reverse scanning can satisfy the request.
-        let pushdown_result = self
-            .file_source
-            .try_reverse_output(order, &self.eq_properties())?;
-
-        match pushdown_result {
-            SortOrderPushdownResult::Exact { inner } => {
-                Ok(SortOrderPushdownResult::Exact {
-                    inner: self.rebuild_with_source(inner, true)?,
-                })
-            }
-            SortOrderPushdownResult::Inexact { inner } => {
-                Ok(SortOrderPushdownResult::Inexact {
-                    inner: self.rebuild_with_source(inner, false)?,
-                })
-            }
-            SortOrderPushdownResult::Unsupported => {
-                Ok(SortOrderPushdownResult::Unsupported)
             }
         }
     }
