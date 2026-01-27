@@ -384,11 +384,10 @@ impl Display for PruningMetrics {
         if fully_matched != 0 {
             write!(
                 f,
-                "{} total → {} matched -> {} fully matched",
-                total, matched, fully_matched
+                "{total} total → {matched} matched -> {fully_matched} fully matched",
             )
         } else {
-            write!(f, "{} total → {} matched", total, matched)
+            write!(f, "{total} total → {matched} matched")
         }
     }
 }
