@@ -44,18 +44,14 @@ pub struct ParquetFileMetrics {
     pub files_ranges_pruned_statistics: PruningMetrics,
     /// Number of times the predicate could not be evaluated
     pub predicate_evaluation_errors: Count,
-    /// Number of row groups whose bloom filters were checked, tracked with matched/pruned counts
+    /// Number of row groups pruned by bloom filters
     pub row_groups_pruned_bloom_filter: PruningMetrics,
-    /// Number of row groups whose statistics were checked, tracked with matched/pruned counts
+    /// Number of row groups pruned due to limit pruning.
+    pub limit_pruned_row_groups: PruningMetrics,
+    /// Number of row groups pruned by statistics
     pub row_groups_pruned_statistics: PruningMetrics,
     /// Number of row groups whose bloom filters were checked and matched (not pruned)
     pub row_groups_matched_bloom_filter: Count,
-    /// Number of row groups pruned due to limit pruning.
-    pub limit_pruned_row_groups: Count,
-    /// Number of row groups whose statistics were checked and fully matched
-    pub row_groups_fully_matched_statistics: Count,
-    /// Number of row groups whose statistics were checked and matched (not pruned)
-    pub row_groups_matched_statistics: Count,
     /// Total number of bytes scanned
     pub bytes_scanned: Count,
     /// Total rows filtered out by predicates pushed into parquet scan
@@ -104,15 +100,8 @@ impl ParquetFileMetrics {
 
         let limit_pruned_row_groups = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
-            .counter("limit_pruned_row_groups", partition);
-
-        let row_groups_fully_matched_statistics = MetricBuilder::new(metrics)
-            .with_new_label("filename", filename.to_string())
-            .counter("row_groups_fully_matched_statistics", partition);
-
-        let row_groups_matched_statistics = MetricBuilder::new(metrics)
-            .with_new_label("filename", filename.to_string())
-            .counter("row_groups_matched_statistics", partition);
+            .with_type(MetricType::SUMMARY)
+            .pruning_metrics("limit_pruned_row_groups", partition);
 
         let row_groups_pruned_statistics = MetricBuilder::new(metrics)
             .with_new_label("filename", filename.to_string())
@@ -179,8 +168,6 @@ impl ParquetFileMetrics {
             predicate_evaluation_errors,
             row_groups_matched_bloom_filter,
             row_groups_pruned_bloom_filter,
-            row_groups_fully_matched_statistics,
-            row_groups_matched_statistics,
             row_groups_pruned_statistics,
             limit_pruned_row_groups,
             bytes_scanned,

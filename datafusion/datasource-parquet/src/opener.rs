@@ -61,13 +61,15 @@ use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 /// Implements [`FileOpener`] for a parquet file
 pub(super) struct ParquetOpener {
     /// Execution partition index
-    pub partition_index: usize,
+    pub(crate) partition_index: usize,
     /// Column indexes in `table_schema` needed by the query
     pub projection: Arc<[usize]>,
     /// Target number of rows in each output RecordBatch
     pub batch_size: usize,
     /// Optional limit on the number of rows to read
-    pub limit: Option<usize>,
+    pub(crate) limit: Option<usize>,
+    /// If should keep the output rows in order
+    pub preserve_order: bool,
     /// Optional predicate to apply during the scan
     pub predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Schema of the output table without partition columns.
@@ -99,8 +101,6 @@ pub(super) struct ParquetOpener {
     pub enable_row_group_stats_pruning: bool,
     /// Coerce INT96 timestamps to specific TimeUnit
     pub coerce_int96: Option<TimeUnit>,
-    /// Should limit pruning be applied
-    pub enable_limit_pruning: bool,
     /// Optional parquet FileDecryptionProperties
     #[cfg(feature = "parquet_encryption")]
     pub file_decryption_properties: Option<Arc<FileDecryptionProperties>>,
@@ -153,7 +153,6 @@ impl FileOpener for ParquetOpener {
         let enable_bloom_filter = self.enable_bloom_filter;
         let enable_row_group_stats_pruning = self.enable_row_group_stats_pruning;
         let limit = self.limit;
-        let enable_limit_pruning = self.enable_limit_pruning;
 
         let predicate_creation_errors = MetricBuilder::new(&self.metrics)
             .global_counter("num_predicate_creation_errors");
@@ -165,6 +164,7 @@ impl FileOpener for ParquetOpener {
         #[cfg(feature = "parquet_encryption")]
         let encryption_context = self.get_encryption_context();
         let max_predicate_cache_size = self.max_predicate_cache_size;
+        let preserve_order = self.preserve_order;
 
         Ok(Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
@@ -410,14 +410,13 @@ impl FileOpener for ParquetOpener {
                     .add_matched(n_remaining_row_groups);
             }
 
-            // Prune by limit
-            if enable_limit_pruning {
-                if let Some(limit) = limit {
-                    row_groups.prune_by_limit(limit, rg_metadata, &file_metrics);
-                }
+            // Prune by limit if limit is set and limit order is not sensitive
+            if let (Some(limit), false) = (limit, preserve_order) {
+                row_groups.prune_by_limit(limit, rg_metadata, &file_metrics);
             }
 
             let mut access_plan = row_groups.build();
+
             // page index pruning: if all data on individual pages can
             // be ruled using page metadata, rows from other columns
             // with that range can be skipped as well
@@ -886,6 +885,7 @@ mod test {
                 projection: Arc::new([0, 1]),
                 batch_size: 1024,
                 limit: None,
+                preserve_order: false,
                 predicate: Some(predicate),
                 logical_file_schema: schema.clone(),
                 metadata_size_hint: None,
@@ -898,7 +898,6 @@ mod test {
                 reorder_filters: false,
                 enable_page_index: false,
                 enable_bloom_filter: false,
-                enable_limit_pruning: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
                 coerce_int96: None,
@@ -956,6 +955,7 @@ mod test {
                 projection: Arc::new([0]),
                 batch_size: 1024,
                 limit: None,
+                preserve_order: false,
                 predicate: Some(predicate),
                 logical_file_schema: file_schema.clone(),
                 metadata_size_hint: None,
@@ -972,7 +972,6 @@ mod test {
                 reorder_filters: false,
                 enable_page_index: false,
                 enable_bloom_filter: false,
-                enable_limit_pruning: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
                 coerce_int96: None,
@@ -1046,6 +1045,7 @@ mod test {
                 projection: Arc::new([0]),
                 batch_size: 1024,
                 limit: None,
+                preserve_order: false,
                 predicate: Some(predicate),
                 logical_file_schema: file_schema.clone(),
                 metadata_size_hint: None,
@@ -1062,7 +1062,6 @@ mod test {
                 reorder_filters: false,
                 enable_page_index: false,
                 enable_bloom_filter: false,
-                enable_limit_pruning: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
                 coerce_int96: None,
@@ -1139,6 +1138,7 @@ mod test {
                 projection: Arc::new([0]),
                 batch_size: 1024,
                 limit: None,
+                preserve_order: false,
                 predicate: Some(predicate),
                 logical_file_schema: file_schema.clone(),
                 metadata_size_hint: None,
@@ -1155,7 +1155,6 @@ mod test {
                 reorder_filters: true,
                 enable_page_index: false,
                 enable_bloom_filter: false,
-                enable_limit_pruning: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: false, // note that this is false!
                 coerce_int96: None,
@@ -1232,6 +1231,7 @@ mod test {
                 projection: Arc::new([0]),
                 batch_size: 1024,
                 limit: None,
+                preserve_order: false,
                 predicate: Some(predicate),
                 logical_file_schema: file_schema.clone(),
                 metadata_size_hint: None,
@@ -1248,7 +1248,6 @@ mod test {
                 reorder_filters: false,
                 enable_page_index: false,
                 enable_bloom_filter: false,
-                enable_limit_pruning: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
                 coerce_int96: None,
@@ -1387,6 +1386,7 @@ mod test {
             projection: Arc::new([0, 1]),
             batch_size: 1024,
             limit: None,
+            preserve_order: false,
             predicate: Some(predicate),
             logical_file_schema: Arc::clone(&table_schema),
             metadata_size_hint: None,
@@ -1399,7 +1399,6 @@ mod test {
             reorder_filters: false,
             enable_page_index: false,
             enable_bloom_filter: false,
-            enable_limit_pruning: false,
             schema_adapter_factory: Arc::new(CustomSchemaAdapterFactory),
             enable_row_group_stats_pruning: false,
             coerce_int96: None,

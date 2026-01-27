@@ -564,6 +564,7 @@ impl FileSource for ParquetSource {
                 .batch_size
                 .expect("Batch size must set before creating ParquetOpener"),
             limit: base_config.limit,
+            preserve_order: base_config.preserve_order,
             predicate: self.predicate.clone(),
             logical_file_schema: Arc::clone(base_config.file_schema()),
             partition_fields: base_config.table_partition_cols().clone(),
@@ -575,7 +576,6 @@ impl FileSource for ParquetSource {
             enable_page_index: self.enable_page_index(),
             enable_bloom_filter: self.bloom_filter_on_read(),
             enable_row_group_stats_pruning: self.table_parquet_options.global.pruning,
-            enable_limit_pruning: base_config.limit_pruning,
             schema_adapter_factory,
             coerce_int96,
             #[cfg(feature = "parquet_encryption")]
