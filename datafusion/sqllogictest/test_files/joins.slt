@@ -2106,7 +2106,7 @@ SELECT join_t1.t1_id, join_t2.t2_id
 FROM (select t1_id from join_t1 where join_t1.t1_id > 22) as join_t1
 RIGHT JOIN (select t2_id from join_t2 where join_t2.t2_id > 11) as join_t2
         ON join_t1.t1_id < join_t2.t2_id
-ORDER BY 1, 2        
+ORDER BY 1, 2
 ----
 33 44
 33 55
@@ -4025,7 +4025,7 @@ query TT
 explain select t1_id, t1_name, i from join_t1 t1 cross join lateral (select * from unnest(generate_series(1, t1_int))) as series(i);
 ----
 logical_plan
-01)Cross Join: 
+01)Cross Join:
 02)--SubqueryAlias: t1
 03)----TableScan: join_t1 projection=[t1_id, t1_name]
 04)--SubqueryAlias: series
@@ -4617,7 +4617,7 @@ query TT
 explain SELECT * FROM person a NATURAL JOIN lineitem b;
 ----
 logical_plan
-01)Cross Join: 
+01)Cross Join:
 02)--SubqueryAlias: a
 03)----TableScan: person projection=[id, age, state]
 04)--SubqueryAlias: b
@@ -4664,7 +4664,7 @@ query TT
 explain SELECT j1_string, j2_string FROM j1, LATERAL (SELECT * FROM j2 WHERE j1_id < j2_id) AS j2;
 ----
 logical_plan
-01)Cross Join: 
+01)Cross Join:
 02)--TableScan: j1 projection=[j1_string]
 03)--SubqueryAlias: j2
 04)----Projection: j2.j2_string
@@ -4677,7 +4677,7 @@ query TT
 explain SELECT * FROM j1 JOIN (j2 JOIN j3 ON(j2_id = j3_id - 2)) ON(j1_id = j2_id), LATERAL (SELECT * FROM j3 WHERE j3_string = j2_string) as j4
 ----
 logical_plan
-01)Cross Join: 
+01)Cross Join:
 02)--Inner Join: CAST(j2.j2_id AS Int64) = CAST(j3.j3_id AS Int64) - Int64(2)
 03)----Inner Join: j1.j1_id = j2.j2_id
 04)------TableScan: j1 projection=[j1_string, j1_id]
@@ -4693,11 +4693,11 @@ query TT
 explain SELECT * FROM j1, LATERAL (SELECT * FROM j1, LATERAL (SELECT * FROM j2 WHERE j1_id = j2_id) as j2) as j2;
 ----
 logical_plan
-01)Cross Join: 
+01)Cross Join:
 02)--TableScan: j1 projection=[j1_string, j1_id]
 03)--SubqueryAlias: j2
 04)----Subquery:
-05)------Cross Join: 
+05)------Cross Join:
 06)--------TableScan: j1 projection=[j1_string, j1_id]
 07)--------SubqueryAlias: j2
 08)----------Subquery:
@@ -4709,7 +4709,7 @@ query TT
 explain SELECT j1_string, j2_string FROM j1 LEFT JOIN LATERAL (SELECT * FROM j2 WHERE j1_id < j2_id) AS j2 ON(true);
 ----
 logical_plan
-01)Left Join: 
+01)Left Join:
 02)--TableScan: j1 projection=[j1_string]
 03)--SubqueryAlias: j2
 04)----Projection: j2.j2_string
@@ -4722,9 +4722,9 @@ query TT
 explain SELECT * FROM j1, (j2 LEFT JOIN LATERAL (SELECT * FROM j3 WHERE j1_id + j2_id = j3_id) AS j3 ON(true));
 ----
 logical_plan
-01)Cross Join: 
+01)Cross Join:
 02)--TableScan: j1 projection=[j1_string, j1_id]
-03)--Left Join: 
+03)--Left Join:
 04)----TableScan: j2 projection=[j2_string, j2_id]
 05)----SubqueryAlias: j3
 06)------Subquery:
@@ -4736,7 +4736,7 @@ query TT
 explain SELECT * FROM j1, LATERAL (SELECT 1) AS j2;
 ----
 logical_plan
-01)Cross Join: 
+01)Cross Join:
 02)--TableScan: j1 projection=[j1_string, j1_id]
 03)--SubqueryAlias: j2
 04)----Projection: Int64(1)
@@ -5089,7 +5089,7 @@ FULL JOIN t2 ON k1 = k2
 
 # LEFT MARK JOIN
 query TT
-EXPLAIN 
+EXPLAIN
 SELECT *
 FROM t2
 WHERE k2 > 0
@@ -5148,12 +5148,11 @@ LEFT ANTI JOIN t2 ON k1 = k2
 WHERE k1 < 0
 ----
 physical_plan
-01)CoalesceBatchesExec: target_batch_size=3
-02)--HashJoinExec: mode=CollectLeft, join_type=RightAnti, on=[(k2@0, k1@0)]
+01)HashJoinExec: mode=CollectLeft, join_type=RightAnti, on=[(k2@0, k1@0)]
+02)--FilterExec: k2@0 < 0
 03)----DataSourceExec: partitions=1, partition_sizes=[0]
-04)----CoalesceBatchesExec: target_batch_size=3
-05)------FilterExec: k1@0 < 0
-06)--------DataSourceExec: partitions=1, partition_sizes=[10000]
+04)--FilterExec: k1@0 < 0
+05)----DataSourceExec: partitions=1, partition_sizes=[10000]
 
 query II
 SELECT *
@@ -5168,14 +5167,14 @@ CREATE OR REPLACE TABLE t1(b INT, c INT, d INT);
 
 statement ok
 INSERT INTO t1 VALUES
-  (10, 5, 3),   
-  ( 1, 7, 8),  
-  ( 2, 9, 7),   
-  ( 3, 8,10),   
-  ( 5, 6, 6),   
-  ( 0, 4, 9),   
-  ( 4, 8, 7),   
-  (100,6, 5);  
+  (10, 5, 3),
+  ( 1, 7, 8),
+  ( 2, 9, 7),
+  ( 3, 8,10),
+  ( 5, 6, 6),
+  ( 0, 4, 9),
+  ( 4, 8, 7),
+  (100,6, 5);
 
 query I rowsort
 SELECT c
