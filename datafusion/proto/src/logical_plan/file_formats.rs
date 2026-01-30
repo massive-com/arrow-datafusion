@@ -238,6 +238,7 @@ impl JsonOptionsProto {
             JsonOptionsProto {
                 compression: options.compression as i32,
                 schema_infer_max_rec: options.schema_infer_max_rec.map(|v| v as u64),
+                newline_delimited: Some(options.newline_delimited),
             }
         } else {
             JsonOptionsProto::default()
@@ -256,6 +257,7 @@ impl From<&JsonOptionsProto> for JsonOptions {
                 _ => CompressionTypeVariant::UNCOMPRESSED,
             },
             schema_infer_max_rec: proto.schema_infer_max_rec.map(|v| v as usize),
+            newline_delimited: proto.newline_delimited.unwrap_or(true),
         }
     }
 }

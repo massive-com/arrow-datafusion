@@ -21,5 +21,6 @@
 
 pub mod file_format;
 pub mod source;
+pub mod utils;
 
 pub use file_format::*;

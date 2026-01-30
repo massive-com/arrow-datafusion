@@ -2813,6 +2813,22 @@ config_namespace! {
     pub struct JsonOptions {
         pub compression: CompressionTypeVariant, default = CompressionTypeVariant::UNCOMPRESSED
         pub schema_infer_max_rec: Option<usize>, default = None
+       /// The JSON format to use when reading files.
+       ///
+       /// When `true` (default), expects newline-delimited JSON (NDJSON):
+       /// ```text
+       /// {"key1": 1, "key2": "val"}
+       /// {"key1": 2, "key2": "vals"}
+       /// ```
+       ///
+       /// When `false`, expects JSON array format:
+       /// ```text
+       /// [
+       ///   {"key1": 1, "key2": "val"},
+       ///   {"key1": 2, "key2": "vals"}
+       /// ]
+       /// ```
+       pub newline_delimited: bool, default = true
     }
 }
 
