@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! [`JsonFormat`]: Line delimited and array JSON [`FileFormat`] abstractions
+//! [`JsonFormat`]: Line delimited JSON [`FileFormat`] abstractions
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Debug;
-use std::io::{BufReader, Read};
+use std::io::BufReader;
 use std::sync::Arc;
 
 use crate::source::JsonSource;
@@ -47,8 +47,6 @@ use datafusion_datasource::file_format::{
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::file_sink_config::{FileSink, FileSinkConfig};
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
-
-use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::write::demux::DemuxedStreamReceiver;
 use datafusion_datasource::write::orchestration::spawn_writer_tasks_and_join;
 use datafusion_datasource::write::BatchSerializer;
@@ -60,6 +58,7 @@ use datafusion_session::Session;
 
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
+use datafusion_datasource::source::DataSourceExec;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
 
 #[derive(Default)]
@@ -132,23 +131,7 @@ impl Debug for JsonFormatFactory {
     }
 }
 
-/// JSON `FileFormat` implementation supporting both line-delimited and array formats.
-///
-/// # Supported Formats
-///
-/// ## Line-Delimited JSON (default)
-/// ```text
-/// {"key1": 1, "key2": "val"}
-/// {"key1": 2, "key2": "vals"}
-/// ```
-///
-/// ## JSON Array Format (when `format_array` option is true)
-/// ```text
-/// [
-///     {"key1": 1, "key2": "val"},
-///     {"key1": 2, "key2": "vals"}
-/// ]
-/// ```
+/// New line delimited JSON `FileFormat` implementation.
 #[derive(Debug, Default)]
 pub struct JsonFormat {
     options: JsonOptions,
@@ -182,49 +165,6 @@ impl JsonFormat {
         self.options.compression = file_compression_type.into();
         self
     }
-
-    /// Set whether to expect JSON array format instead of line-delimited format.
-    ///
-    /// When `true`, expects input like: `[{"a": 1}, {"a": 2}]`
-    /// When `false` (default), expects input like:
-    /// ```text
-    /// {"a": 1}
-    /// {"a": 2}
-    /// ```
-    pub fn with_format_array(mut self, format_array: bool) -> Self {
-        self.options.format_array = format_array;
-        self
-    }
-}
-
-/// Infer schema from a JSON array format file.
-///
-/// This function reads JSON data in array format `[{...}, {...}]` and infers
-/// the Arrow schema from the contained objects.
-fn infer_json_schema_from_json_array<R: Read>(
-    reader: &mut R,
-    max_records: usize,
-) -> std::result::Result<Schema, ArrowError> {
-    let mut content = String::new();
-    reader.read_to_string(&mut content).map_err(|e| {
-        ArrowError::JsonError(format!("Failed to read JSON content: {e}"))
-    })?;
-
-    // Parse as JSON array using serde_json
-    let values: Vec<serde_json::Value> = serde_json::from_str(&content)
-        .map_err(|e| ArrowError::JsonError(format!("Failed to parse JSON array: {e}")))?;
-
-    // Take only max_records for schema inference
-    let values_to_infer: Vec<_> = values.into_iter().take(max_records).collect();
-
-    if values_to_infer.is_empty() {
-        return Err(ArrowError::JsonError(
-            "JSON array is empty, cannot infer schema".to_string(),
-        ));
-    }
-
-    // Use arrow's schema inference on the parsed values
-    infer_json_schema_from_iterator(values_to_infer.into_iter().map(Ok))
 }
 
 #[async_trait]
@@ -261,8 +201,6 @@ impl FileFormat for JsonFormat {
             .schema_infer_max_rec
             .unwrap_or(DEFAULT_SCHEMA_INFER_MAX_RECORD);
         let file_compression_type = FileCompressionType::from(self.options.compression);
-        let is_array_format = self.options.format_array;
-
         for object in objects {
             let mut take_while = || {
                 let should_take = records_to_read > 0;
@@ -278,29 +216,15 @@ impl FileFormat for JsonFormat {
                 GetResultPayload::File(file, _) => {
                     let decoder = file_compression_type.convert_read(file)?;
                     let mut reader = BufReader::new(decoder);
-
-                    if is_array_format {
-                        infer_json_schema_from_json_array(&mut reader, records_to_read)?
-                    } else {
-                        let iter = ValueIter::new(&mut reader, None);
-                        infer_json_schema_from_iterator(
-                            iter.take_while(|_| take_while()),
-                        )?
-                    }
+                    let iter = ValueIter::new(&mut reader, None);
+                    infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
                 }
                 GetResultPayload::Stream(_) => {
                     let data = r.bytes().await?;
                     let decoder = file_compression_type.convert_read(data.reader())?;
                     let mut reader = BufReader::new(decoder);
-
-                    if is_array_format {
-                        infer_json_schema_from_json_array(&mut reader, records_to_read)?
-                    } else {
-                        let iter = ValueIter::new(&mut reader, None);
-                        infer_json_schema_from_iterator(
-                            iter.take_while(|_| take_while()),
-                        )?
-                    }
+                    let iter = ValueIter::new(&mut reader, None);
+                    infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
                 }
             };
 
@@ -329,8 +253,7 @@ impl FileFormat for JsonFormat {
         _state: &dyn Session,
         conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let source =
-            Arc::new(JsonSource::new().with_format_array(self.options.format_array));
+        let source = Arc::new(JsonSource::new());
         let conf = FileScanConfigBuilder::from(conf)
             .with_file_compression_type(FileCompressionType::from(
                 self.options.compression,
@@ -359,7 +282,7 @@ impl FileFormat for JsonFormat {
     }
 
     fn file_source(&self) -> Arc<dyn FileSource> {
-        Arc::new(JsonSource::new().with_format_array(self.options.format_array))
+        Arc::new(JsonSource::default())
     }
 }
 

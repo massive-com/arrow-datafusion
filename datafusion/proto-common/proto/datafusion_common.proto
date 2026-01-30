@@ -467,8 +467,6 @@ message CsvOptions {
 message JsonOptions {
   CompressionTypeVariant compression = 1; // Compression type
   optional uint64 schema_infer_max_rec = 2; // Optional max records for schema inference
-  optional uint32 compression_level = 3; // Optional compression level
-  bool format_array = 4; // Whether the JSON is in array format [{},...] (default false = line-delimited)
 }
 
 message TableParquetOptions {
