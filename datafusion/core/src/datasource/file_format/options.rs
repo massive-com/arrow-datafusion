@@ -442,14 +442,23 @@ impl<'a> AvroReadOptions<'a> {
     }
 }
 
-/// Options that control the reading of Line-delimited JSON files (NDJson)
+#[deprecated(
+    since = "53.0.0",
+    note = "Use `JsonReadOptions` instead. This alias will be removed in a future version."
+)]
+#[doc = "Deprecated: Use [`JsonReadOptions`] instead."]
+pub type NdJsonReadOptions<'a> = JsonReadOptions<'a>;
+
+/// Options that control the reading of JSON files.
+///
+/// Supports both newline-delimited JSON (NDJSON) and JSON array formats.
 ///
 /// Note this structure is supplied when a datasource is created and
-/// can not not vary from statement to statement. For settings that
+/// can not vary from statement to statement. For settings that
 /// can vary statement to statement see
 /// [`ConfigOptions`](crate::config::ConfigOptions).
 #[derive(Clone)]
-pub struct NdJsonReadOptions<'a> {
+pub struct JsonReadOptions<'a> {
     /// The data source schema.
     pub schema: Option<&'a Schema>,
     /// Max number of rows to read from JSON files for schema inference if needed. Defaults to `DEFAULT_SCHEMA_INFER_MAX_RECORD`.
@@ -465,12 +474,25 @@ pub struct NdJsonReadOptions<'a> {
     pub infinite: bool,
     /// Indicates how the file is sorted
     pub file_sort_order: Vec<Vec<SortExpr>>,
-    /// Whether the JSON file is in array format `[{...}, {...}]` instead of
-    /// line-delimited format. Defaults to `false`.
-    pub format_array: bool,
+    /// Whether to read as newline-delimited JSON (default: true).
+    ///
+    /// When `true` (default), expects newline-delimited JSON (NDJSON):
+    /// ```text
+    /// {"key1": 1, "key2": "val"}
+    /// {"key1": 2, "key2": "vals"}
+    /// ```
+    ///
+    /// When `false`, expects JSON array format:
+    /// ```text
+    /// [
+    ///   {"key1": 1, "key2": "val"},
+    ///   {"key1": 2, "key2": "vals"}
+    /// ]
+    /// ```
+    pub newline_delimited: bool,
 }
 
-impl Default for NdJsonReadOptions<'_> {
+impl Default for JsonReadOptions<'_> {
     fn default() -> Self {
         Self {
             schema: None,
@@ -480,12 +502,12 @@ impl Default for NdJsonReadOptions<'_> {
             file_compression_type: FileCompressionType::UNCOMPRESSED,
             infinite: false,
             file_sort_order: vec![],
-            format_array: false,
+            newline_delimited: true,
         }
     }
 }
 
-impl<'a> NdJsonReadOptions<'a> {
+impl<'a> JsonReadOptions<'a> {
     /// Specify table_partition_cols for partition pruning
     pub fn table_partition_cols(
         mut self,
@@ -534,10 +556,23 @@ impl<'a> NdJsonReadOptions<'a> {
         self
     }
 
-    /// Specify whether the JSON file is in array format `[{...}, {...}]`
-    /// instead of line-delimited format.
-    pub fn format_array(mut self, format_array: bool) -> Self {
-        self.format_array = format_array;
+    /// Set whether to read as newline-delimited JSON.
+    ///
+    /// When `true` (default), expects newline-delimited JSON (NDJSON):
+    /// ```text
+    /// {"key1": 1, "key2": "val"}
+    /// {"key1": 2, "key2": "vals"}
+    /// ```
+    ///
+    /// When `false`, expects JSON array format:
+    /// ```text
+    /// [
+    ///   {"key1": 1, "key2": "val"},
+    ///   {"key1": 2, "key2": "vals"}
+    /// ]
+    /// ```
+    pub fn newline_delimited(mut self, newline_delimited: bool) -> Self {
+        self.newline_delimited = newline_delimited;
         self
     }
 }
@@ -665,7 +700,7 @@ impl ReadOptions<'_> for ParquetReadOptions<'_> {
 }
 
 #[async_trait]
-impl ReadOptions<'_> for NdJsonReadOptions<'_> {
+impl ReadOptions<'_> for JsonReadOptions<'_> {
     fn to_listing_options(
         &self,
         config: &SessionConfig,
@@ -675,7 +710,7 @@ impl ReadOptions<'_> for NdJsonReadOptions<'_> {
             .with_options(table_options.json)
             .with_schema_infer_max_rec(self.schema_infer_max_records)
             .with_file_compression_type(self.file_compression_type.to_owned())
-            .with_format_array(self.format_array);
+            .with_newline_delimited(self.newline_delimited);
 
         ListingOptions::new(Arc::new(file_format))
             .with_file_extension(self.file_extension)

@@ -151,11 +151,11 @@ physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/
 ## JSON Array Format Tests
 ##########
 
-# Test reading JSON array format file with format_array=true
+# Test reading JSON array format file with newline_delimited=false
 statement ok
 CREATE EXTERNAL TABLE json_array_test
 STORED AS JSON
-OPTIONS ('format.format_array' 'true')
+OPTIONS ('format.newline_delimited' 'false')
 LOCATION '../core/tests/data/json_array.json';
 
 query IT rowsort
@@ -168,8 +168,8 @@ SELECT a, b FROM json_array_test
 statement ok
 DROP TABLE json_array_test;
 
-# Test that reading JSON array format WITHOUT format_array option fails
-# (default is line-delimited mode which can't parse array format correctly)
+# Test that reading JSON array format WITHOUT newline_delimited option fails
+# (default is newline_delimited=true which can't parse array format correctly)
 statement error Not valid JSON
 CREATE EXTERNAL TABLE json_array_as_ndjson
 STORED AS JSON

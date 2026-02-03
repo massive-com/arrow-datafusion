@@ -659,12 +659,9 @@ pub struct JsonOptions {
     /// Optional max records for schema inference
     #[prost(uint64, optional, tag = "2")]
     pub schema_infer_max_rec: ::core::option::Option<u64>,
-    /// Optional compression level
-    #[prost(uint32, optional, tag = "3")]
-    pub compression_level: ::core::option::Option<u32>,
-    /// Whether the JSON is in array format \[{},...\] (default false = line-delimited)
-    #[prost(bool, tag = "4")]
-    pub format_array: bool,
+    /// Whether to read as newline-delimited JSON (default true). When false, expects JSON array format \[{},...\]
+    #[prost(bool, optional, tag = "3")]
+    pub newline_delimited: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TableParquetOptions {
