@@ -21,15 +21,20 @@ use std::sync::Arc;
 use crate::utils::make_scalar_function;
 
 use arrow::array::{ArrayRef, AsArray, PrimitiveArray};
-use arrow::datatypes::DataType::{Float32, Float64};
-use arrow::datatypes::{DataType, Float32Type, Float64Type, Int64Type};
+use arrow::datatypes::DataType::{
+    Decimal128, Decimal256, Decimal32, Decimal64, Float32, Float64,
+};
+use arrow::datatypes::{
+    DataType, Decimal128Type, Decimal32Type, Decimal64Type, Float32Type, Float64Type,
+    Int64Type,
+};
 use datafusion_common::ScalarValue::Int64;
 use datafusion_common::{exec_err, Result};
 use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
-use datafusion_expr::TypeSignature::Exact;
+use datafusion_expr::TypeSignature::{Coercible, Exact};
 use datafusion_expr::{
-    ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
-    Volatility,
+    Coercion, ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
+    TypeSignatureClass, Volatility,
 };
 use datafusion_macros::user_doc;
 
@@ -82,6 +87,17 @@ impl TruncFunc {
                     Exact(vec![Float64, Int64]),
                     Exact(vec![Float64]),
                     Exact(vec![Float32]),
+                    Coercible(vec![
+                        Coercion::Exact {
+                            desired_type: TypeSignatureClass::Decimal,
+                        },
+                        Coercion::Exact {
+                            desired_type: TypeSignatureClass::Integer,
+                        },
+                    ]),
+                    Coercible(vec![Coercion::Exact {
+                        desired_type: TypeSignatureClass::Decimal,
+                    }]),
                 ],
                 Volatility::Immutable,
             ),
@@ -105,6 +121,10 @@ impl ScalarUDFImpl for TruncFunc {
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         match arg_types[0] {
             Float32 => Ok(Float32),
+            Decimal128(precision, scale) => Ok(Decimal128(precision, scale)),
+            Decimal256(precision, scale) => Ok(Decimal256(precision, scale)),
+            Decimal32(precision, scale) => Ok(Decimal32(precision, scale)),
+            Decimal64(precision, scale) => Ok(Decimal64(precision, scale)),
             _ => Ok(Float64),
         }
     }
@@ -152,6 +172,64 @@ fn trunc(args: &[ArrayRef]) -> Result<ArrayRef> {
     };
 
     match num.data_type() {
+        Decimal128(_, scale) => match precision {
+            ColumnarValue::Scalar(Int64(Some(0))) => Ok(Arc::new(
+                num.as_primitive::<Decimal128Type>()
+                    .unary::<_, Decimal128Type>(|x: i128| {
+                        compute_truncate_decimal128(x, 0, *scale)
+                    }),
+            ) as ArrayRef),
+            ColumnarValue::Array(precision) => {
+                let num_array = num.as_primitive::<Decimal128Type>();
+                let precision_array = precision.as_primitive::<Int64Type>();
+                let result: PrimitiveArray<Decimal128Type> =
+                    arrow::compute::binary(num_array, precision_array, |x, y| {
+                        compute_truncate_decimal128(x, y, *scale)
+                    })?;
+
+                Ok(Arc::new(result) as ArrayRef)
+            }
+            _ => exec_err!("trunc function requires a scalar or array for precision"),
+        },
+        Decimal64(_, scale) => match precision {
+            ColumnarValue::Scalar(Int64(Some(0))) => Ok(Arc::new(
+                num.as_primitive::<Decimal64Type>()
+                    .unary::<_, Decimal64Type>(|x: i64| {
+                        compute_truncate_decimal64(x, 0, *scale)
+                    }),
+            ) as ArrayRef),
+            ColumnarValue::Array(precision) => {
+                let num_array = num.as_primitive::<Decimal64Type>();
+                let precision_array = precision.as_primitive::<Int64Type>();
+                let result: PrimitiveArray<Decimal64Type> =
+                    arrow::compute::binary(num_array, precision_array, |x, y| {
+                        compute_truncate_decimal64(x, y, *scale)
+                    })?;
+
+                Ok(Arc::new(result) as ArrayRef)
+            }
+            _ => exec_err!("trunc function requires a scalar or array for precision"),
+        },
+        Decimal32(_, scale) => match precision {
+            ColumnarValue::Scalar(Int64(Some(0))) => Ok(Arc::new(
+                num.as_primitive::<Decimal32Type>()
+                    .unary::<_, Decimal32Type>(|x: i32| {
+                        compute_truncate_decimal32(x, 0, *scale)
+                    }),
+            ) as ArrayRef),
+            ColumnarValue::Array(precision) => {
+                let num_array = num.as_primitive::<Decimal32Type>();
+                let precision_array = precision.as_primitive::<Int64Type>();
+                let result: PrimitiveArray<Decimal32Type> =
+                    arrow::compute::binary(num_array, precision_array, |x, y| {
+                        compute_truncate_decimal32(x, y, *scale)
+                    })?;
+
+                Ok(Arc::new(result) as ArrayRef)
+            }
+            _ => exec_err!("trunc function requires a scalar or array for precision"),
+        },
+
         Float64 => match precision {
             ColumnarValue::Scalar(Int64(Some(0))) => {
                 Ok(Arc::new(
@@ -217,6 +295,27 @@ fn compute_truncate64(x: f64, y: i64) -> f64 {
     let factor = 10.0_f64.powi(y as i32);
     (x * factor).round() / factor
 }
+fn compute_truncate_decimal128(x: i128, target: i64, scale: i8) -> i128 {
+    if target >= scale as i64 {
+        return x;
+    }
+    let factor = 10_i128.pow(target as u32);
+    (x / factor) * factor
+}
+fn compute_truncate_decimal64(x: i64, target: i64, scale: i8) -> i64 {
+    if target >= scale as i64 {
+        return x;
+    }
+    let factor = 10_i64.pow(target as u32);
+    (x / factor) * factor
+}
+fn compute_truncate_decimal32(x: i32, target: i64, scale: i8) -> i32 {
+    if target >= scale as i64 {
+        return x;
+    }
+    let factor = 10_i32.pow(target as u32);
+    (x / factor) * factor
+}
 
 #[cfg(test)]
 mod test {
@@ -224,7 +323,13 @@ mod test {
 
     use crate::math::trunc::trunc;
 
-    use arrow::array::{ArrayRef, Float32Array, Float64Array, Int64Array};
+    use arrow::{
+        array::{
+            ArrayRef, Decimal128Array, Decimal64Array, Float32Array, Float64Array,
+            Int64Array, PrimitiveArray,
+        },
+        datatypes::{Decimal128Type, Decimal64Type},
+    };
     use datafusion_common::cast::{as_float32_array, as_float64_array};
 
     #[test]
@@ -297,5 +402,94 @@ mod test {
         assert_eq!(floats.value(2), 123.0);
         assert_eq!(floats.value(3), 123.0);
         assert_eq!(floats.value(4), -321.0);
+    }
+
+    #[test]
+    fn test_truncate_decimal64_one_arg() {
+        let args: Vec<ArrayRef> = {
+            let mut decimal_builder = Decimal64Array::builder(5)
+                .with_precision_and_scale(18, 6)
+                .unwrap();
+            decimal_builder.append_value(5_000_000_000);
+            decimal_builder.append_value(234_267_812);
+            decimal_builder.append_value(123_123_45);
+            decimal_builder.append_value(123_312_979_313_2);
+            decimal_builder.append_value(-321_123);
+            vec![Arc::new(decimal_builder.finish())]
+        };
+
+        let result: ArrayRef =
+            trunc(&args).expect("failed to initialize function truncate");
+
+        let decimals = result
+            .as_any()
+            .downcast_ref::<PrimitiveArray<Decimal64Type>>()
+            .unwrap();
+
+        assert_eq!(decimals.len(), 5);
+        assert_eq!(decimals.value(0), 5_000_000_000);
+        assert_eq!(decimals.value(1), 234_000_000);
+        assert_eq!(decimals.value(2), 12_000_000);
+        assert_eq!(decimals.value(3), 1_233_129_000_000);
+        assert_eq!(decimals.value(4), 0);
+    }
+    #[test]
+    fn test_truncate_decimal64_two_args() {
+        let args: Vec<ArrayRef> = {
+            let mut decimal_builder = Decimal64Array::builder(5)
+                .with_precision_and_scale(18, 6)
+                .unwrap();
+            decimal_builder.append_value(5_000_000_000);
+            decimal_builder.append_value(234_267_812);
+            decimal_builder.append_value(123_123_45);
+            decimal_builder.append_value(123_312_979_313_2);
+            decimal_builder.append_value(-321_123);
+            vec![
+                Arc::new(decimal_builder.finish()),
+                Arc::new(Int64Array::from(vec![0, 3, 2, 5, 6])),
+            ]
+        };
+        let result: ArrayRef =
+            trunc(&args).expect("failed to initialize function truncate");
+        let decimals = result
+            .as_any()
+            .downcast_ref::<PrimitiveArray<Decimal64Type>>()
+            .unwrap();
+
+        assert_eq!(decimals.len(), 5);
+        assert_eq!(decimals.value(0), 5_000_000_000);
+        assert_eq!(decimals.value(1), 234_267_000);
+        assert_eq!(decimals.value(2), 123_123_00);
+        assert_eq!(decimals.value(3), 1233129700000);
+        assert_eq!(decimals.value(4), -321123);
+    }
+    #[test]
+    fn test_truncate_decimal128_one_arg() {
+        let args: Vec<ArrayRef> = {
+            let mut decimal_builder = Decimal128Array::builder(5)
+                .with_precision_and_scale(38, 6)
+                .unwrap();
+            decimal_builder.append_value(5_000_000_000);
+            decimal_builder.append_value(234_267_812);
+            decimal_builder.append_value(123_123_45);
+            decimal_builder.append_value(123_312_979_313_2);
+            decimal_builder.append_value(-321_123);
+            vec![Arc::new(decimal_builder.finish())]
+        };
+
+        let result: ArrayRef =
+            trunc(&args).expect("failed to initialize function truncate");
+
+        let decimals = result
+            .as_any()
+            .downcast_ref::<PrimitiveArray<Decimal128Type>>()
+            .unwrap();
+
+        assert_eq!(decimals.len(), 5);
+        assert_eq!(decimals.value(0), 5_000_000_000);
+        assert_eq!(decimals.value(1), 234_000_000);
+        assert_eq!(decimals.value(2), 12_000_000);
+        assert_eq!(decimals.value(3), 1_233_129_000_000);
+        assert_eq!(decimals.value(4), 0);
     }
 }
