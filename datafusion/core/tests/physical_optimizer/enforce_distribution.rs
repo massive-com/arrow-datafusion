@@ -66,8 +66,8 @@ use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::{
-    displayable, DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties,
-    Statistics,
+    displayable, DisplayAs, DisplayFormatType, ExecutionPlanProperties, InputOrderMode,
+    PlanProperties, Statistics,
 };
 use insta::Settings;
 
@@ -3721,6 +3721,91 @@ fn test_replace_order_preserving_variants_with_fetch() -> Result<()> {
         result.0.plan.fetch(),
         Some(5),
         "Fetch value was not preserved after transformation"
+    );
+
+    Ok(())
+}
+
+/// Verify that EnforceDistribution preserves SortPreservingMergeExec
+/// (instead of replacing it with CoalescePartitionsExec) when doing so
+/// enables the parent AggregateExec to run in streaming mode rather than
+/// blocking (Final emission).
+///
+/// Scenario:
+///   AggregateExec (Final, group-by [a])
+///     AggregateExec (Partial, group-by [a], Sorted mode) — 2 partitions sorted by [a]
+///
+/// Without the fix, EnforceDistribution would insert CoalescePartitionsExec
+/// between Partial and Final, destroying the ordering and forcing the Final
+/// aggregate into blocking mode.
+///
+/// With the fix, SortPreservingMergeExec is preserved because the parent
+/// AggregateExec benefits from the ordered input (streaming execution).
+#[test]
+fn test_streaming_aggregate_preserves_sort_preserving_merge() -> Result<()> {
+    let schema = schema();
+    let sort_key: LexOrdering =
+        [PhysicalSortExpr::new_default(col("a", &schema)?)].into();
+
+    // Create 2-partition sorted input
+    let input = parquet_exec_multiple_sorted(vec![sort_key]);
+
+    // Partial aggregate grouping by [a]
+    let group_by = PhysicalGroupBy::new_single(vec![(
+        col("a", &input.schema())?,
+        "a".to_string(),
+    )]);
+    let partial = Arc::new(AggregateExec::try_new(
+        AggregateMode::Partial,
+        group_by,
+        vec![],
+        vec![],
+        input as Arc<dyn ExecutionPlan>,
+        schema.clone(),
+    )?);
+
+    // Verify the partial aggregate is in Sorted mode
+    assert!(
+        matches!(partial.input_order_mode(), InputOrderMode::Sorted),
+        "Expected Sorted input_order_mode for partial, got {:?}",
+        partial.input_order_mode()
+    );
+    // Verify it has output ordering
+    assert!(
+        partial.properties().output_ordering().is_some(),
+        "Partial aggregate should have output ordering in Sorted mode"
+    );
+
+    // Final aggregate on top
+    let final_group_by = PhysicalGroupBy::new_single(vec![(
+        col("a", &partial.schema())?,
+        "a".to_string(),
+    )]);
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
+        AggregateMode::Final,
+        final_group_by,
+        vec![],
+        vec![],
+        partial,
+        schema,
+    )?);
+
+    // Run EnforceDistribution (without prefer_existing_sort — the default)
+    let optimized = ensure_distribution_helper(plan, 10, false)?;
+
+    let plan_str = displayable(optimized.as_ref()).indent(true).to_string();
+
+    // The key assertion: SortPreservingMergeExec should be present,
+    // NOT CoalescePartitionsExec, because it enables streaming.
+    assert!(
+        plan_str.contains("SortPreservingMergeExec"),
+        "Expected SortPreservingMergeExec in plan to enable streaming aggregate, \
+         but got:\n{plan_str}"
+    );
+    assert!(
+        !plan_str.contains("CoalescePartitionsExec"),
+        "CoalescePartitionsExec should NOT be present — SortPreservingMergeExec \
+         should be used instead to enable streaming. Plan:\n{plan_str}"
     );
 
     Ok(())

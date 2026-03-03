@@ -942,20 +942,44 @@ fn add_hash_on_top(
 ///
 /// * `input`: Current node.
 ///
-/// Checks whether preserving the child's ordering would allow the parent
-/// to switch from blocking (Final emission) to streaming execution.
+/// Checks whether preserving the child's ordering enables the parent to
+/// run in streaming mode. Compares the parent's pipeline behavior with
+/// the ordered child vs. an unordered (coalesced) child. If removing the
+/// ordering would cause the parent to switch from streaming to blocking,
+/// keeping the order-preserving variant is beneficial.
+///
+/// Only applicable to single-child operators; returns false for multi-child
+/// operators (e.g. joins) where child substitution semantics are ambiguous.
 fn preserving_order_enables_streaming(
     parent: &Arc<dyn ExecutionPlan>,
     ordered_child: &Arc<dyn ExecutionPlan>,
 ) -> bool {
-    if parent.pipeline_behavior() != EmissionType::Final {
+    // Only applicable to single-child operators
+    if parent.children().len() != 1 {
         return false;
     }
-    match parent
+    // Build parent with the ordered child
+    let with_ordered = match parent
         .clone()
         .with_new_children(vec![Arc::clone(ordered_child)])
     {
-        Ok(candidate) => candidate.pipeline_behavior() != EmissionType::Final,
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    if with_ordered.pipeline_behavior() == EmissionType::Final {
+        // Parent is blocking even with ordering — no benefit
+        return false;
+    }
+    // Build parent with an unordered child (simulating CoalescePartitionsExec)
+    let unordered_child: Arc<dyn ExecutionPlan> =
+        Arc::new(CoalescePartitionsExec::new(Arc::clone(ordered_child)));
+    match parent
+        .clone()
+        .with_new_children(vec![unordered_child])
+    {
+        Ok(without_ordered) => {
+            without_ordered.pipeline_behavior() == EmissionType::Final
+        }
         Err(_) => false,
     }
 }
