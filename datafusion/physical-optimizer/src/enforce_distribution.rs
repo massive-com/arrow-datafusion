@@ -942,6 +942,24 @@ fn add_hash_on_top(
 ///
 /// * `input`: Current node.
 ///
+/// Checks whether preserving the child's ordering would allow the parent
+/// to switch from blocking (Final emission) to streaming execution.
+fn preserving_order_enables_streaming(
+    parent: &Arc<dyn ExecutionPlan>,
+    ordered_child: &Arc<dyn ExecutionPlan>,
+) -> bool {
+    if parent.pipeline_behavior() != EmissionType::Final {
+        return false;
+    }
+    match parent
+        .clone()
+        .with_new_children(vec![Arc::clone(ordered_child)])
+    {
+        Ok(candidate) => candidate.pipeline_behavior() != EmissionType::Final,
+        Err(_) => false,
+    }
+}
+
 /// # Returns
 ///
 /// Updated node with an execution plan, where desired single
@@ -1333,7 +1351,10 @@ pub fn ensure_distribution(
                     .equivalence_properties()
                     .ordering_satisfy_requirement(sort_req.clone())?;
 
-                if (!ordering_satisfied || !order_preserving_variants_desirable)
+                let streaming_benefit = child.data
+                    && preserving_order_enables_streaming(&plan, &child.plan);
+                if (!ordering_satisfied
+                    || (!order_preserving_variants_desirable && !streaming_benefit))
                     && child.data
                 {
                     let (replaced_child, fetch)  = replace_order_preserving_variants(child, ordering_satisfied)?;
@@ -1356,8 +1377,15 @@ pub fn ensure_distribution(
                 match requirement {
                     // Operator requires specific distribution.
                     Distribution::SinglePartition | Distribution::HashPartitioned(_) => {
-                        // Since there is no ordering requirement, preserving ordering is pointless
-                        child = replace_order_preserving_variants(child, false)?.0;
+                        let streaming_benefit = child.data
+                            && preserving_order_enables_streaming(
+                                &plan,
+                                &child.plan,
+                            );
+                        if !streaming_benefit {
+                            child =
+                                replace_order_preserving_variants(child, false)?.0;
+                        }
                     }
                     Distribution::UnspecifiedDistribution => {
                         // Since ordering is lost, trying to preserve ordering is pointless
