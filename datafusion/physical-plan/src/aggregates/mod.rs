@@ -732,45 +732,71 @@ impl AggregateExec {
         // using get_expr_properties, which evaluates expression monotonicity
         // bottom-up — the same mechanism that determined input_order_mode
         // via find_longest_permutation.
-        if !matches!(input_order_mode, InputOrderMode::Linear)
-            && eq_properties.output_ordering().is_none()
-        {
-            let sorted_indices = match input_order_mode {
-                InputOrderMode::Sorted => {
-                    (0..group_expr_mapping.len()).collect::<Vec<_>>()
-                }
-                InputOrderMode::PartiallySorted(indices) => indices.clone(),
-                InputOrderMode::Linear => unreachable!(),
-            };
-
+        if !matches!(input_order_mode, InputOrderMode::Linear) {
+            let has_ordering = eq_properties.output_ordering().is_some();
+            eprintln!(
+                "DEBUG compute_properties: input_order_mode={:?}, output_ordering_exists={}, mode={:?}",
+                input_order_mode, has_ordering, mode
+            );
+            if let Some(ord) = eq_properties.output_ordering() {
+                eprintln!("DEBUG compute_properties: existing output_ordering={:?}", ord);
+            }
             let input_eq = input.equivalence_properties();
-            let source_exprs: Vec<_> = group_expr_mapping
-                .iter()
-                .map(|(source, _)| Arc::clone(source))
-                .collect();
-            let output_schema = eq_properties.schema();
+            eprintln!(
+                "DEBUG compute_properties: input oeq_class={:?}",
+                input_eq.oeq_class()
+            );
+            eprintln!(
+                "DEBUG compute_properties: input constants={:?}",
+                input_eq.constants()
+            );
 
-            let sorted_ordering: Vec<PhysicalSortExpr> = sorted_indices
-                .iter()
-                .filter_map(|&idx| {
-                    let props =
-                        input_eq.get_expr_properties(Arc::clone(&source_exprs[idx]));
-                    match props.sort_properties {
-                        SortProperties::Ordered(options) => {
-                            let output_col = Arc::new(Column::new(
-                                output_schema.field(idx).name(),
-                                idx,
-                            ));
-                            Some(PhysicalSortExpr::new(output_col as _, options))
-                        }
-                        _ => None,
+            if !has_ordering {
+                let sorted_indices = match input_order_mode {
+                    InputOrderMode::Sorted => {
+                        (0..group_expr_mapping.len()).collect::<Vec<_>>()
                     }
-                })
-                .collect();
+                    InputOrderMode::PartiallySorted(indices) => indices.clone(),
+                    InputOrderMode::Linear => unreachable!(),
+                };
 
-            if !sorted_ordering.is_empty() {
-                if let Some(ordering) = LexOrdering::new(sorted_ordering) {
-                    eq_properties.add_orderings([ordering]);
+                let source_exprs: Vec<_> = group_expr_mapping
+                    .iter()
+                    .map(|(source, _)| Arc::clone(source))
+                    .collect();
+                let output_schema = eq_properties.schema();
+
+                let sorted_ordering: Vec<PhysicalSortExpr> = sorted_indices
+                    .iter()
+                    .filter_map(|&idx| {
+                        let props =
+                            input_eq.get_expr_properties(Arc::clone(&source_exprs[idx]));
+                        eprintln!(
+                            "DEBUG compute_properties: idx={}, expr={:?}, sort_properties={:?}",
+                            idx, source_exprs[idx], props.sort_properties
+                        );
+                        match props.sort_properties {
+                            SortProperties::Ordered(options) => {
+                                let output_col = Arc::new(Column::new(
+                                    output_schema.field(idx).name(),
+                                    idx,
+                                ));
+                                Some(PhysicalSortExpr::new(output_col as _, options))
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect();
+
+                eprintln!(
+                    "DEBUG compute_properties: sorted_ordering={:?}",
+                    sorted_ordering
+                );
+
+                if !sorted_ordering.is_empty() {
+                    if let Some(ordering) = LexOrdering::new(sorted_ordering) {
+                        eq_properties.add_orderings([ordering]);
+                    }
                 }
             }
         }
