@@ -42,8 +42,14 @@ use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::ScalarValue;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
+use datafusion_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+};
 use datafusion_expr::{JoinType, Operator};
+use datafusion_physical_expr::expressions::CastExpr;
 use datafusion_physical_expr::expressions::{binary, lit, BinaryExpr, Column, Literal};
+use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::{
     LexOrdering, OrderingRequirements, PhysicalSortExpr,
@@ -3751,10 +3757,8 @@ fn test_streaming_aggregate_preserves_sort_preserving_merge() -> Result<()> {
     let input = parquet_exec_multiple_sorted(vec![sort_key]);
 
     // Partial aggregate grouping by [a]
-    let group_by = PhysicalGroupBy::new_single(vec![(
-        col("a", &input.schema())?,
-        "a".to_string(),
-    )]);
+    let group_by =
+        PhysicalGroupBy::new_single(vec![(col("a", &input.schema())?, "a".to_string())]);
     let partial = Arc::new(AggregateExec::try_new(
         AggregateMode::Partial,
         group_by,
@@ -3806,6 +3810,340 @@ fn test_streaming_aggregate_preserves_sort_preserving_merge() -> Result<()> {
         !plan_str.contains("CoalescePartitionsExec"),
         "CoalescePartitionsExec should NOT be present — SortPreservingMergeExec \
          should be used instead to enable streaming. Plan:\n{plan_str}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_streaming_aggregate_partially_sorted_multi_column() -> Result<()> {
+    // Mimic real case: multi-column group-by with PartiallySorted([0, 2])
+    // Input sorted by [a ASC, b ASC], group by [a, c, b] → PartiallySorted([0, 2])
+    let schema = schema();
+    let sort_key: LexOrdering = [
+        PhysicalSortExpr::new_default(col("a", &schema)?),
+        PhysicalSortExpr::new_default(col("b", &schema)?),
+    ]
+    .into();
+
+    let input = parquet_exec_multiple_sorted(vec![sort_key]);
+
+    // Group by [a, c, b] — ordering covers a (idx 0) and b (idx 2)
+    let group_by = PhysicalGroupBy::new_single(vec![
+        (col("a", &input.schema())?, "a".to_string()),
+        (col("c", &input.schema())?, "c".to_string()),
+        (col("b", &input.schema())?, "b".to_string()),
+    ]);
+    let partial = Arc::new(AggregateExec::try_new(
+        AggregateMode::Partial,
+        group_by,
+        vec![],
+        vec![],
+        input as Arc<dyn ExecutionPlan>,
+        schema.clone(),
+    )?);
+
+    // Verify it's PartiallySorted
+    assert!(
+        matches!(
+            partial.input_order_mode(),
+            InputOrderMode::PartiallySorted(_)
+        ),
+        "Expected PartiallySorted, got {:?}",
+        partial.input_order_mode()
+    );
+
+    // Final aggregate
+    let final_group_by = PhysicalGroupBy::new_single(vec![
+        (col("a", &partial.schema())?, "a".to_string()),
+        (col("c", &partial.schema())?, "c".to_string()),
+        (col("b", &partial.schema())?, "b".to_string()),
+    ]);
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
+        AggregateMode::Final,
+        final_group_by,
+        vec![],
+        vec![],
+        partial,
+        schema,
+    )?);
+
+    let optimized = ensure_distribution_helper(plan, 10, false)?;
+
+    let plan_str = displayable(optimized.as_ref()).indent(true).to_string();
+
+    assert!(
+        plan_str.contains("SortPreservingMergeExec"),
+        "Expected SortPreservingMergeExec in plan to enable streaming aggregate, \
+         but got:\n{plan_str}"
+    );
+    assert!(
+        !plan_str.contains("CoalescePartitionsExec"),
+        "CoalescePartitionsExec should NOT be present. Plan:\n{plan_str}"
+    );
+
+    Ok(())
+}
+
+/// Mock UDF that behaves like date_bin: preserves ordering of second argument
+/// when first argument (step) and optional third argument (origin) are Singleton.
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct MockDateBin {
+    signature: Signature,
+}
+impl MockDateBin {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(3, Volatility::Immutable),
+        }
+    }
+}
+impl ScalarUDFImpl for MockDateBin {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "mock_date_bin"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _args: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Timestamp(
+            arrow_schema::TimeUnit::Nanosecond,
+            Some("UTC".into()),
+        ))
+    }
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        unimplemented!("mock only")
+    }
+    fn output_ordering(&self, input: &[ExprProperties]) -> Result<SortProperties> {
+        let step = &input[0];
+        let date_value = &input[1];
+        let reference = input.get(2);
+        if step.sort_properties == SortProperties::Singleton
+            && reference
+                .map(|r| r.sort_properties == SortProperties::Singleton)
+                .unwrap_or(true)
+        {
+            Ok(date_value.sort_properties)
+        } else {
+            Ok(SortProperties::Unordered)
+        }
+    }
+}
+
+/// Models the real-world scenario where a ProjectionExec computes date_bin
+/// BEFORE the Partial AggregateExec, so the aggregate's group-by expressions
+/// are Column references (not the date_bin expression itself):
+///
+///   Final AggregateExec
+///     Partial AggregateExec (group-by: [ticker@0, bucket_start@3, exchange@1])
+///       ProjectionExec (ws→original_time@2, date_bin(interval,CAST(ws))→bucket_start@3)
+///         UnionExec (2 partitions)
+///           DataSourceExec (sorted by [ws DESC])
+///           DataSourceExec (sorted by [ws DESC])
+///
+/// The bug: ProjectionExec outputs ordering [original_time@2 DESC, bucket_start@3 DESC].
+/// The Partial's `construct_dependency_map` sees leading term `original_time@2` which
+/// is NOT a group-by source → chain is dropped → output_ordering() = None →
+/// add_merge_on_top creates CoalescePartitionsExec instead of SortPreservingMergeExec.
+///
+/// Fix 1 (in AggregateExec::compute_properties) re-derives output ordering from
+/// input_order_mode when projected_orderings fails.
+/// Fix 2 (in ensure_distribution) preserves SPM when it enables streaming.
+#[test]
+fn test_streaming_aggregate_with_date_bin_group_by() -> Result<()> {
+    // Source uses Millisecond (like the real StorageExec/FileScanExec),
+    // date_bin CASTs to Nanosecond (like the real plan).
+    let ws_source_type =
+        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, Some("UTC".into()));
+    let ws_target_type =
+        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into()));
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("ticker", DataType::Utf8, false),
+        Field::new("exchange", DataType::Utf8, false),
+        Field::new("session_end_date", DataType::Utf8, false),
+        Field::new("ws", ws_source_type.clone(), false),
+        Field::new("open", DataType::Float64, true),
+        Field::new("high", DataType::Float64, true),
+        Field::new("low", DataType::Float64, true),
+        Field::new("close", DataType::Float64, true),
+    ]));
+
+    let desc = SortOptions {
+        descending: true,
+        nulls_first: true,
+    };
+
+    // Both branches sorted by [ws DESC].
+    // In the real case, ordering may have a leading constant prefix like
+    // [extract_year_month(ws) DESC, ws DESC] that gets stripped by
+    // add_constants, leaving [ws DESC].
+    //
+    // The key bug: ProjectionExec maps ws → original_time (not in group-by)
+    // and computes date_bin(CAST(ws)) → bucket_start (in group-by).
+    // When the input ordering chain breaks (e.g. leading term can't be
+    // projected), AggregateExec's output_ordering() may return None even
+    // though find_longest_permutation detects PartiallySorted via bottom-up
+    // get_expr_properties. Fix 1 bridges this gap.
+    let ws_col = Arc::new(Column::new("ws", 3)) as Arc<dyn PhysicalExpr>;
+    let sort_key: LexOrdering = [PhysicalSortExpr::new(Arc::clone(&ws_col), desc)].into();
+    let branch1 =
+        parquet_exec_with_sort(Arc::clone(&source_schema), vec![sort_key.clone()]);
+    let branch2 = parquet_exec_with_sort(Arc::clone(&source_schema), vec![sort_key]);
+
+    // UnionExec: 2 partitions.
+    // calculate_union of [ws DESC] and [] = [] (no common ordering)
+    let union = union_exec(vec![
+        branch1 as Arc<dyn ExecutionPlan>,
+        branch2 as Arc<dyn ExecutionPlan>,
+    ]);
+
+    // ProjectionExec: computes date_bin and renames ws → original_time
+    // Real plan: date_bin(interval, CAST(ws AS Timestamp(Nanosecond, Some("UTC"))), origin)
+    let ticker_src = Arc::new(Column::new("ticker", 0)) as Arc<dyn PhysicalExpr>;
+    let exchange_src = Arc::new(Column::new("exchange", 1)) as Arc<dyn PhysicalExpr>;
+    let session_end_src =
+        Arc::new(Column::new("session_end_date", 2)) as Arc<dyn PhysicalExpr>;
+    let ws_src = Arc::new(Column::new("ws", 3)) as Arc<dyn PhysicalExpr>;
+
+    // CAST from Millisecond → Nanosecond (like the real plan)
+    let cast_ws = Arc::new(CastExpr::new(
+        Arc::clone(&ws_src),
+        ws_target_type.clone(),
+        None,
+    )) as Arc<dyn PhysicalExpr>;
+
+    let mock_udf = Arc::new(ScalarUDF::from(MockDateBin::new()));
+    let interval_lit = Arc::new(Literal::new(ScalarValue::IntervalMonthDayNano(Some(
+        arrow::datatypes::IntervalMonthDayNanoType::make_value(0, 0, 1_000_000_000),
+    )))) as Arc<dyn PhysicalExpr>;
+    // Origin literal (3rd arg, like real date_bin)
+    let origin_lit = Arc::new(Literal::new(ScalarValue::TimestampNanosecond(
+        Some(1_491_177_600_000_000_000),
+        Some("UTC".into()),
+    ))) as Arc<dyn PhysicalExpr>;
+
+    let date_bin_expr = Arc::new(ScalarFunctionExpr::new(
+        "mock_date_bin",
+        mock_udf,
+        vec![
+            Arc::clone(&interval_lit),
+            Arc::clone(&cast_ws),
+            Arc::clone(&origin_lit),
+        ],
+        Arc::new(Field::new("bucket_start", ws_target_type.clone(), false)),
+        Arc::new(ConfigOptions::new()),
+    )) as Arc<dyn PhysicalExpr>;
+
+    let open_src = Arc::new(Column::new("open", 4)) as Arc<dyn PhysicalExpr>;
+    let high_src = Arc::new(Column::new("high", 5)) as Arc<dyn PhysicalExpr>;
+    let low_src = Arc::new(Column::new("low", 6)) as Arc<dyn PhysicalExpr>;
+    let close_src = Arc::new(Column::new("close", 7)) as Arc<dyn PhysicalExpr>;
+
+    let proj_exprs: Vec<ProjectionExpr> = vec![
+        (Arc::clone(&ticker_src), "ticker".to_string()).into(),
+        (Arc::clone(&exchange_src), "exchange".to_string()).into(),
+        (Arc::clone(&ws_src), "original_time".to_string()).into(),
+        (
+            date_bin_expr as Arc<dyn PhysicalExpr>,
+            "bucket_start".to_string(),
+        )
+            .into(),
+        (Arc::clone(&session_end_src), "session_end_date".to_string()).into(),
+        (Arc::clone(&open_src), "open".to_string()).into(),
+        (Arc::clone(&high_src), "high".to_string()).into(),
+        (Arc::clone(&low_src), "low".to_string()).into(),
+        (Arc::clone(&close_src), "close".to_string()).into(),
+    ];
+    let projection = Arc::new(ProjectionExec::try_new(proj_exprs, union)?);
+    let proj_schema = projection.schema();
+
+    // Partial AggregateExec: group-by uses Column references (not date_bin expr)
+    // Group-by: [ticker@0, exchange@1, session_end_date@4, bucket_start@3]
+    let group_by = PhysicalGroupBy::new_single(vec![
+        (col("ticker", &proj_schema)?, "ticker".to_string()),
+        (col("exchange", &proj_schema)?, "exchange".to_string()),
+        (
+            col("session_end_date", &proj_schema)?,
+            "session_end_date".to_string(),
+        ),
+        (
+            col("bucket_start", &proj_schema)?,
+            "bucket_start".to_string(),
+        ),
+    ]);
+
+    let agg_schema = Arc::new(Schema::new(vec![
+        Field::new("ticker", DataType::Utf8, false),
+        Field::new("exchange", DataType::Utf8, false),
+        Field::new("session_end_date", DataType::Utf8, false),
+        Field::new("bucket_start", ws_target_type, false),
+    ]));
+
+    let partial = Arc::new(AggregateExec::try_new(
+        AggregateMode::Partial,
+        group_by,
+        vec![],
+        vec![],
+        projection as Arc<dyn ExecutionPlan>,
+        Arc::clone(&agg_schema),
+    )?);
+
+    // Verify Partial detects PartiallySorted mode
+    assert!(
+        matches!(
+            partial.input_order_mode(),
+            InputOrderMode::PartiallySorted(_)
+        ),
+        "Expected PartiallySorted, got {:?}",
+        partial.input_order_mode()
+    );
+
+    // Key assertion: output_ordering should NOT be None
+    let partial_ordering = partial.properties().output_ordering();
+    assert!(
+        partial_ordering.is_some(),
+        "Partial AggregateExec should have non-None output_ordering when \
+         input_order_mode is PartiallySorted."
+    );
+
+    // Final aggregate on top
+    let final_group_by = PhysicalGroupBy::new_single(vec![
+        (col("ticker", &partial.schema())?, "ticker".to_string()),
+        (col("exchange", &partial.schema())?, "exchange".to_string()),
+        (
+            col("session_end_date", &partial.schema())?,
+            "session_end_date".to_string(),
+        ),
+        (
+            col("bucket_start", &partial.schema())?,
+            "bucket_start".to_string(),
+        ),
+    ]);
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
+        AggregateMode::Final,
+        final_group_by,
+        vec![],
+        vec![],
+        partial,
+        Arc::clone(&agg_schema),
+    )?);
+
+    // Run EnforceDistribution (prefer_existing_sort=true to match real config)
+    let optimized = ensure_distribution_helper(plan, 10, true)?;
+    let plan_str = displayable(optimized.as_ref()).indent(true).to_string();
+
+    // SortPreservingMergeExec should be present — NOT CoalescePartitionsExec
+    assert!(
+        plan_str.contains("SortPreservingMergeExec"),
+        "Expected SortPreservingMergeExec in plan to enable streaming aggregate, \
+         but got:\n{plan_str}"
+    );
+    assert!(
+        !plan_str.contains("CoalescePartitionsExec"),
+        "CoalescePartitionsExec should NOT be present. Plan:\n{plan_str}"
     );
 
     Ok(())
