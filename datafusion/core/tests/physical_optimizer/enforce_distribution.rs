@@ -3952,66 +3952,175 @@ impl ScalarUDFImpl for MockDateBin {
 /// Fix 1 (in AggregateExec::compute_properties) re-derives output ordering from
 /// input_order_mode when projected_orderings fails.
 /// Fix 2 (in ensure_distribution) preserves SPM when it enables streaming.
+fn col_proj(name: &str, idx: usize) -> (Arc<dyn PhysicalExpr>, String) {
+    (Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>, name.to_string())
+}
+
+fn col_proj_alias(name: &str, idx: usize, alias: &str) -> (Arc<dyn PhysicalExpr>, String) {
+    (Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>, alias.to_string())
+}
+
 #[test]
 fn test_streaming_aggregate_with_date_bin_group_by() -> Result<()> {
-    // Source uses Millisecond (like the real StorageExec/FileScanExec),
-    // date_bin CASTs to Nanosecond (like the real plan).
-    let ws_source_type =
-        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, Some("UTC".into()));
-    let ws_target_type =
-        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into()));
-    let source_schema = Arc::new(Schema::new(vec![
-        Field::new("ticker", DataType::Utf8, false),
-        Field::new("exchange", DataType::Utf8, false),
-        Field::new("session_end_date", DataType::Utf8, false),
-        Field::new("ws", ws_source_type.clone(), false),
-        Field::new("open", DataType::Float64, true),
-        Field::new("high", DataType::Float64, true),
-        Field::new("low", DataType::Float64, true),
-        Field::new("close", DataType::Float64, true),
-    ]));
-
-    let desc = SortOptions {
-        descending: true,
-        nulls_first: true,
-    };
-
-    // Both branches sorted by [ws DESC].
-    // In the real case, ordering may have a leading constant prefix like
-    // [extract_year_month(ws) DESC, ws DESC] that gets stripped by
-    // add_constants, leaving [ws DESC].
+    // Reproduces the exact real plan structure:
     //
-    // The key bug: ProjectionExec maps ws → original_time (not in group-by)
-    // and computes date_bin(CAST(ws)) → bucket_start (in group-by).
-    // When the input ordering chain breaks (e.g. leading term can't be
-    // projected), AggregateExec's output_ordering() may return None even
-    // though find_longest_permutation detects PartiallySorted via bottom-up
-    // get_expr_properties. Fix 1 bridges this gap.
-    let ws_col = Arc::new(Column::new("ws", 3)) as Arc<dyn PhysicalExpr>;
-    let sort_key: LexOrdering = [PhysicalSortExpr::new(Arc::clone(&ws_col), desc)].into();
-    let branch1 =
-        parquet_exec_with_sort(Arc::clone(&source_schema), vec![sort_key.clone()]);
-    let branch2 = parquet_exec_with_sort(Arc::clone(&source_schema), vec![sort_key]);
+    // AggregateExec(Final) [requires SinglePartition]
+    //   AggregateExec(Partial, PartiallySorted([0,3]))
+    //     ProjectionExec [ticker, exchange, ws→original_time, date_bin(CAST(ws))→bucket_start, ...]
+    //       UnionExec (2 partitions)
+    //         Branch 1: ProjectionExec [..., ws@2→ws]
+    //           DataSourceExec [ws@2 DESC], ticker=const
+    //         Branch 2: ProjectionExec [..., CAST(ws@3 AS Millis)→ws]
+    //           ProjectionExec [passthrough, drop year_month]
+    //             DataSourceExec [eym@3 DESC, ws@3 DESC], eym=const, ticker=const
 
-    // UnionExec: 2 partitions.
-    // calculate_union of [ws DESC] and [] = [] (no common ordering)
-    let union = union_exec(vec![
-        branch1 as Arc<dyn ExecutionPlan>,
-        branch2 as Arc<dyn ExecutionPlan>,
-    ]);
+    let ws_millis =
+        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, Some("UTC".into()));
+    let ws_nanos =
+        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into()));
+    let desc = SortOptions { descending: true, nulls_first: true };
 
-    // ProjectionExec: computes date_bin and renames ws → original_time
-    // Real plan: date_bin(interval, CAST(ws AS Timestamp(Nanosecond, Some("UTC"))), origin)
-    let ticker_src = Arc::new(Column::new("ticker", 0)) as Arc<dyn PhysicalExpr>;
-    let exchange_src = Arc::new(Column::new("exchange", 1)) as Arc<dyn PhysicalExpr>;
-    let session_end_src =
-        Arc::new(Column::new("session_end_date", 2)) as Arc<dyn PhysicalExpr>;
+    // ── Branch 1 (live): schema similar to StorageExec ──
+    // StorageExec output: [ticker, exchange, ws(Millis), open..close, volume..transactions, session_end_date]
+    let branch1_schema = Arc::new(Schema::new(vec![
+        Field::new("ticker", DataType::Utf8, false),          // 0
+        Field::new("exchange", DataType::Utf8, false),         // 1
+        Field::new("ws", ws_millis.clone(), false),            // 2
+        Field::new("open", DataType::Float64, true),           // 3
+        Field::new("high", DataType::Float64, true),           // 4
+        Field::new("low", DataType::Float64, true),            // 5
+        Field::new("close", DataType::Float64, true),          // 6
+        Field::new("volume", DataType::Float64, true),         // 7
+        Field::new("dollar_volume", DataType::Float64, true),  // 8
+        Field::new("transactions", DataType::Int64, true),     // 9
+        Field::new("session_end_date", DataType::Utf8, false), // 10
+    ]));
+    let branch1_sort: LexOrdering =
+        [PhysicalSortExpr::new(Arc::new(Column::new("ws", 2)) as _, desc)].into();
+    let branch1_source = parquet_exec_with_sort(Arc::clone(&branch1_schema), vec![branch1_sort]);
+    // Filter ticker = 'ESU4' to make ticker constant (Uniform within this branch)
+    let branch1_filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("ticker", 0)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Utf8(Some("ESU4".to_string())))),
+        )),
+        branch1_source,
+    )?);
+    // ProjectionExec: reorder to union schema [ticker, exchange, session_end_date, ws, open..transactions]
+    let branch1_proj: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+        vec![
+            col_proj("ticker", 0),
+            col_proj("exchange", 1),
+            col_proj_alias("session_end_date", 10, "session_end_date"),
+            col_proj("ws", 2),
+            col_proj("open", 3),
+            col_proj("high", 4),
+            col_proj("low", 5),
+            col_proj("close", 6),
+            col_proj("volume", 7),
+            col_proj("dollar_volume", 8),
+            col_proj("transactions", 9),
+        ],
+        branch1_filtered,
+    )?);
+
+    // ── Branch 2 (historical): schema similar to FileScanExec ──
+    // FileScanExec output: [ticker, exchange, trade_date, ws(Nanos), open..transactions, year_month]
+    let branch2_schema = Arc::new(Schema::new(vec![
+        Field::new("ticker", DataType::Utf8, false),          // 0
+        Field::new("exchange", DataType::Utf8, false),         // 1
+        Field::new("trade_date", DataType::Utf8, false),       // 2
+        Field::new("ws", ws_nanos.clone(), false),             // 3
+        Field::new("open", DataType::Float64, true),           // 4
+        Field::new("high", DataType::Float64, true),           // 5
+        Field::new("low", DataType::Float64, true),            // 6
+        Field::new("close", DataType::Float64, true),          // 7
+        Field::new("volume", DataType::Int64, true),           // 8
+        Field::new("dollar_volume", DataType::Float64, true),  // 9
+        Field::new("transactions", DataType::Int64, true),     // 10
+        Field::new("year_month", DataType::Utf8, false),       // 11
+    ]));
+    // FileScanExec ordering: [extract_year_month(ws@3) DESC, ws@3 DESC]
+    let eym_col = Arc::new(Column::new("year_month", 11)) as Arc<dyn PhysicalExpr>;
+    let ws3_col = Arc::new(Column::new("ws", 3)) as Arc<dyn PhysicalExpr>;
+    let branch2_sort: LexOrdering = [
+        PhysicalSortExpr::new(Arc::clone(&eym_col), desc),
+        PhysicalSortExpr::new(Arc::clone(&ws3_col), desc),
+    ].into();
+    let branch2_source = parquet_exec_with_sort(Arc::clone(&branch2_schema), vec![branch2_sort]);
+    // Filter ticker = 'NQU4' (different from branch1!) AND year_month = '2025-01'
+    // This makes ticker Heterogeneous after UnionExec (constant per branch, different values)
+    // which models the real case where each partition has a different ticker value.
+    let branch2_filtered: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+        Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("ticker", 0)),
+                Operator::Eq,
+                Arc::new(Literal::new(ScalarValue::Utf8(Some("NQU4".to_string())))),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("year_month", 11)),
+                Operator::Eq,
+                Arc::new(Literal::new(ScalarValue::Utf8(Some("2025-01".to_string())))),
+            )),
+        )),
+        branch2_source,
+    )?);
+    // Inner ProjectionExec: passthrough, drop year_month (like real plan)
+    let branch2_inner_proj: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+        vec![
+            col_proj("ticker", 0),
+            col_proj("exchange", 1),
+            col_proj("trade_date", 2),
+            col_proj("ws", 3),
+            col_proj("open", 4),
+            col_proj("high", 5),
+            col_proj("low", 6),
+            col_proj("close", 7),
+            col_proj("volume", 8),
+            col_proj("dollar_volume", 9),
+            col_proj("transactions", 10),
+        ],
+        branch2_filtered,
+    )?);
+    // Outer ProjectionExec: CAST(ws@3 AS Millis), trade_date→session_end_date, CAST(volume AS Float64)
+    let branch2_outer_proj: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+        vec![
+            col_proj("ticker", 0),
+            col_proj("exchange", 1),
+            col_proj_alias("trade_date", 2, "session_end_date"),
+            (Arc::new(CastExpr::new(
+                Arc::new(Column::new("ws", 3)),
+                ws_millis.clone(),
+                None,
+            )) as Arc<dyn PhysicalExpr>, "ws".to_string()),
+            col_proj("open", 4),
+            col_proj("high", 5),
+            col_proj("low", 6),
+            col_proj("close", 7),
+            (Arc::new(CastExpr::new(
+                Arc::new(Column::new("volume", 8)),
+                DataType::Float64,
+                None,
+            )) as Arc<dyn PhysicalExpr>, "volume".to_string()),
+            col_proj("dollar_volume", 9),
+            col_proj("transactions", 10),
+        ],
+        branch2_inner_proj,
+    )?);
+
+    // ── UnionExec ──
+    // Both branches now have schema: [ticker, exchange, session_end_date, ws(Millis), open..transactions]
+    let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![branch1_proj, branch2_outer_proj])?;
+
+    // ── Outer ProjectionExec (above UnionExec) ──
+    // ws@3 → original_time, date_bin(interval, CAST(ws@3 AS Nanos), origin) → bucket_start
     let ws_src = Arc::new(Column::new("ws", 3)) as Arc<dyn PhysicalExpr>;
-
-    // CAST from Millisecond → Nanosecond (like the real plan)
-    let cast_ws = Arc::new(CastExpr::new(
+    let cast_ws_to_nanos = Arc::new(CastExpr::new(
         Arc::clone(&ws_src),
-        ws_target_type.clone(),
+        ws_nanos.clone(),
         None,
     )) as Arc<dyn PhysicalExpr>;
 
@@ -4019,108 +4128,96 @@ fn test_streaming_aggregate_with_date_bin_group_by() -> Result<()> {
     let interval_lit = Arc::new(Literal::new(ScalarValue::IntervalMonthDayNano(Some(
         arrow::datatypes::IntervalMonthDayNanoType::make_value(0, 0, 1_000_000_000),
     )))) as Arc<dyn PhysicalExpr>;
-    // Origin literal (3rd arg, like real date_bin)
     let origin_lit = Arc::new(Literal::new(ScalarValue::TimestampNanosecond(
         Some(1_491_177_600_000_000_000),
         Some("UTC".into()),
     ))) as Arc<dyn PhysicalExpr>;
-
     let date_bin_expr = Arc::new(ScalarFunctionExpr::new(
         "mock_date_bin",
         mock_udf,
-        vec![
-            Arc::clone(&interval_lit),
-            Arc::clone(&cast_ws),
-            Arc::clone(&origin_lit),
-        ],
-        Arc::new(Field::new("bucket_start", ws_target_type.clone(), false)),
+        vec![Arc::clone(&interval_lit), Arc::clone(&cast_ws_to_nanos), Arc::clone(&origin_lit)],
+        Arc::new(Field::new("bucket_start", ws_nanos.clone(), false)),
         Arc::new(ConfigOptions::new()),
     )) as Arc<dyn PhysicalExpr>;
 
-    let open_src = Arc::new(Column::new("open", 4)) as Arc<dyn PhysicalExpr>;
-    let high_src = Arc::new(Column::new("high", 5)) as Arc<dyn PhysicalExpr>;
-    let low_src = Arc::new(Column::new("low", 6)) as Arc<dyn PhysicalExpr>;
-    let close_src = Arc::new(Column::new("close", 7)) as Arc<dyn PhysicalExpr>;
+    let outer_proj: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+        vec![
+            col_proj("ticker", 0),
+            col_proj("exchange", 1),
+            (Arc::clone(&ws_src) as Arc<dyn PhysicalExpr>, "original_time".to_string()),
+            (date_bin_expr as Arc<dyn PhysicalExpr>, "bucket_start".to_string()),
+            col_proj("session_end_date", 2),
+            col_proj("open", 4),
+            col_proj("high", 5),
+            col_proj("low", 6),
+            col_proj("close", 7),
+            col_proj("volume", 8),
+            col_proj("dollar_volume", 9),
+            col_proj("transactions", 10),
+        ],
+        union,
+    )?);
+    let proj_schema = outer_proj.schema();
 
-    let proj_exprs: Vec<ProjectionExpr> = vec![
-        (Arc::clone(&ticker_src), "ticker".to_string()).into(),
-        (Arc::clone(&exchange_src), "exchange".to_string()).into(),
-        (Arc::clone(&ws_src), "original_time".to_string()).into(),
-        (
-            date_bin_expr as Arc<dyn PhysicalExpr>,
-            "bucket_start".to_string(),
-        )
-            .into(),
-        (Arc::clone(&session_end_src), "session_end_date".to_string()).into(),
-        (Arc::clone(&open_src), "open".to_string()).into(),
-        (Arc::clone(&high_src), "high".to_string()).into(),
-        (Arc::clone(&low_src), "low".to_string()).into(),
-        (Arc::clone(&close_src), "close".to_string()).into(),
-    ];
-    let projection = Arc::new(ProjectionExec::try_new(proj_exprs, union)?);
-    let proj_schema = projection.schema();
+    // Debug: print ordering chain
+    eprintln!("DEBUG: outer_proj output_ordering = {:?}", outer_proj.properties().output_ordering());
+    eprintln!("DEBUG: outer_proj oeq_class = {:?}", outer_proj.equivalence_properties().oeq_class());
+    eprintln!("DEBUG: outer_proj constants = {:?}", outer_proj.equivalence_properties().constants());
+    let union_node = &outer_proj.children()[0];
+    eprintln!("DEBUG: union output_ordering = {:?}", union_node.properties().output_ordering());
+    eprintln!("DEBUG: union constants = {:?}", union_node.equivalence_properties().constants());
+    for (i, child) in union_node.children().iter().enumerate() {
+        eprintln!("DEBUG: union child {} output_ordering = {:?}", i, child.properties().output_ordering());
+        eprintln!("DEBUG: union child {} constants = {:?}", i, child.equivalence_properties().constants());
+    }
 
-    // Partial AggregateExec: group-by uses Column references (not date_bin expr)
-    // Group-by: [ticker@0, exchange@1, session_end_date@4, bucket_start@3]
+    // ── Partial AggregateExec ──
     let group_by = PhysicalGroupBy::new_single(vec![
         (col("ticker", &proj_schema)?, "ticker".to_string()),
         (col("exchange", &proj_schema)?, "exchange".to_string()),
-        (
-            col("session_end_date", &proj_schema)?,
-            "session_end_date".to_string(),
-        ),
-        (
-            col("bucket_start", &proj_schema)?,
-            "bucket_start".to_string(),
-        ),
+        (col("session_end_date", &proj_schema)?, "session_end_date".to_string()),
+        (col("bucket_start", &proj_schema)?, "bucket_start".to_string()),
     ]);
-
     let agg_schema = Arc::new(Schema::new(vec![
         Field::new("ticker", DataType::Utf8, false),
         Field::new("exchange", DataType::Utf8, false),
         Field::new("session_end_date", DataType::Utf8, false),
-        Field::new("bucket_start", ws_target_type, false),
+        Field::new("bucket_start", ws_nanos.clone(), false),
     ]));
-
     let partial = Arc::new(AggregateExec::try_new(
         AggregateMode::Partial,
         group_by,
         vec![],
         vec![],
-        projection as Arc<dyn ExecutionPlan>,
+        outer_proj,
         Arc::clone(&agg_schema),
     )?);
 
+    eprintln!("DEBUG: Partial input_order_mode = {:?}", partial.input_order_mode());
+    eprintln!("DEBUG: Partial output_ordering = {:?}", partial.properties().output_ordering());
+    eprintln!("DEBUG: Partial oeq_class = {:?}", partial.properties().equivalence_properties().oeq_class());
+
     // Verify Partial detects PartiallySorted mode
     assert!(
-        matches!(
-            partial.input_order_mode(),
-            InputOrderMode::PartiallySorted(_)
-        ),
+        matches!(partial.input_order_mode(), InputOrderMode::PartiallySorted(_)),
         "Expected PartiallySorted, got {:?}",
         partial.input_order_mode()
     );
 
     // Key assertion: output_ordering should NOT be None
-    let partial_ordering = partial.properties().output_ordering();
     assert!(
-        partial_ordering.is_some(),
+        partial.properties().output_ordering().is_some(),
         "Partial AggregateExec should have non-None output_ordering when \
-         input_order_mode is PartiallySorted."
+         input_order_mode is PartiallySorted. Got oeq_class={:?}",
+        partial.properties().equivalence_properties().oeq_class()
     );
 
-    // Final aggregate on top
+    // ── Final AggregateExec ──
     let final_group_by = PhysicalGroupBy::new_single(vec![
         (col("ticker", &partial.schema())?, "ticker".to_string()),
         (col("exchange", &partial.schema())?, "exchange".to_string()),
-        (
-            col("session_end_date", &partial.schema())?,
-            "session_end_date".to_string(),
-        ),
-        (
-            col("bucket_start", &partial.schema())?,
-            "bucket_start".to_string(),
-        ),
+        (col("session_end_date", &partial.schema())?, "session_end_date".to_string()),
+        (col("bucket_start", &partial.schema())?, "bucket_start".to_string()),
     ]);
     let plan: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
         AggregateMode::Final,
@@ -4134,6 +4231,7 @@ fn test_streaming_aggregate_with_date_bin_group_by() -> Result<()> {
     // Run EnforceDistribution (prefer_existing_sort=true to match real config)
     let optimized = ensure_distribution_helper(plan, 10, true)?;
     let plan_str = displayable(optimized.as_ref()).indent(true).to_string();
+    eprintln!("DEBUG: Optimized plan:\n{plan_str}");
 
     // SortPreservingMergeExec should be present — NOT CoalescePartitionsExec
     assert!(

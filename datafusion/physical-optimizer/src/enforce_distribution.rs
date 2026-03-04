@@ -1372,8 +1372,8 @@ pub fn ensure_distribution(
 
                 let streaming_benefit = child.data
                     && preserving_order_enables_streaming(&plan, &child.plan);
-                if (!ordering_satisfied
-                    || (!order_preserving_variants_desirable && !streaming_benefit))
+                if (!ordering_satisfied || !order_preserving_variants_desirable)
+                    && !streaming_benefit
                     && child.data
                 {
                     let (replaced_child, fetch)  = replace_order_preserving_variants(child, ordering_satisfied)?;
