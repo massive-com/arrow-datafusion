@@ -954,8 +954,14 @@ fn preserving_order_enables_streaming(
     parent: &Arc<dyn ExecutionPlan>,
     ordered_child: &Arc<dyn ExecutionPlan>,
 ) -> bool {
-    // Only applicable to single-child operators
+    // Only applicable to single-child operators that maintain input order
+    // (e.g. AggregateExec in PartiallySorted mode). Operators that don't
+    // maintain input order (e.g. SortExec) handle ordering themselves —
+    // preserving SPM for them is unnecessary.
     if parent.children().len() != 1 {
+        return false;
+    }
+    if !parent.maintains_input_order()[0] {
         return false;
     }
     // Build parent with the ordered child
