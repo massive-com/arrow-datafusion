@@ -980,33 +980,4 @@ mod tests {
 
         Ok(())
     }
-
-    /// Verifies that calculate_union reconciles [b ASC] (no constants) with
-    /// [c ASC, b ASC] (c constant) into [b ASC]. This models the real case
-    /// where Branch 1 (live) has [window_start DESC] and Branch 2 (historical)
-    /// has [extract_year_month(ws) DESC, ws DESC] with extract_year_month
-    /// constant via equal_conditions.
-    #[test]
-    fn test_union_constant_prefix_stripped_ordering() -> Result<()> {
-        let schema = create_test_schema().unwrap();
-        UnionEquivalenceTest::new(&schema)
-            .with_child_sort_and_const_exprs(
-                // Branch 1: [b ASC], no constants
-                vec![vec!["b"]],
-                vec![],
-                &schema,
-            )?
-            .with_child_sort_and_const_exprs(
-                // Branch 2: [c ASC, b ASC], const [c]
-                vec![vec!["c", "b"]],
-                vec!["c"],
-                &schema,
-            )?
-            .with_expected_sort_and_const_exprs(
-                // Union: [b ASC], no constants
-                vec![vec!["b"]],
-                vec![],
-            )?
-            .run()
-    }
 }

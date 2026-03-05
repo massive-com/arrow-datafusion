@@ -46,7 +46,6 @@ use arrow_schema::FieldRef;
 use datafusion_common::stats::Precision;
 use datafusion_common::{internal_err, not_impl_err, Constraint, Constraints, Result};
 use datafusion_execution::TaskContext;
-use datafusion_expr::sort_properties::SortProperties;
 use datafusion_expr::{Accumulator, Aggregate};
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
@@ -56,8 +55,7 @@ use datafusion_physical_expr::{
 };
 use datafusion_physical_expr_common::physical_expr::{fmt_sql, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::{
-    LexOrdering, LexRequirement, OrderingRequirements, PhysicalSortExpr,
-    PhysicalSortRequirement,
+    LexOrdering, LexRequirement, OrderingRequirements, PhysicalSortRequirement,
 };
 
 use datafusion_expr::utils::AggregateOrderSensitivity;
@@ -723,83 +721,6 @@ impl AggregateExec {
         constraints.push(new_constraint);
         eq_properties =
             eq_properties.with_constraints(Constraints::new_unverified(constraints));
-
-        // When the aggregate operates in sorted/partially-sorted mode, its
-        // output is ordered by the sorted group-by columns. The project()
-        // path may fail to capture this (e.g. when construct_dependency_map
-        // can't project the leading ordering term through the group-by
-        // mapping). Re-derive the output ordering from input_order_mode
-        // using get_expr_properties, which evaluates expression monotonicity
-        // bottom-up — the same mechanism that determined input_order_mode
-        // via find_longest_permutation.
-        if !matches!(input_order_mode, InputOrderMode::Linear) {
-            let has_ordering = eq_properties.output_ordering().is_some();
-            eprintln!(
-                "DEBUG compute_properties: input_order_mode={:?}, output_ordering_exists={}, mode={:?}",
-                input_order_mode, has_ordering, mode
-            );
-            if let Some(ord) = eq_properties.output_ordering() {
-                eprintln!("DEBUG compute_properties: existing output_ordering={:?}", ord);
-            }
-            let input_eq = input.equivalence_properties();
-            eprintln!(
-                "DEBUG compute_properties: input oeq_class={:?}",
-                input_eq.oeq_class()
-            );
-            eprintln!(
-                "DEBUG compute_properties: input constants={:?}",
-                input_eq.constants()
-            );
-
-            if !has_ordering {
-                let sorted_indices = match input_order_mode {
-                    InputOrderMode::Sorted => {
-                        (0..group_expr_mapping.len()).collect::<Vec<_>>()
-                    }
-                    InputOrderMode::PartiallySorted(indices) => indices.clone(),
-                    InputOrderMode::Linear => unreachable!(),
-                };
-
-                let source_exprs: Vec<_> = group_expr_mapping
-                    .iter()
-                    .map(|(source, _)| Arc::clone(source))
-                    .collect();
-                let output_schema = eq_properties.schema();
-
-                let sorted_ordering: Vec<PhysicalSortExpr> = sorted_indices
-                    .iter()
-                    .filter_map(|&idx| {
-                        let props =
-                            input_eq.get_expr_properties(Arc::clone(&source_exprs[idx]));
-                        eprintln!(
-                            "DEBUG compute_properties: idx={}, expr={:?}, sort_properties={:?}",
-                            idx, source_exprs[idx], props.sort_properties
-                        );
-                        match props.sort_properties {
-                            SortProperties::Ordered(options) => {
-                                let output_col = Arc::new(Column::new(
-                                    output_schema.field(idx).name(),
-                                    idx,
-                                ));
-                                Some(PhysicalSortExpr::new(output_col as _, options))
-                            }
-                            _ => None,
-                        }
-                    })
-                    .collect();
-
-                eprintln!(
-                    "DEBUG compute_properties: sorted_ordering={:?}",
-                    sorted_ordering
-                );
-
-                if !sorted_ordering.is_empty() {
-                    if let Some(ordering) = LexOrdering::new(sorted_ordering) {
-                        eq_properties.add_orderings([ordering]);
-                    }
-                }
-            }
-        }
 
         // Get output partitioning:
         let input_partitioning = input.output_partitioning().clone();
