@@ -942,6 +942,47 @@ fn add_hash_on_top(
 ///
 /// * `input`: Current node.
 ///
+/// Checks whether preserving the child's ordering enables the parent to
+/// run in streaming mode. Compares the parent's pipeline behavior with
+/// the ordered child vs. an unordered (coalesced) child. If removing the
+/// ordering would cause the parent to switch from streaming to blocking,
+/// keeping the order-preserving variant is beneficial.
+///
+/// Only applicable to single-child operators; returns false for multi-child
+/// operators (e.g. joins) where child substitution semantics are ambiguous.
+fn preserving_order_enables_streaming(
+    parent: &Arc<dyn ExecutionPlan>,
+    ordered_child: &Arc<dyn ExecutionPlan>,
+) -> bool {
+    // Only applicable to single-child operators that maintain input order
+    // (e.g. AggregateExec in PartiallySorted mode). Operators that don't
+    // maintain input order (e.g. SortExec) handle ordering themselves —
+    // preserving SPM for them is unnecessary.
+    if parent.children().len() != 1 {
+        return false;
+    }
+    if !parent.maintains_input_order()[0] {
+        return false;
+    }
+    // Build parent with the ordered child
+    let with_ordered =
+        match Arc::clone(parent).with_new_children(vec![Arc::clone(ordered_child)]) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+    if with_ordered.pipeline_behavior() == EmissionType::Final {
+        // Parent is blocking even with ordering — no benefit
+        return false;
+    }
+    // Build parent with an unordered child (simulating CoalescePartitionsExec)
+    let unordered_child: Arc<dyn ExecutionPlan> =
+        Arc::new(CoalescePartitionsExec::new(Arc::clone(ordered_child)));
+    match Arc::clone(parent).with_new_children(vec![unordered_child]) {
+        Ok(without_ordered) => without_ordered.pipeline_behavior() == EmissionType::Final,
+        Err(_) => false,
+    }
+}
+
 /// # Returns
 ///
 /// Updated node with an execution plan, where desired single
@@ -1333,7 +1374,10 @@ pub fn ensure_distribution(
                     .equivalence_properties()
                     .ordering_satisfy_requirement(sort_req.clone())?;
 
+                let streaming_benefit = child.data
+                    && preserving_order_enables_streaming(&plan, &child.plan);
                 if (!ordering_satisfied || !order_preserving_variants_desirable)
+                    && !streaming_benefit
                     && child.data
                 {
                     let (replaced_child, fetch)  = replace_order_preserving_variants(child, ordering_satisfied)?;
@@ -1356,8 +1400,15 @@ pub fn ensure_distribution(
                 match requirement {
                     // Operator requires specific distribution.
                     Distribution::SinglePartition | Distribution::HashPartitioned(_) => {
-                        // Since there is no ordering requirement, preserving ordering is pointless
-                        child = replace_order_preserving_variants(child, false)?.0;
+                        let streaming_benefit = child.data
+                            && preserving_order_enables_streaming(
+                                &plan,
+                                &child.plan,
+                            );
+                        if !streaming_benefit {
+                            child =
+                                replace_order_preserving_variants(child, false)?.0;
+                        }
                     }
                     Distribution::UnspecifiedDistribution => {
                         // Since ordering is lost, trying to preserve ordering is pointless
