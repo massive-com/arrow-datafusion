@@ -1448,7 +1448,7 @@ fn infer_predicates_from_equalities(predicates: Vec<Expr>) -> Result<Vec<Expr>> 
             } else if let Expr::Column(col) = right.as_ref() {
                 // Only add to map if left side is a literal
                 if matches!(left.as_ref(), Expr::Literal(_, _)) {
-                    equality_map.insert(col.clone(), *right.clone());
+                    equality_map.insert(col.clone(), *left.clone());
                     final_predicates.push(predicate.clone());
                 }
             }
@@ -4286,6 +4286,36 @@ mod tests {
         Filter: Boolean(false)
           TestUserNode
         "
+        )
+    }
+
+    #[test]
+    fn infer_predicate_from_literal_eq_column() -> Result<()> {
+        // Test that `3 = col_b` (literal on left) correctly maps col_b → 3
+        let table_scan = test_table_scan()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .filter(lit(1i64).eq(col("a")))?
+            .filter(col("b").gt(col("a")))?
+            .build()?;
+        // The two filters merge and infer_predicates_from_equalities should
+        // substitute col("a") with lit(1) in `b > a`, producing `b > 1`.
+        assert_optimized_plan_equal!(
+            plan,
+            @"TableScan: test, full_filters=[Int64(1) = test.a, test.b > Int64(1)]"
+        )
+    }
+
+    #[test]
+    fn infer_predicate_from_column_eq_literal() -> Result<()> {
+        // Test that `col_a = 3` (column on left) correctly maps col_a → 3
+        let table_scan = test_table_scan()?;
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .filter(col("a").eq(lit(1i64)))?
+            .filter(col("b").gt(col("a")))?
+            .build()?;
+        assert_optimized_plan_equal!(
+            plan,
+            @"TableScan: test, full_filters=[test.a = Int64(1), test.b > Int64(1)]"
         )
     }
 }
