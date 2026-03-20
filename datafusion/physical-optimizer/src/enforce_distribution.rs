@@ -1405,7 +1405,7 @@ pub fn ensure_distribution(
                                 &plan,
                                 &child.plan,
                             );
-                        if !streaming_benefit {
+                        if !streaming_benefit && !maintains {
                             child =
                                 replace_order_preserving_variants(child, false)?.0;
                         }
