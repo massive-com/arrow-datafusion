@@ -1455,10 +1455,14 @@ pub fn ensure_distribution(
                 match requirement {
                     // Operator requires specific distribution.
                     Distribution::SinglePartition | Distribution::HashPartitioned(_) => {
-                        let streaming_benefit =
-                            child.data && preserving_order_enables_streaming(&plan, &child.plan);
-                        if !streaming_benefit {
-                            child = replace_order_preserving_variants(child, false)?.0;
+                        let streaming_benefit = child.data
+                            && preserving_order_enables_streaming(
+                                &plan,
+                                &child.plan,
+                            );
+                        if !streaming_benefit && !maintains {
+                            child =
+                                replace_order_preserving_variants(child, false)?.0;
                         }
                     }
                     Distribution::UnspecifiedDistribution => {
