@@ -26,7 +26,9 @@ use crate::PhysicalExpr;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::stats::{ColumnStatistics, Precision};
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{ScalarValue, internal_datafusion_err, internal_err, plan_err, Result};
+use datafusion_common::{
+    internal_datafusion_err, internal_err, plan_err, Result, ScalarValue,
+};
 
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use indexmap::IndexMap;
@@ -666,23 +668,17 @@ impl ProjectionMapping {
                 if let Some(field_mapping) =
                     func_expr.fun().struct_field_mapping(&literal_args)
                 {
-                    if let DataType::Struct(struct_fields) =
-                        func_expr.return_type()
-                    {
-                        for (accessor_args, source_arg_idx) in &field_mapping.fields
-                        {
-                            let value_expr =
-                                func_expr.args()[*source_arg_idx].clone();
+                    if let DataType::Struct(struct_fields) = func_expr.return_type() {
+                        for (accessor_args, source_arg_idx) in &field_mapping.fields {
+                            let value_expr = func_expr.args()[*source_arg_idx].clone();
 
                             // Build accessor args: [target_col, ...field_name_literals]
                             let mut accessor_fn_args: Vec<Arc<dyn PhysicalExpr>> =
                                 vec![Arc::clone(&target_expr)];
-                            accessor_fn_args.extend(accessor_args.iter().map(
-                                |sv| {
-                                    Arc::new(Literal::new(sv.clone()))
-                                        as Arc<dyn PhysicalExpr>
-                                },
-                            ));
+                            accessor_fn_args.extend(accessor_args.iter().map(|sv| {
+                                Arc::new(Literal::new(sv.clone()))
+                                    as Arc<dyn PhysicalExpr>
+                            }));
 
                             // Look up the field's return type from the struct schema
                             let return_field = accessor_args
@@ -696,15 +692,14 @@ impl ProjectionMapping {
                                 });
 
                             if let Some(return_field) = return_field {
-                                let field_access_expr =
-                                    Arc::new(ScalarFunctionExpr::new(
-                                        field_mapping.field_accessor.name(),
-                                        Arc::clone(&field_mapping.field_accessor),
-                                        accessor_fn_args,
-                                        return_field,
-                                        Arc::new(func_expr.config_options().clone()),
-                                    ))
-                                        as Arc<dyn PhysicalExpr>;
+                                let field_access_expr = Arc::new(ScalarFunctionExpr::new(
+                                    field_mapping.field_accessor.name(),
+                                    Arc::clone(&field_mapping.field_accessor),
+                                    accessor_fn_args,
+                                    return_field,
+                                    Arc::new(func_expr.config_options().clone()),
+                                ))
+                                    as Arc<dyn PhysicalExpr>;
 
                                 map.entry(value_expr)
                                     .or_default()

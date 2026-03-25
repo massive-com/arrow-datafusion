@@ -1578,12 +1578,10 @@ mod tests {
 
         // Projection: named_struct(...) AS s
         let proj_exprs = vec![(named_struct_expr, "s".to_string())];
-        let projection_mapping =
-            ProjectionMapping::try_new(proj_exprs, &input_schema)?;
+        let projection_mapping = ProjectionMapping::try_new(proj_exprs, &input_schema)?;
 
         // Input is ordered by [a ASC]
-        let mut input_properties =
-            EquivalenceProperties::new(Arc::clone(&input_schema));
+        let mut input_properties = EquivalenceProperties::new(Arc::clone(&input_schema));
         let sort_a = PhysicalSortExpr::new(
             Arc::clone(&col_a),
             SortOptions {
@@ -1595,8 +1593,7 @@ mod tests {
 
         // Project through the named_struct
         let out_schema = output_schema(&projection_mapping, &input_schema)?;
-        let out_properties =
-            input_properties.project(&projection_mapping, out_schema);
+        let out_properties = input_properties.project(&projection_mapping, out_schema);
 
         // Build the sort expression: get_field(col("s"), "a")
         // This is what the framework would generate for ORDER BY s.a
