@@ -118,7 +118,9 @@ pub use udaf::{
     udaf_default_window_function_schema_name, AggregateUDF, AggregateUDFImpl,
     ReversedUDAF, SetMonotonicity, StatisticsArgs,
 };
-pub use udf::{ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl};
+pub use udf::{
+    ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, StructFieldMapping,
+};
 pub use udwf::{LimitEffect, ReversedUDWF, WindowUDF, WindowUDFImpl};
 pub use window_frame::{WindowFrame, WindowFrameBound, WindowFrameUnits};
 
