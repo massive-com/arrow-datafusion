@@ -18,14 +18,15 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use crate::expressions::Column;
+use crate::expressions::{Column, Literal};
+use crate::scalar_function::ScalarFunctionExpr;
 use crate::utils::collect_columns;
 use crate::PhysicalExpr;
 
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::stats::{ColumnStatistics, Precision};
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{internal_datafusion_err, internal_err, plan_err, Result};
+use datafusion_common::{ScalarValue, internal_datafusion_err, internal_err, plan_err, Result};
 
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use indexmap::IndexMap;
@@ -638,9 +639,81 @@ impl ProjectionMapping {
                 None => Ok(Transformed::no(e)),
             })
             .data()?;
-            map.entry(source_expr)
+            map.entry(source_expr.clone())
                 .or_default()
-                .push((target_expr, expr_idx));
+                .push((Arc::clone(&target_expr), expr_idx));
+
+            // For struct-producing functions (e.g. named_struct), decompose
+            // into field-level mapping entries so that orderings propagate
+            // through struct projections. For example, if the projection has
+            // `named_struct('ticker', p.ticker, ...) AS details`, this adds:
+            //   p.ticker → get_field(col("details"), "ticker")
+            // enabling the optimizer to know that sorting by
+            // `details.ticker` is equivalent to sorting by `p.ticker`.
+            if let Some(func_expr) =
+                source_expr.as_any().downcast_ref::<ScalarFunctionExpr>()
+            {
+                let literal_args: Vec<Option<ScalarValue>> = func_expr
+                    .args()
+                    .iter()
+                    .map(|arg| {
+                        arg.as_any()
+                            .downcast_ref::<Literal>()
+                            .map(|l| l.value().clone())
+                    })
+                    .collect();
+
+                if let Some(field_mapping) =
+                    func_expr.fun().struct_field_mapping(&literal_args)
+                {
+                    if let DataType::Struct(struct_fields) =
+                        func_expr.return_type()
+                    {
+                        for (accessor_args, source_arg_idx) in &field_mapping.fields
+                        {
+                            let value_expr =
+                                func_expr.args()[*source_arg_idx].clone();
+
+                            // Build accessor args: [target_col, ...field_name_literals]
+                            let mut accessor_fn_args: Vec<Arc<dyn PhysicalExpr>> =
+                                vec![Arc::clone(&target_expr)];
+                            accessor_fn_args.extend(accessor_args.iter().map(
+                                |sv| {
+                                    Arc::new(Literal::new(sv.clone()))
+                                        as Arc<dyn PhysicalExpr>
+                                },
+                            ));
+
+                            // Look up the field's return type from the struct schema
+                            let return_field = accessor_args
+                                .first()
+                                .and_then(|sv| sv.try_as_str().flatten())
+                                .and_then(|field_name| {
+                                    struct_fields
+                                        .iter()
+                                        .find(|f| f.name() == field_name)
+                                        .cloned()
+                                });
+
+                            if let Some(return_field) = return_field {
+                                let field_access_expr =
+                                    Arc::new(ScalarFunctionExpr::new(
+                                        field_mapping.field_accessor.name(),
+                                        Arc::clone(&field_mapping.field_accessor),
+                                        accessor_fn_args,
+                                        return_field,
+                                        Arc::new(func_expr.config_options().clone()),
+                                    ))
+                                        as Arc<dyn PhysicalExpr>;
+
+                                map.entry(value_expr)
+                                    .or_default()
+                                    .push((field_access_expr, expr_idx));
+                            }
+                        }
+                    }
+                }
+            }
         }
         Ok(Self { map })
     }
@@ -795,8 +868,10 @@ pub(crate) mod tests {
             let data_type = source.data_type(input_schema)?;
             let nullable = source.nullable(input_schema)?;
             for (target, _) in targets.iter() {
+                // Skip non-Column targets (e.g. struct field decomposition
+                // entries which are ScalarFunctionExpr targets).
                 let Some(column) = target.as_any().downcast_ref::<Column>() else {
-                    return plan_err!("Expects to have column");
+                    continue;
                 };
                 fields.push(Field::new(column.name(), data_type.clone(), nullable));
             }
