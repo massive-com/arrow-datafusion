@@ -524,7 +524,7 @@ jobs:
         #  command cannot be run for all the .slt files. Run it for just one that works (limit.slt)
         #  until most of the tickets in https://github.com/apache/datafusion/issues/16248 are addressed
         #  and this command can be run without filters.
-        run: cargo test --test sqllogictests -- --substrait-round-trip limit.slt
+        run: cargo test --test sqllogictests --features substrait -- --substrait-round-trip limit.slt
 
   #  Temporarily commenting out the Windows flow, the reason is enormously slow running build
   #  Waiting for new Windows 2025 github runner
