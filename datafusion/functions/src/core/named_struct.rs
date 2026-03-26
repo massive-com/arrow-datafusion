@@ -185,7 +185,7 @@ impl ScalarUDFImpl for NamedStructFunc {
         &self,
         literal_args: &[Option<ScalarValue>],
     ) -> Option<StructFieldMapping> {
-        if literal_args.is_empty() || literal_args.len() % 2 != 0 {
+        if literal_args.is_empty() || !literal_args.len().is_multiple_of(2) {
             return None;
         }
 

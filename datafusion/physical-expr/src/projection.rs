@@ -641,7 +641,7 @@ impl ProjectionMapping {
                 None => Ok(Transformed::no(e)),
             })
             .data()?;
-            map.entry(source_expr.clone())
+            map.entry(Arc::clone(&source_expr))
                 .or_default()
                 .push((Arc::clone(&target_expr), expr_idx));
 
@@ -670,7 +670,8 @@ impl ProjectionMapping {
                 {
                     if let DataType::Struct(struct_fields) = func_expr.return_type() {
                         for (accessor_args, source_arg_idx) in &field_mapping.fields {
-                            let value_expr = func_expr.args()[*source_arg_idx].clone();
+                            let value_expr =
+                                Arc::clone(&func_expr.args()[*source_arg_idx]);
 
                             // Build accessor args: [target_col, ...field_name_literals]
                             let mut accessor_fn_args: Vec<Arc<dyn PhysicalExpr>> =
