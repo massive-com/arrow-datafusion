@@ -1473,15 +1473,29 @@ impl DefaultPhysicalPlanner {
                     && session_state.config().repartition_joins()
                     && !prefer_hash_join
                 {
-                    // Use SortMergeJoin if hash join is not preferred
-                    let join_on_len = join_on.len();
+                    // Derive sort options from the left input's existing ordering
+                    // rather than hardcoding SortOptions::default()
+                    let sort_options: Vec<SortOptions> = join_on
+                        .iter()
+                        .map(|(left_col, _)| {
+                            physical_left
+                                .output_ordering()
+                                .and_then(|ordering| {
+                                    ordering
+                                        .iter()
+                                        .find(|sort_expr| sort_expr.expr.eq(left_col))
+                                        .map(|sort_expr| sort_expr.options)
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect();
                     Arc::new(SortMergeJoinExec::try_new(
                         physical_left,
                         physical_right,
                         join_on,
                         join_filter,
                         *join_type,
-                        vec![SortOptions::default(); join_on_len],
+                        sort_options,
                         *null_equality,
                     )?)
                 } else if session_state.config().target_partitions() > 1
