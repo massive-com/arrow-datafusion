@@ -4370,4 +4370,191 @@ digraph {
         assert_contains!(&err_str, "field nullability at index");
         assert_contains!(&err_str, "field metadata at index");
     }
+
+    /// Helper: make a session state configured to use SortMergeJoin
+    fn make_smj_session_state() -> SessionState {
+        let runtime = Arc::new(RuntimeEnv::default());
+        let config = SessionConfig::new()
+            .with_target_partitions(4)
+            .set_bool("datafusion.optimizer.prefer_hash_join", false)
+            .set_bool("datafusion.optimizer.skip_failed_rules", false);
+        SessionStateBuilder::new()
+            .with_config(config)
+            .with_runtime_env(runtime)
+            .with_default_features()
+            .build()
+    }
+
+    /// Helper: create a fully-optimized physical plan and return its
+    /// displayable string for snapshot testing
+    async fn plan_smj_display(ctx: &SessionContext, sql: &str) -> Result<String> {
+        let state = ctx.state();
+        let logical_plan = state.create_logical_plan(sql).await?;
+        let logical_plan = state.optimize(&logical_plan)?;
+        let planner = DefaultPhysicalPlanner::default();
+        let plan = planner.create_physical_plan(&logical_plan, &state).await?;
+        Ok(format!("{}", displayable(plan.as_ref()).indent(false)))
+    }
+
+    /// Test: left child sorted DESC on join key -> SMJ derives DESC sort
+    /// options, avoiding a re-sort on the left side
+    #[tokio::test]
+    async fn test_smj_sort_options_derived_from_left_desc() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 2, 1])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )?;
+
+        let left = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])?
+            .with_sort_order(vec![vec![
+                col("a").sort(false, false), // DESC, nulls last
+            ]]);
+        let right = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])?;
+
+        let state = make_smj_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table("left_table", Arc::new(left))?;
+        ctx.register_table("right_table", Arc::new(right))?;
+
+        let plan = plan_smj_display(
+            &ctx,
+            "SELECT * FROM left_table JOIN right_table ON left_table.a = right_table.a",
+        )
+        .await?;
+        insta::assert_snapshot!(plan, @r"
+        SortMergeJoinExec: join_type=Inner, on=[(a@0, a@0)]
+          DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 DESC NULLS LAST
+          SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
+            DataSourceExec: partitions=1, partition_sizes=[1]
+        ");
+        Ok(())
+    }
+
+    /// Test: left child not sorted on join key -> SMJ falls back to default
+    /// ASC behavior
+    #[tokio::test]
+    async fn test_smj_sort_options_default_when_left_unsorted() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )?;
+
+        let left = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])?;
+        let right = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])?;
+
+        let state = make_smj_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table("left_table", Arc::new(left))?;
+        ctx.register_table("right_table", Arc::new(right))?;
+
+        let plan = plan_smj_display(
+            &ctx,
+            "SELECT * FROM left_table JOIN right_table ON left_table.a = right_table.a",
+        )
+        .await?;
+        insta::assert_snapshot!(plan, @r"
+        SortMergeJoinExec: join_type=Inner, on=[(a@0, a@0)]
+          SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
+            DataSourceExec: partitions=1, partition_sizes=[1]
+          SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
+            DataSourceExec: partitions=1, partition_sizes=[1]
+        ");
+        Ok(())
+    }
+
+    /// Test: multi-column join where left child's ordering partially matches
+    #[tokio::test]
+    async fn test_smj_sort_options_partial_match_multi_column() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![30, 20, 10])),
+            ],
+        )?;
+
+        // Left sorted by "a" DESC only; "b" is not in the ordering
+        let left = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])?
+            .with_sort_order(vec![vec![
+                col("a").sort(false, false), // DESC, nulls last
+            ]]);
+        let right = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])?;
+
+        let state = make_smj_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table("left_table", Arc::new(left))?;
+        ctx.register_table("right_table", Arc::new(right))?;
+
+        let plan = plan_smj_display(
+            &ctx,
+            "SELECT * FROM left_table JOIN right_table \
+             ON left_table.a = right_table.a AND left_table.b = right_table.b",
+        )
+        .await?;
+        insta::assert_snapshot!(plan, @r"
+        SortMergeJoinExec: join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
+          SortExec: expr=[a@0 DESC NULLS LAST, b@1 ASC], preserve_partitioning=[false]
+            DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 DESC NULLS LAST
+          SortExec: expr=[a@0 DESC NULLS LAST, b@1 ASC], preserve_partitioning=[false]
+            DataSourceExec: partitions=1, partition_sizes=[1]
+        ");
+        Ok(())
+    }
+
+    /// Test: both sides already sorted DESC on join key -> no SortExec needed
+    #[tokio::test]
+    async fn test_smj_sort_options_both_sides_sorted_desc() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 2, 1])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )?;
+
+        let sort_order = vec![vec![col("a").sort(false, false)]]; // DESC, nulls last
+        let left = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])?
+            .with_sort_order(sort_order.clone());
+        let right = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])?
+            .with_sort_order(sort_order);
+
+        let state = make_smj_session_state();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table("left_table", Arc::new(left))?;
+        ctx.register_table("right_table", Arc::new(right))?;
+
+        let plan = plan_smj_display(
+            &ctx,
+            "SELECT * FROM left_table JOIN right_table ON left_table.a = right_table.a",
+        )
+        .await?;
+        insta::assert_snapshot!(plan, @r"
+        SortMergeJoinExec: join_type=Inner, on=[(a@0, a@0)]
+          DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 DESC NULLS LAST
+          DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 DESC NULLS LAST
+        ");
+        Ok(())
+    }
 }
