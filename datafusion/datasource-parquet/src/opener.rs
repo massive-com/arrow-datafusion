@@ -23,7 +23,7 @@ use crate::{
     ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
     apply_file_schema_type_coercions, coerce_int96_to_resolution, row_filter,
 };
-use arrow::array::{RecordBatch, RecordBatchOptions};
+use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::DataType;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_physical_expr::projection::ProjectionExprs;
@@ -604,19 +604,70 @@ impl FileOpener for ParquetOpener {
                     b = projector.project_batch(&b)?;
                     if replace_schema {
                         // Ensure the output batch has the expected schema.
-                        // This handles things like schema level and field level metadata, which may not be present
-                        // in the physical file schema.
-                        // It is also possible for nullability to differ; some writers create files with
-                        // OPTIONAL fields even when there are no nulls in the data.
-                        // In these cases it may make sense for the logical schema to be `NOT NULL`.
-                        // RecordBatch::try_new_with_options checks that if the schema is NOT NULL
-                        // the array cannot contain nulls, amongst other checks.
-                        let (_stream_schema, arrays, num_rows) = b.into_parts();
+                        //
+                        // In DataFusion 51, SchemaAdapter::map_batch() handled
+                        // schema mismatches by casting each column via
+                        // arrow::compute::cast_with_options(). DF 52 removed
+                        // SchemaAdapter, so we restore that behaviour here.
+                        //
+                        // This handles:
+                        // - Schema/field level metadata differences
+                        // - Nullability mismatches (OPTIONAL vs NOT NULL)
+                        // - Type mismatches from schema evolution (e.g. Utf8 → Date32)
+                        // - List/Struct inner field name/nullability differences
+                        //   (e.g. List(Field("conditions", Int32, false)) vs
+                        //    List(Field("element", Int32, true)))
+                        let (stream_schema, arrays, num_rows) = b.into_parts();
+                        let adapted_arrays: Vec<ArrayRef> = arrays
+                            .iter()
+                            .enumerate()
+                            .map(|(i, array)| {
+                                let target_type = output_schema.field(i).data_type();
+                                if array.data_type() == target_type {
+                                    Ok(Arc::clone(array))
+                                } else {
+                                    // Try cast first (handles value-level conversions
+                                    // like Utf8 → Date32)
+                                    let casted = if arrow::compute::can_cast_types(
+                                        array.data_type(),
+                                        target_type,
+                                    ) {
+                                        arrow::compute::cast(array, target_type)?
+                                    } else {
+                                        Arc::clone(array)
+                                    };
+                                    // If types still differ after cast (e.g. List inner
+                                    // field name/nullability), rebuild with target type
+                                    if casted.data_type() != target_type {
+                                        let data = casted
+                                            .to_data()
+                                            .into_builder()
+                                            .data_type(target_type.clone())
+                                            .build()
+                                            .map_err(|e| {
+                                                DataFusionError::ArrowError(Box::new(e), Some(format!(
+                                                    "Failed to adapt column '{}' from {} to {}",
+                                                    stream_schema.field(i).name(),
+                                                    array.data_type(),
+                                                    target_type,
+                                                )))
+                                            })?;
+                                        Ok(arrow::array::make_array(data))
+                                    } else {
+                                        Ok(casted)
+                                    }
+                                }
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        // Note: nullability handling is left to the caller
+                        // (e.g. atlas's adapt_table_schema_for_parquet which
+                        // forces file columns nullable without touching partition
+                        // columns). We only handle type/field-name adaptation here.
                         let options =
                             RecordBatchOptions::new().with_row_count(Some(num_rows));
                         RecordBatch::try_new_with_options(
                             Arc::clone(&output_schema),
-                            arrays,
+                            adapted_arrays,
                             &options,
                         )
                         .map_err(Into::into)
@@ -1962,5 +2013,188 @@ mod test {
             vec![7, 5, 1],
             "Reverse scan with non-contiguous row groups should correctly map RowSelection"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Schema adaptation tests (DF 51 SchemaAdapter compatibility)
+    // ──────────────────────────────────────────────────────────
+
+    /// Helper: create a parquet file with a given schema and write some data,
+    /// then read it back using a DIFFERENT logical schema to test adaptation.
+    mod schema_adapt {
+        use super::*;
+        use arrow::array::{ArrayRef, Int32Array, ListArray, RecordBatch, StringArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use bytes::Bytes;
+        use datafusion_datasource::TableSchema;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_execution::TaskContext;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+        use datafusion_physical_plan::ExecutionPlan;
+        use object_store::memory::InMemory;
+        use object_store::path::Path;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        /// Write a RecordBatch to an in-memory parquet file.
+        async fn write_parquet(store: &InMemory, path: &str, batch: &RecordBatch) {
+            let mut buf = Vec::new();
+            let mut writer =
+                ArrowWriter::try_new(&mut buf, batch.schema(), None).unwrap();
+            writer.write(batch).unwrap();
+            writer.close().unwrap();
+            store
+                .put(&Path::from(path), Bytes::from(buf).into())
+                .await
+                .unwrap();
+        }
+
+        /// Read a parquet file using a given logical schema (which may differ
+        /// from the file's physical schema).
+        async fn read_with_schema(
+            store: Arc<InMemory>,
+            path: &str,
+            logical_schema: Arc<Schema>,
+        ) -> Vec<RecordBatch> {
+            use datafusion_datasource::PartitionedFile;
+
+            let object_store_url = ObjectStoreUrl::parse("memory://").unwrap();
+            let table_schema = TableSchema::from_file_schema(logical_schema);
+            let source = crate::source::ParquetSource::new(table_schema);
+
+            let meta = store.head(&Path::from(path)).await.unwrap();
+            let file = PartitionedFile::from(meta);
+
+            let config = FileScanConfigBuilder::new(
+                object_store_url.clone(),
+                Arc::new(source) as Arc<dyn datafusion_datasource::file::FileSource>,
+            )
+            .with_file(file)
+            .build();
+
+            let exec =
+                datafusion_datasource::source::DataSourceExec::from_data_source(config);
+
+            let ctx = TaskContext::default();
+            ctx.runtime_env()
+                .register_object_store(object_store_url.as_ref(), store);
+
+            let stream = exec.execute(0, Arc::new(ctx)).unwrap();
+            use futures::TryStreamExt;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+            batches
+        }
+
+        /// Test: file has Utf8 column, logical schema expects Date32.
+        /// DF 51's SchemaAdapter handled this via cast. Our replace_schema
+        /// fix should do the same.
+        #[tokio::test]
+        async fn test_utf8_to_date32_schema_evolution() {
+            let store = Arc::new(InMemory::new());
+
+            // Write file with Utf8 date column
+            let file_schema =
+                Arc::new(Schema::new(vec![Field::new("date", DataType::Utf8, true)]));
+            let batch = RecordBatch::try_new(
+                file_schema.clone(),
+                vec![Arc::new(StringArray::from(vec![
+                    "2026-01-01",
+                    "2026-02-01",
+                ]))],
+            )
+            .unwrap();
+            write_parquet(&store, "test_dates.parquet", &batch).await;
+
+            // Read with Date32 schema
+            let logical_schema = Arc::new(Schema::new(vec![Field::new(
+                "date",
+                DataType::Date32,
+                true,
+            )]));
+            let batches =
+                read_with_schema(store, "test_dates.parquet", logical_schema).await;
+
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].num_rows(), 2);
+            assert_eq!(
+                batches[0].column(0).data_type(),
+                &DataType::Date32,
+                "Utf8 should be cast to Date32"
+            );
+        }
+
+        /// Test: file has List(Field("conditions", Int32, false)), logical
+        /// schema expects List(Field("element", Int32, true)).
+        /// This is the exact quotes_v1 regression scenario.
+        #[tokio::test]
+        async fn test_list_field_name_and_nullability_mismatch() {
+            let store = Arc::new(InMemory::new());
+
+            // Write file with List(Field("conditions", Int32, false))
+            let inner_field = Arc::new(Field::new("conditions", DataType::Int32, false));
+            let file_schema = Arc::new(Schema::new(vec![Field::new(
+                "conditions",
+                DataType::List(inner_field.clone()),
+                true,
+            )]));
+            let values = Int32Array::from(vec![1, 2, 3, 4]);
+            let offsets = OffsetBuffer::from_lengths([2, 2]);
+            let list = ListArray::new(inner_field, offsets, Arc::new(values), None);
+            let batch = RecordBatch::try_new(
+                file_schema.clone(),
+                vec![Arc::new(list) as ArrayRef],
+            )
+            .unwrap();
+            write_parquet(&store, "test_list.parquet", &batch).await;
+
+            // Read with List(Field("element", Int32, true)) — different name + nullable
+            let logical_inner = Arc::new(Field::new("element", DataType::Int32, true));
+            let logical_schema = Arc::new(Schema::new(vec![Field::new(
+                "conditions",
+                DataType::List(logical_inner),
+                true,
+            )]));
+            let batches =
+                read_with_schema(store, "test_list.parquet", logical_schema.clone())
+                    .await;
+
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].num_rows(), 2);
+            assert_eq!(
+                batches[0].schema(),
+                logical_schema,
+                "Output schema should match logical schema"
+            );
+        }
+
+        /// Test: file has non-nullable column but data has no nulls.
+        /// Logical schema says nullable. Should not error.
+        #[tokio::test]
+        async fn test_nullability_mismatch_non_null_to_nullable() {
+            let store = Arc::new(InMemory::new());
+
+            let file_schema =
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            let batch = RecordBatch::try_new(
+                file_schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            write_parquet(&store, "test_nullable.parquet", &batch).await;
+
+            // Read with nullable schema
+            let logical_schema =
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+            let batches =
+                read_with_schema(store, "test_nullable.parquet", logical_schema).await;
+
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].num_rows(), 3);
+            assert!(
+                batches[0].schema().field(0).is_nullable(),
+                "Output field should be nullable"
+            );
+        }
     }
 }
