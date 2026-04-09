@@ -29,7 +29,7 @@ use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -122,6 +122,8 @@ pub(super) struct ParquetOpener {
     /// discard partially-matched row groups because they may contain rows that
     /// sort before fully-matched groups.
     pub preserve_order: bool,
+    /// Whether to reverse rows within each batch (for Exact reverse scan)
+    pub reverse_rows: bool,
 }
 
 /// Represents a prepared access plan with optional row selection
@@ -279,6 +281,7 @@ impl FileOpener for ParquetOpener {
         let max_predicate_cache_size = self.max_predicate_cache_size;
 
         let reverse_row_groups = self.reverse_row_groups;
+        let reverse_rows = self.reverse_rows;
         Ok(Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
             let file_decryption_properties = encryption_context
@@ -563,6 +566,18 @@ impl FileOpener for ParquetOpener {
                 prepared_plan = prepared_plan.reverse(file_metadata.as_ref())?;
             }
 
+            // Collect per-RG row counts for exact reverse buffering
+            let rg_row_counts: Vec<usize> = if reverse_rows {
+                let rg_metadata = file_metadata.row_groups();
+                prepared_plan
+                    .row_group_indexes
+                    .iter()
+                    .map(|&idx| rg_metadata[idx].num_rows() as usize)
+                    .collect()
+            } else {
+                vec![]
+            };
+
             // Apply the prepared plan to the builder
             builder = prepared_plan.apply_to_builder(builder);
 
@@ -609,6 +624,9 @@ impl FileOpener for ParquetOpener {
                         &predicate_cache_inner_records,
                         &predicate_cache_records,
                     );
+                    // Note: per-batch row reversal is handled by ReversedRowGroupStream
+                    // (wraps the stream below), NOT here. Reversing per-batch here would
+                    // double-reverse when combined with the RG-level buffer+reverse.
                     b = projector.project_batch(&b)?;
                     if replace_schema {
                         // Ensure the output batch has the expected schema.
@@ -685,6 +703,15 @@ impl FileOpener for ParquetOpener {
                 })
             });
 
+            // When exact reverse is enabled, wrap the stream to buffer
+            // and reverse rows per row group. Memory cost: O(largest_RG).
+            let stream: futures::stream::BoxStream<'static, Result<RecordBatch>> =
+                if reverse_rows {
+                    ReversedRowGroupStream::new(stream, rg_row_counts).boxed()
+                } else {
+                    stream.boxed()
+                };
+
             if let Some(file_pruner) = file_pruner {
                 Ok(EarlyStoppingStream::new(
                     stream,
@@ -696,6 +723,127 @@ impl FileOpener for ParquetOpener {
                 Ok(stream.boxed())
             }
         }))
+    }
+}
+
+/// Buffers batches per row group, then emits them in reversed order with
+/// reversed rows within each batch. Memory: O(largest row group).
+///
+/// The input stream has row groups already in reversed order (via
+/// `PreparedAccessPlan::reverse`). This stream reverses the row order
+/// *within* each row group so the final output is in exact descending order.
+struct ReversedRowGroupStream<S> {
+    inner: S,
+    /// Number of rows in each row group (in read order, already reversed)
+    rg_row_counts: Vec<usize>,
+    /// Index of the current row group being buffered
+    current_rg: usize,
+    /// Rows remaining in the current row group
+    rows_remaining_in_rg: usize,
+    /// Buffered batches for the current row group
+    buffer: Vec<RecordBatch>,
+    /// Reversed batches ready to emit
+    output_buffer: VecDeque<RecordBatch>,
+    /// Whether the inner stream is exhausted
+    done: bool,
+}
+
+impl<S> ReversedRowGroupStream<S> {
+    fn new(inner: S, rg_row_counts: Vec<usize>) -> Self {
+        let rows_remaining = rg_row_counts.first().copied().unwrap_or(0);
+        Self {
+            inner,
+            rg_row_counts,
+            current_rg: 0,
+            rows_remaining_in_rg: rows_remaining,
+            buffer: Vec::new(),
+            output_buffer: VecDeque::new(),
+            done: false,
+        }
+    }
+
+    /// Reverse the buffered batches: reverse batch order, reverse rows
+    /// within each batch, and move them to output_buffer.
+    fn flush_buffer(&mut self) -> Result<()> {
+        let batches = std::mem::take(&mut self.buffer);
+        for batch in batches.into_iter().rev() {
+            if batch.num_rows() <= 1 {
+                self.output_buffer.push_back(batch);
+                continue;
+            }
+            let indices = arrow::array::UInt32Array::from_iter_values(
+                (0..batch.num_rows() as u32).rev(),
+            );
+            let reversed = arrow::compute::take_record_batch(&batch, &indices)?;
+            self.output_buffer.push_back(reversed);
+        }
+        // Advance to next row group
+        self.current_rg += 1;
+        self.rows_remaining_in_rg = self
+            .rg_row_counts
+            .get(self.current_rg)
+            .copied()
+            .unwrap_or(0);
+        Ok(())
+    }
+}
+
+impl<S> Stream for ReversedRowGroupStream<S>
+where
+    S: Stream<Item = Result<RecordBatch>> + Unpin,
+{
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        use Poll;
+
+        // First, emit any already-reversed batches
+        if let Some(batch) = self.output_buffer.pop_front() {
+            return Poll::Ready(Some(Ok(batch)));
+        }
+
+        if self.done {
+            return Poll::Ready(None);
+        }
+
+        // Pull batches from the inner stream until we complete a row group
+        loop {
+            match ready!(self.inner.poll_next_unpin(cx)) {
+                Some(Ok(batch)) => {
+                    let num_rows = batch.num_rows();
+                    self.buffer.push(batch);
+                    self.rows_remaining_in_rg =
+                        self.rows_remaining_in_rg.saturating_sub(num_rows);
+
+                    if self.rows_remaining_in_rg == 0 {
+                        // Row group complete — flush buffer
+                        if let Err(e) = self.flush_buffer() {
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                        if let Some(batch) = self.output_buffer.pop_front() {
+                            return Poll::Ready(Some(Ok(batch)));
+                        }
+                    }
+                }
+                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                None => {
+                    self.done = true;
+                    // Flush any remaining buffered batches
+                    if !self.buffer.is_empty()
+                        && let Err(e) = self.flush_buffer()
+                    {
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    if let Some(batch) = self.output_buffer.pop_front() {
+                        return Poll::Ready(Some(Ok(batch)));
+                    }
+                    return Poll::Ready(None);
+                }
+            }
+        }
     }
 }
 
@@ -1035,6 +1183,7 @@ fn should_enable_page_index(
 
 #[cfg(test)]
 mod test {
+    use std::pin::Pin;
     use std::sync::Arc;
 
     use super::{ConstantColumns, constant_columns_from_stats};
@@ -1085,6 +1234,7 @@ mod test {
         max_predicate_cache_size: Option<usize>,
         reverse_row_groups: bool,
         preserve_order: bool,
+        reverse_rows: bool,
     }
 
     impl ParquetOpenerBuilder {
@@ -1111,6 +1261,7 @@ mod test {
                 max_predicate_cache_size: None,
                 reverse_row_groups: false,
                 preserve_order: false,
+                reverse_rows: false,
             }
         }
 
@@ -1231,6 +1382,7 @@ mod test {
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
                 preserve_order: self.preserve_order,
+                reverse_rows: self.reverse_rows,
             }
         }
     }
@@ -1319,7 +1471,7 @@ mod test {
     }
 
     async fn count_batches_and_rows(
-        mut stream: std::pin::Pin<
+        mut stream: Pin<
             Box<
                 dyn Stream<Item = Result<arrow::array::RecordBatch, DataFusionError>>
                     + Send,
@@ -1337,7 +1489,7 @@ mod test {
 
     /// Helper to collect all int32 values from the first column of batches
     async fn collect_int32_values(
-        mut stream: std::pin::Pin<
+        mut stream: Pin<
             Box<
                 dyn Stream<Item = Result<arrow::array::RecordBatch, DataFusionError>>
                     + Send,

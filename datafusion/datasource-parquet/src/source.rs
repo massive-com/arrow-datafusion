@@ -288,11 +288,19 @@ pub struct ParquetSource {
     pub(crate) projection: ProjectionExprs,
     #[cfg(feature = "parquet_encryption")]
     pub(crate) encryption_factory: Option<Arc<dyn EncryptionFactory>>,
-    /// If true, read files in reverse order and reverse row groups within files.
-    /// But it's not guaranteed that rows within row groups are in reverse order,
-    /// so we still need to sort them after reading, so the reverse scan is inexact.
-    /// Used to optimize ORDER BY ... DESC on sorted data.
+    /// If true, read row groups in reverse order within each file.
+    /// Combined with `reverse_rows`, controls the sort pushdown behavior:
+    /// - `reverse_row_groups=true, reverse_rows=false`: Inexact (RGs reversed, rows within RG not)
+    /// - `reverse_row_groups=true, reverse_rows=true`: Exact (both RGs and rows reversed)
     reverse_row_groups: bool,
+    /// If true, reverse the row order within each batch after reading.
+    /// This gives exact descending order when combined with `reverse_row_groups`.
+    reverse_rows: bool,
+    /// If true, `try_reverse_output` returns `Exact` (reverse_row_groups + reverse_rows),
+    /// allowing the Sort operator to be removed entirely and fetch to be pushed down.
+    /// If false (default), returns `Inexact` (only reverse_row_groups), preserving
+    /// backward-compatible behavior where Sort is kept as TopK.
+    exact_reverse: bool,
 }
 
 impl ParquetSource {
@@ -318,6 +326,8 @@ impl ParquetSource {
             #[cfg(feature = "parquet_encryption")]
             encryption_factory: None,
             reverse_row_groups: false,
+            reverse_rows: false,
+            exact_reverse: false,
         }
     }
 
@@ -481,6 +491,25 @@ impl ParquetSource {
     pub fn reverse_row_groups(&self) -> bool {
         self.reverse_row_groups
     }
+
+    /// Enable or disable exact reverse scanning.
+    ///
+    /// When `true`, `try_reverse_output` returns `Exact` (both row groups and
+    /// rows within each batch are reversed), allowing the Sort operator to be
+    /// removed entirely and fetch/limit to be pushed down to the scan.
+    ///
+    /// When `false` (default), `try_reverse_output` returns `Inexact` (only row
+    /// groups are reversed), preserving backward-compatible behavior where the
+    /// Sort operator is kept as TopK.
+    pub fn with_exact_reverse(mut self, exact_reverse: bool) -> Self {
+        self.exact_reverse = exact_reverse;
+        self
+    }
+
+    /// Returns whether exact reverse scanning is enabled.
+    pub fn exact_reverse(&self) -> bool {
+        self.exact_reverse
+    }
 }
 
 /// Parses datafusion.common.config.ParquetOptions.coerce_int96 String to a arrow_schema.datatype.TimeUnit
@@ -568,6 +597,7 @@ impl FileSource for ParquetSource {
             max_predicate_cache_size: self.max_predicate_cache_size(),
             reverse_row_groups: self.reverse_row_groups,
             preserve_order: !base_config.output_ordering.is_empty(),
+            reverse_rows: self.reverse_rows,
         });
         Ok(opener)
     }
@@ -804,12 +834,24 @@ impl FileSource for ParquetSource {
             return Ok(SortOrderPushdownResult::Unsupported);
         }
 
-        // Return Inexact because we're only reversing row group order,
-        // not guaranteeing perfect row-level ordering
-        let new_source = self.clone().with_reverse_row_groups(true);
-        Ok(SortOrderPushdownResult::Inexact {
-            inner: Arc::new(new_source) as Arc<dyn FileSource>,
-        })
+        let new_source: Arc<dyn FileSource> = if self.exact_reverse {
+            // Exact: reverse both row groups and rows within each batch,
+            // giving globally sorted output. This allows the Sort operator
+            // to be removed entirely and fetch to be pushed down to the scan.
+            let mut source = self.clone().with_reverse_row_groups(true);
+            source.reverse_rows = true;
+            Arc::new(source)
+        } else {
+            // Inexact: only reverse row groups. The Sort operator stays
+            // (as TopK) but benefits from early termination.
+            Arc::new(self.clone().with_reverse_row_groups(true))
+        };
+
+        if self.exact_reverse {
+            Ok(SortOrderPushdownResult::Exact { inner: new_source })
+        } else {
+            Ok(SortOrderPushdownResult::Inexact { inner: new_source })
+        }
 
         // TODO Phase 2: Add support for other optimizations:
         // - File reordering based on min/max statistics
@@ -916,5 +958,70 @@ mod tests {
 
         assert!(source.reverse_row_groups());
         assert!(source.filter().is_some());
+    }
+
+    #[test]
+    fn test_exact_reverse_returns_exact() {
+        use arrow::compute::SortOptions;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_physical_expr::EquivalenceProperties;
+        use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
+        use datafusion_physical_plan::SortOrderPushdownResult;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+
+        let source = ParquetSource::new(schema.clone()).with_exact_reverse(true);
+
+        // Build equivalence properties with ASC ordering
+        let sort_expr = PhysicalSortExpr {
+            expr: Arc::new(datafusion_physical_expr::expressions::Column::new("a", 0)),
+            options: SortOptions::default(), // ASC NULLS LAST
+        };
+        let mut eq_properties = EquivalenceProperties::new(schema);
+        eq_properties.add_orderings(vec![vec![sort_expr.clone()]]);
+
+        // Request DESC ordering (reverse of source)
+        let desc_expr = sort_expr.reverse();
+
+        let result = source
+            .try_reverse_output(&[desc_expr], &eq_properties)
+            .unwrap();
+
+        assert!(
+            matches!(result, SortOrderPushdownResult::Exact { .. }),
+            "with_exact_reverse(true) should return Exact"
+        );
+    }
+
+    #[test]
+    fn test_default_returns_inexact() {
+        use arrow::compute::SortOptions;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion_physical_expr::EquivalenceProperties;
+        use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
+        use datafusion_physical_plan::SortOrderPushdownResult;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+
+        // Default: exact_reverse is false
+        let source = ParquetSource::new(schema.clone());
+
+        let sort_expr = PhysicalSortExpr {
+            expr: Arc::new(datafusion_physical_expr::expressions::Column::new("a", 0)),
+            options: SortOptions::default(),
+        };
+        let mut eq_properties = EquivalenceProperties::new(schema);
+        eq_properties.add_orderings(vec![vec![sort_expr.clone()]]);
+
+        let desc_expr = sort_expr.reverse();
+
+        let result = source
+            .try_reverse_output(&[desc_expr], &eq_properties)
+            .unwrap();
+
+        assert!(
+            matches!(result, SortOrderPushdownResult::Inexact { .. }),
+            "default (exact_reverse=false) should return Inexact"
+        );
     }
 }
