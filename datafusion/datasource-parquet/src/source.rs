@@ -336,6 +336,7 @@ impl ParquetSource {
         mut self,
         table_parquet_options: TableParquetOptions,
     ) -> Self {
+        self.exact_reverse = table_parquet_options.global.enable_exact_reverse_scan;
         self.table_parquet_options = table_parquet_options;
         self
     }
@@ -651,8 +652,10 @@ impl FileSource for ParquetSource {
 
                 write!(f, "{predicate_string}")?;
 
-                // Add reverse_scan info if enabled
-                if self.reverse_row_groups {
+                // Add reverse scan info if enabled
+                if self.reverse_row_groups && self.reverse_rows {
+                    write!(f, ", scan_direction=Reversed")?;
+                } else if self.reverse_row_groups {
                     write!(f, ", reverse_row_groups=true")?;
                 }
 

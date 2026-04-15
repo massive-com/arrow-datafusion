@@ -581,8 +581,14 @@ impl FileOpener for ParquetOpener {
             // Apply the prepared plan to the builder
             builder = prepared_plan.apply_to_builder(builder);
 
+            // When reverse_rows is enabled, limit must be applied AFTER row
+            // reversal (in ReversedRowGroupStream), not at the parquet reader
+            // level. Applying limit here would read the first N rows in forward
+            // order and then reverse them, giving wrong results.
             if let Some(limit) = limit {
-                builder = builder.with_limit(limit)
+                if !reverse_rows {
+                    builder = builder.with_limit(limit)
+                }
             }
 
             if let Some(max_predicate_cache_size) = max_predicate_cache_size {
@@ -705,9 +711,11 @@ impl FileOpener for ParquetOpener {
 
             // When exact reverse is enabled, wrap the stream to buffer
             // and reverse rows per row group. Memory cost: O(largest_RG).
+            // The limit is applied here (after reversal) instead of at the
+            // parquet reader level so that we get the correct reversed rows.
             let stream: futures::stream::BoxStream<'static, Result<RecordBatch>> =
                 if reverse_rows {
-                    ReversedRowGroupStream::new(stream, rg_row_counts).boxed()
+                    ReversedRowGroupStream::new(stream, rg_row_counts, limit).boxed()
                 } else {
                     stream.boxed()
                 };
@@ -746,10 +754,12 @@ struct ReversedRowGroupStream<S> {
     output_buffer: VecDeque<RecordBatch>,
     /// Whether the inner stream is exhausted
     done: bool,
+    /// Optional row limit (applied after reversal for correct results)
+    remaining_limit: Option<usize>,
 }
 
 impl<S> ReversedRowGroupStream<S> {
-    fn new(inner: S, rg_row_counts: Vec<usize>) -> Self {
+    fn new(inner: S, rg_row_counts: Vec<usize>, limit: Option<usize>) -> Self {
         let rows_remaining = rg_row_counts.first().copied().unwrap_or(0);
         Self {
             inner,
@@ -759,6 +769,25 @@ impl<S> ReversedRowGroupStream<S> {
             buffer: Vec::new(),
             output_buffer: VecDeque::new(),
             done: false,
+            remaining_limit: limit,
+        }
+    }
+
+    /// Truncate batch to remaining limit and update the counter.
+    /// Returns the (possibly truncated) batch.
+    fn apply_limit(&mut self, batch: RecordBatch) -> RecordBatch {
+        if let Some(remaining) = self.remaining_limit.as_mut() {
+            let rows = batch.num_rows();
+            if rows <= *remaining {
+                *remaining -= rows;
+                batch
+            } else {
+                let truncated = batch.slice(0, *remaining);
+                *remaining = 0;
+                truncated
+            }
+        } else {
+            batch
         }
     }
 
@@ -798,11 +827,14 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        use Poll;
+        // Check if limit has been reached
+        if self.remaining_limit == Some(0) {
+            return Poll::Ready(None);
+        }
 
         // First, emit any already-reversed batches
         if let Some(batch) = self.output_buffer.pop_front() {
-            return Poll::Ready(Some(Ok(batch)));
+            return Poll::Ready(Some(Ok(self.apply_limit(batch))));
         }
 
         if self.done {
@@ -824,7 +856,7 @@ where
                             return Poll::Ready(Some(Err(e)));
                         }
                         if let Some(batch) = self.output_buffer.pop_front() {
-                            return Poll::Ready(Some(Ok(batch)));
+                            return Poll::Ready(Some(Ok(self.apply_limit(batch))));
                         }
                     }
                 }
@@ -838,7 +870,7 @@ where
                         return Poll::Ready(Some(Err(e)));
                     }
                     if let Some(batch) = self.output_buffer.pop_front() {
-                        return Poll::Ready(Some(Ok(batch)));
+                        return Poll::Ready(Some(Ok(self.apply_limit(batch))));
                     }
                     return Poll::Ready(None);
                 }
