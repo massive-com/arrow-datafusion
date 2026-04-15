@@ -465,6 +465,7 @@ mod tests {
             skip_arrow_metadata: defaults.skip_arrow_metadata,
             coerce_int96: None,
             max_predicate_cache_size: defaults.max_predicate_cache_size,
+            enable_exact_reverse_scan: defaults.enable_exact_reverse_scan,
         }
     }
 
@@ -579,6 +580,8 @@ mod tests {
                 binary_as_string: global_options_defaults.binary_as_string,
                 skip_arrow_metadata: global_options_defaults.skip_arrow_metadata,
                 coerce_int96: None,
+                enable_exact_reverse_scan: global_options_defaults
+                    .enable_exact_reverse_scan,
             },
             column_specific_options,
             key_value_metadata,

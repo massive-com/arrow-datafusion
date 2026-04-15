@@ -242,6 +242,7 @@ datafusion.execution.parquet.data_page_row_count_limit 20000
 datafusion.execution.parquet.data_pagesize_limit 1048576
 datafusion.execution.parquet.dictionary_enabled true
 datafusion.execution.parquet.dictionary_page_size_limit 1048576
+datafusion.execution.parquet.enable_exact_reverse_scan false
 datafusion.execution.parquet.enable_page_index true
 datafusion.execution.parquet.encoding NULL
 datafusion.execution.parquet.force_filter_selections false
@@ -377,6 +378,7 @@ datafusion.execution.parquet.data_page_row_count_limit 20000 (writing) Sets best
 datafusion.execution.parquet.data_pagesize_limit 1048576 (writing) Sets best effort maximum size of data page in bytes
 datafusion.execution.parquet.dictionary_enabled true (writing) Sets if dictionary encoding is enabled. If NULL, uses default parquet writer setting
 datafusion.execution.parquet.dictionary_page_size_limit 1048576 (writing) Sets best effort maximum dictionary page size, in bytes
+datafusion.execution.parquet.enable_exact_reverse_scan false (reading) If true, reverse scans produce exact descending order by reversing rows within each row group. This allows the Sort operator to be removed entirely and fetch/limit to be pushed down to the scan. If false (default), reverse scans only reverse row group order (inexact), keeping TopK above for final sorting.
 datafusion.execution.parquet.enable_page_index true (reading) If true, reads the Parquet data page level metadata (the Page Index), if present, to reduce the I/O and number of rows decoded.
 datafusion.execution.parquet.encoding NULL (writing)  Sets default encoding for any column. Valid values are: plain, plain_dictionary, rle, bit_packed, delta_binary_packed, delta_length_byte_array, delta_byte_array, rle_dictionary, and byte_stream_split. These values are not case sensitive. If NULL, uses default parquet writer setting
 datafusion.execution.parquet.force_filter_selections false (reading) Force the use of RowSelections for filter results, when pushdown_filters is enabled. If false, the reader will automatically choose between a RowSelection and a Bitmap based on the number and pattern of selected rows.

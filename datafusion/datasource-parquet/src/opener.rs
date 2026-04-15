@@ -585,10 +585,10 @@ impl FileOpener for ParquetOpener {
             // reversal (in ReversedRowGroupStream), not at the parquet reader
             // level. Applying limit here would read the first N rows in forward
             // order and then reverse them, giving wrong results.
-            if let Some(limit) = limit {
-                if !reverse_rows {
-                    builder = builder.with_limit(limit)
-                }
+            if let Some(limit) = limit
+                && !reverse_rows
+            {
+                builder = builder.with_limit(limit)
             }
 
             if let Some(max_predicate_cache_size) = max_predicate_cache_size {
