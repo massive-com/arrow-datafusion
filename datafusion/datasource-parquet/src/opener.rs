@@ -184,6 +184,48 @@ impl PreparedAccessPlan {
     }
 }
 
+/// Compute per-row-group *selected* row counts for exact reverse buffering.
+///
+/// `RowSelection` is a flat sequence of `RowSelector` values (alternating
+/// skip/select) applied to the concatenation of all selected row groups.
+/// To know how many rows each row group will emit, we walk both sequences
+/// in lock-step and accumulate the `select` portions per row group.
+fn compute_selected_rows_per_rg(
+    row_group_indexes: &[usize],
+    rg_metadata: &[RowGroupMetaData],
+    row_selection: &parquet::arrow::arrow_reader::RowSelection,
+) -> Result<Vec<usize>> {
+    let mut selectors = row_selection.iter();
+    let mut current_remaining: usize = 0;
+    let mut current_skip: bool = false;
+
+    let mut result = Vec::with_capacity(row_group_indexes.len());
+    for &rg_idx in row_group_indexes {
+        let mut rows_left_in_rg = rg_metadata[rg_idx].num_rows() as usize;
+        let mut selected = 0usize;
+        while rows_left_in_rg > 0 {
+            if current_remaining == 0 {
+                let Some(sel) = selectors.next() else {
+                    return Err(DataFusionError::Internal(
+                        "RowSelection ended before covering all planned row groups"
+                            .to_string(),
+                    ));
+                };
+                current_remaining = sel.row_count;
+                current_skip = sel.skip;
+            }
+            let consumed = rows_left_in_rg.min(current_remaining);
+            if !current_skip {
+                selected += consumed;
+            }
+            rows_left_in_rg -= consumed;
+            current_remaining -= consumed;
+        }
+        result.push(selected);
+    }
+    Ok(result)
+}
+
 impl FileOpener for ParquetOpener {
     fn open(&self, partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
         let file_range = partitioned_file.range.clone();
@@ -566,14 +608,25 @@ impl FileOpener for ParquetOpener {
                 prepared_plan = prepared_plan.reverse(file_metadata.as_ref())?;
             }
 
-            // Collect per-RG row counts for exact reverse buffering
+            // Collect per-RG *output* row counts for exact reverse buffering.
+            // When `row_selection` is present (e.g. page pruning via
+            // pushdown_filters), the stream emits only the selected rows, so
+            // `RowGroupMetaData::num_rows()` would over-count and cause
+            // ReversedRowGroupStream to misdetect row-group boundaries.
             let rg_row_counts: Vec<usize> = if reverse_rows {
                 let rg_metadata = file_metadata.row_groups();
-                prepared_plan
-                    .row_group_indexes
-                    .iter()
-                    .map(|&idx| rg_metadata[idx].num_rows() as usize)
-                    .collect()
+                match prepared_plan.row_selection.as_ref() {
+                    Some(row_selection) => compute_selected_rows_per_rg(
+                        &prepared_plan.row_group_indexes,
+                        rg_metadata,
+                        row_selection,
+                    )?,
+                    None => prepared_plan
+                        .row_group_indexes
+                        .iter()
+                        .map(|&idx| rg_metadata[idx].num_rows() as usize)
+                        .collect(),
+                }
             } else {
                 vec![]
             };
@@ -1218,7 +1271,9 @@ mod test {
     use std::pin::Pin;
     use std::sync::Arc;
 
-    use super::{ConstantColumns, constant_columns_from_stats};
+    use super::{
+        ConstantColumns, compute_selected_rows_per_rg, constant_columns_from_stats,
+    };
     use crate::{DefaultParquetFileReaderFactory, RowGroupAccess, opener::ParquetOpener};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use bytes::{BufMut, BytesMut};
@@ -1241,6 +1296,7 @@ mod test {
     use futures::{Stream, StreamExt};
     use object_store::{ObjectStore, memory::InMemory, path::Path};
     use parquet::arrow::ArrowWriter;
+    use parquet::file::metadata::RowGroupMetaData;
     use parquet::file::properties::WriterProperties;
 
     /// Builder for creating [`ParquetOpener`] instances with sensible defaults for tests.
@@ -1348,6 +1404,12 @@ mod test {
         /// Set reverse row groups flag.
         fn with_reverse_row_groups(mut self, enable: bool) -> Self {
             self.reverse_row_groups = enable;
+            self
+        }
+
+        /// Set reverse_rows flag (Exact reverse scan: per-RG buffer + row reversal).
+        fn with_reverse_rows(mut self, enable: bool) -> Self {
+            self.reverse_rows = enable;
             self
         }
 
@@ -2521,5 +2583,357 @@ mod test {
                 "With preserve_order, partially-matched RG0 is scanned first"
             );
         }
+    }
+
+    // ============================================================================
+    // Exact reverse scan tests
+    // ============================================================================
+    //
+    // These cover the `reverse_rows=true` path (per-RG buffer + row reversal) that
+    // is layered on top of `reverse_row_groups`:
+    //
+    //   reverse_row_groups only: Inexact — RGs reversed, rows within RG still ASC.
+    //   reverse_row_groups + reverse_rows: Exact — globally DESC.
+    //
+    // The helper `compute_selected_rows_per_rg` is also unit-tested below, since a
+    // `RowSelection` produced by page pruning can make the parquet stream emit
+    // fewer rows per RG than `RowGroupMetaData::num_rows()` would suggest.
+
+    /// Build a `RowSelection` from a flat list of `(skip, row_count)` pairs.
+    fn row_selection_from_pairs(
+        pairs: &[(bool, usize)],
+    ) -> parquet::arrow::arrow_reader::RowSelection {
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+        let selectors: Vec<RowSelector> = pairs
+            .iter()
+            .map(|&(skip, n)| {
+                if skip {
+                    RowSelector::skip(n)
+                } else {
+                    RowSelector::select(n)
+                }
+            })
+            .collect();
+        RowSelection::from(selectors)
+    }
+
+    /// Build a stub `RowGroupMetaData` with the given row count.
+    ///
+    /// `compute_selected_rows_per_rg` only reads `num_rows()` from the metadata,
+    /// so we can construct a minimal one with just that field populated.
+    fn stub_rg(num_rows: i64) -> RowGroupMetaData {
+        use parquet::schema::types::{SchemaDescriptor, Type};
+        let schema = Arc::new(SchemaDescriptor::new(Arc::new(
+            Type::group_type_builder("schema").build().unwrap(),
+        )));
+        RowGroupMetaData::builder(schema)
+            .set_num_rows(num_rows)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_compute_selected_rows_per_rg_no_skip() {
+        // Selection that selects everything → output == raw num_rows per RG.
+        let rgs = vec![stub_rg(4), stub_rg(6), stub_rg(5)];
+        let sel = row_selection_from_pairs(&[(false, 15)]);
+        let counts = compute_selected_rows_per_rg(&[0, 1, 2], &rgs, &sel).unwrap();
+        assert_eq!(counts, vec![4, 6, 5]);
+    }
+
+    #[test]
+    fn test_compute_selected_rows_per_rg_skip_spanning_rgs() {
+        // RG sizes: [4, 6, 5] = 15 rows total.
+        // Selection: skip 5, select 7, skip 3 → rows [6..=12] chosen.
+        //   RG0 (rows 0..4)  : skip all 4       → 0 selected
+        //   RG1 (rows 4..10) : skip 1, select 5 → 5 selected
+        //   RG2 (rows 10..15): select 2, skip 3 → 2 selected
+        let rgs = vec![stub_rg(4), stub_rg(6), stub_rg(5)];
+        let sel = row_selection_from_pairs(&[(true, 5), (false, 7), (true, 3)]);
+        let counts = compute_selected_rows_per_rg(&[0, 1, 2], &rgs, &sel).unwrap();
+        assert_eq!(counts, vec![0, 5, 2]);
+    }
+
+    #[test]
+    fn test_compute_selected_rows_per_rg_all_skipped() {
+        // Every row is skipped — each RG emits 0 rows.
+        let rgs = vec![stub_rg(3), stub_rg(3)];
+        let sel = row_selection_from_pairs(&[(true, 6)]);
+        let counts = compute_selected_rows_per_rg(&[0, 1], &rgs, &sel).unwrap();
+        assert_eq!(counts, vec![0, 0]);
+    }
+
+    #[test]
+    fn test_compute_selected_rows_per_rg_short_selection_errors() {
+        // Selection covers only 5 rows but RGs sum to 10 → must error instead of
+        // silently returning garbage counts.
+        let rgs = vec![stub_rg(5), stub_rg(5)];
+        let sel = row_selection_from_pairs(&[(false, 5)]);
+        let err = compute_selected_rows_per_rg(&[0, 1], &rgs, &sel).unwrap_err();
+        assert!(
+            format!("{err}").contains("RowSelection ended before"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_reverse_scan_multi_rg_produces_global_desc() {
+        // Three RGs, each with an ascending run. With reverse_row_groups +
+        // reverse_rows, the output must be globally descending.
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 =
+            record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(3) // one RG per batch
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2, batch3],
+            Some(props),
+        )
+        .await;
+
+        let schema = batch1.schema();
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        );
+
+        // Inexact (only RGs reversed; rows within RG still ASC).
+        let inexact = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_reverse_row_groups(true)
+            .build();
+        let stream = inexact.open(file.clone()).unwrap().await.unwrap();
+        let inexact_values = collect_int32_values(stream).await;
+        assert_eq!(
+            inexact_values,
+            vec![7, 8, 9, 4, 5, 6, 1, 2, 3],
+            "Inexact: RGs reversed but rows within RG stay ASC"
+        );
+
+        // Exact (reverse_rows adds per-RG row reversal → globally DESC).
+        let exact = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_reverse_row_groups(true)
+            .with_reverse_rows(true)
+            .build();
+        let stream = exact.open(file.clone()).unwrap().await.unwrap();
+        let exact_values = collect_int32_values(stream).await;
+        assert_eq!(
+            exact_values,
+            vec![9, 8, 7, 6, 5, 4, 3, 2, 1],
+            "Exact: globally sorted DESC"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_reverse_scan_applies_limit_after_reversal() {
+        // With exact reverse + limit, the limit must come from the *end* of the
+        // logical forward order, not the first N rows pre-reversal.
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 =
+            record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(3)
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2, batch3],
+            Some(props),
+        )
+        .await;
+
+        let schema = batch1.schema();
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        );
+
+        let opener = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_reverse_row_groups(true)
+            .with_reverse_rows(true)
+            .with_limit(Some(4))
+            .build();
+        let stream = opener.open(file).unwrap().await.unwrap();
+        let values = collect_int32_values(stream).await;
+        assert_eq!(
+            values,
+            vec![9, 8, 7, 6],
+            "Limit must be applied AFTER row reversal; \
+             applying it at the parquet reader layer would produce [1,2,3,4] \
+             reversed to [4,3,2,1] — wrong."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_reverse_scan_with_row_selection_across_rgs() {
+        // Regression test for copilot review comment #2: when `row_selection`
+        // (e.g. from page pruning / pushdown filters) causes the stream to emit
+        // fewer rows per RG than `num_rows()` suggests, `ReversedRowGroupStream`
+        // must still detect RG boundaries correctly. Before the fix,
+        // `rg_row_counts` was seeded from `RowGroupMetaData::num_rows()` and the
+        // boundary detector drifted, silently mixing batches from multiple RGs.
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        // Three RGs of 4 rows each. Each RG's rows are ASC (and so are the RGs
+        // relative to one another), so forward scan = [1..12] and any correct
+        // reverse scan over the selected rows must be DESC.
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3), Some(4)]))
+                .unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(5), Some(6), Some(7), Some(8)]))
+                .unwrap();
+        let batch3 =
+            record_batch!(("a", Int32, vec![Some(9), Some(10), Some(11), Some(12)]))
+                .unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(4)
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2, batch3],
+            Some(props),
+        )
+        .await;
+
+        let schema = batch1.schema();
+
+        // Attach a ParquetAccessPlan with a per-RG RowSelection:
+        //   RG0 : skip first 2, select last 2  → selects rows {3, 4}
+        //   RG1 : select all                    → selects rows {5, 6, 7, 8}
+        //   RG2 : select first 2, skip last 2   → selects rows {9, 10}
+        //
+        // Exact reverse over this selection must return [10, 9, 8, 7, 6, 5, 4, 3].
+        use crate::ParquetAccessPlan;
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+        let mut access_plan = ParquetAccessPlan::new_all(3);
+        access_plan.scan_selection(
+            0,
+            RowSelection::from(vec![RowSelector::skip(2), RowSelector::select(2)]),
+        );
+        access_plan.scan_selection(
+            2,
+            RowSelection::from(vec![RowSelector::select(2), RowSelector::skip(2)]),
+        );
+
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        )
+        .with_extensions(Arc::new(access_plan));
+
+        let opener = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_reverse_row_groups(true)
+            .with_reverse_rows(true)
+            .build();
+        let stream = opener.open(file).unwrap().await.unwrap();
+        let values = collect_int32_values(stream).await;
+        assert_eq!(
+            values,
+            vec![10, 9, 8, 7, 6, 5, 4, 3],
+            "Exact reverse must respect row_selection when computing RG boundaries"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_reverse_scan_with_row_selection_and_limit() {
+        // Exact reverse + row_selection + limit. Must produce the top-N in DESC
+        // order taken from the selected rows (not the unselected ones).
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3), Some(4)]))
+                .unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(5), Some(6), Some(7), Some(8)]))
+                .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(4)
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2],
+            Some(props),
+        )
+        .await;
+
+        let schema = batch1.schema();
+
+        // Select only rows {2, 3, 6, 7}.
+        use crate::ParquetAccessPlan;
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+        let mut access_plan = ParquetAccessPlan::new_all(2);
+        access_plan.scan_selection(
+            0,
+            RowSelection::from(vec![
+                RowSelector::skip(1),
+                RowSelector::select(2),
+                RowSelector::skip(1),
+            ]),
+        );
+        access_plan.scan_selection(
+            1,
+            RowSelection::from(vec![
+                RowSelector::skip(1),
+                RowSelector::select(2),
+                RowSelector::skip(1),
+            ]),
+        );
+
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        )
+        .with_extensions(Arc::new(access_plan));
+
+        let opener = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_reverse_row_groups(true)
+            .with_reverse_rows(true)
+            .with_limit(Some(3))
+            .build();
+        let stream = opener.open(file).unwrap().await.unwrap();
+        let values = collect_int32_values(stream).await;
+        assert_eq!(
+            values,
+            vec![7, 6, 3],
+            "top 3 of {{2, 3, 6, 7}} in DESC order"
+        );
     }
 }
