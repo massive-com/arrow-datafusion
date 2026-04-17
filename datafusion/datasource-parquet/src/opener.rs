@@ -813,11 +813,19 @@ struct ReversedRowGroupStream<S> {
 
 impl<S> ReversedRowGroupStream<S> {
     fn new(inner: S, rg_row_counts: Vec<usize>, limit: Option<usize>) -> Self {
-        let rows_remaining = rg_row_counts.first().copied().unwrap_or(0);
+        // Skip leading empty RGs (all rows filtered by RowSelection).
+        // Without this, rows_remaining_in_rg=0 causes the first batch from
+        // the next real RG to immediately trigger flush_buffer(), attributing
+        // it to the wrong (empty) RG.
+        let mut current_rg = 0;
+        while current_rg < rg_row_counts.len() && rg_row_counts[current_rg] == 0 {
+            current_rg += 1;
+        }
+        let rows_remaining = rg_row_counts.get(current_rg).copied().unwrap_or(0);
         Self {
             inner,
             rg_row_counts,
-            current_rg: 0,
+            current_rg,
             rows_remaining_in_rg: rows_remaining,
             buffer: Vec::new(),
             output_buffer: VecDeque::new(),
@@ -859,8 +867,16 @@ impl<S> ReversedRowGroupStream<S> {
             let reversed = arrow::compute::take_record_batch(&batch, &indices)?;
             self.output_buffer.push_back(reversed);
         }
-        // Advance to next row group
+        // Advance to next row group, skipping any empty RGs (all rows
+        // filtered by RowSelection). Without this skip, rows_remaining_in_rg=0
+        // would cause the next batch to immediately trigger another flush,
+        // splitting a real RG's batches across two flush cycles.
         self.current_rg += 1;
+        while self.current_rg < self.rg_row_counts.len()
+            && self.rg_row_counts[self.current_rg] == 0
+        {
+            self.current_rg += 1;
+        }
         self.rows_remaining_in_rg = self
             .rg_row_counts
             .get(self.current_rg)
@@ -2935,5 +2951,83 @@ mod test {
             vec![7, 6, 3],
             "top 3 of {{2, 3, 6, 7}} in DESC order"
         );
+    }
+
+    /// Regression test: when RowSelection skips ALL rows in an RG (empty RG),
+    /// `rg_row_counts` has a 0 entry. Without the skip-empty-RG fix,
+    /// `rows_remaining_in_rg=0` causes the first batch from the next real RG
+    /// to immediately trigger `flush_buffer()`, attributing that batch to the
+    /// wrong (empty) RG and corrupting the output order.
+    #[tokio::test]
+    async fn test_exact_reverse_scan_with_empty_rg_from_row_selection() {
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        // Three RGs of 4 rows each.
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3), Some(4)]))
+                .unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(5), Some(6), Some(7), Some(8)]))
+                .unwrap();
+        let batch3 =
+            record_batch!(("a", Int32, vec![Some(9), Some(10), Some(11), Some(12)]))
+                .unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(4)
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2, batch3],
+            Some(props),
+        )
+        .await;
+
+        let schema = batch1.schema();
+
+        // RG0: select all 4 rows → {1,2,3,4}
+        // RG1: skip ALL rows → empty (0 selected)
+        // RG2: select all 4 rows → {9,10,11,12}
+        use crate::ParquetAccessPlan;
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+        let mut access_plan = ParquetAccessPlan::new_all(3);
+        // RG1: skip all 4 rows
+        access_plan.scan_selection(1, RowSelection::from(vec![RowSelector::skip(4)]));
+
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        )
+        .with_extensions(Arc::new(access_plan));
+
+        let opener = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_reverse_row_groups(true)
+            .with_reverse_rows(true)
+            .build();
+        let stream = opener.open(file).unwrap().await.unwrap();
+        let values = collect_int32_values(stream).await;
+
+        // Reversed: RG2 first [12,11,10,9], skip empty RG1, then RG0 [4,3,2,1]
+        assert_eq!(
+            values,
+            vec![12, 11, 10, 9, 4, 3, 2, 1],
+            "empty RG (all rows skipped) must be handled without corrupting order"
+        );
+    }
+
+    #[test]
+    fn test_compute_selected_rows_per_rg_with_fully_skipped_middle_rg() {
+        // RG sizes: [4, 4, 4]. RG1 fully skipped.
+        // Selection: select 4, skip 4, select 4
+        let rgs = vec![stub_rg(4), stub_rg(4), stub_rg(4)];
+        let sel = row_selection_from_pairs(&[(false, 4), (true, 4), (false, 4)]);
+        let counts = compute_selected_rows_per_rg(&[0, 1, 2], &rgs, &sel).unwrap();
+        assert_eq!(counts, vec![4, 0, 4], "middle RG fully skipped → 0 rows");
     }
 }
