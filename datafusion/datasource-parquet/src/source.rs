@@ -511,6 +511,21 @@ impl ParquetSource {
     pub fn exact_reverse(&self) -> bool {
         self.exact_reverse
     }
+
+    /// Returns whether rows within each batch are reversed.
+    pub fn reverse_rows(&self) -> bool {
+        self.reverse_rows
+    }
+
+    /// Enable or disable row reversal within each batch.
+    ///
+    /// This is normally set internally by `try_reverse_output` when
+    /// `exact_reverse` is enabled, but must be set explicitly when
+    /// restoring a plan from proto serialization (RemoteExec path).
+    pub fn with_reverse_rows(mut self, reverse_rows: bool) -> Self {
+        self.reverse_rows = reverse_rows;
+        self
+    }
 }
 
 /// Parses datafusion.common.config.ParquetOptions.coerce_int96 String to a arrow_schema.datatype.TimeUnit
