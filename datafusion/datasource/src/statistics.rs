@@ -84,20 +84,41 @@ impl MinMaxStatistics {
             return plan_err!("Parquet file missing statistics");
         };
 
+        // Determine the number of file (non-partition) columns from the first
+        // entry. Partition columns always follow file columns in the table
+        // schema, so we use partition_values.len() to find the boundary.
+        // Note: we cannot use `s.column_statistics.len()` per-file because
+        // schema evolution means different files may have different column
+        // counts, which would shift the partition offset incorrectly.
+        let num_file_cols = statistics_and_partition_values
+            .first()
+            .map(|(_, pv)| projected_schema.fields().len() - pv.len())
+            .unwrap_or(0);
+
         // Helper function to get min/max statistics for a given column of projected_schema
         let get_min_max = |i: usize| -> Result<(Vec<ScalarValue>, Vec<ScalarValue>)> {
             Ok(statistics_and_partition_values
                 .iter()
                 .map(|(s, pv)| {
-                    if i < s.column_statistics.len() {
-                        s.column_statistics[i]
-                            .min_value
-                            .get_value()
-                            .cloned()
-                            .zip(s.column_statistics[i].max_value.get_value().cloned())
-                            .ok_or_else(|| plan_datafusion_err!("statistics not found"))
+                    if i < num_file_cols {
+                        if i < s.column_statistics.len() {
+                            s.column_statistics[i]
+                                .min_value
+                                .get_value()
+                                .cloned()
+                                .zip(
+                                    s.column_statistics[i].max_value.get_value().cloned(),
+                                )
+                                .ok_or_else(|| {
+                                    plan_datafusion_err!("statistics not found")
+                                })
+                        } else {
+                            // File doesn't have this column (schema evolution)
+                            // — treat as unknown, skip this file for min/max
+                            Err(plan_datafusion_err!("statistics not found"))
+                        }
                     } else {
-                        let partition_value = &pv[i - s.column_statistics.len()];
+                        let partition_value = &pv[i - num_file_cols];
                         Ok((partition_value.clone(), partition_value.clone()))
                     }
                 })
