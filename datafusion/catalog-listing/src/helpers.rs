@@ -339,17 +339,28 @@ fn filter_partitions(
     Ok(None)
 }
 
+/// Returns `Ok(None)` when the file is not inside a valid partition path
+/// (e.g. a stale file in the table root directory). Such files are skipped
+/// by the caller rather than included with empty partition values, which
+/// would cause downstream errors when the query references partition columns.
 fn try_into_partitioned_file(
     object_meta: ObjectMeta,
     partition_cols: &[(String, DataType)],
     table_path: &ListingTableUrl,
-) -> Result<PartitionedFile> {
+) -> Result<Option<PartitionedFile>> {
     let cols = partition_cols.iter().map(|(name, _)| name.as_str());
     let parsed = parse_partitions_for_path(table_path, &object_meta.location, cols);
 
+    let Some(parsed) = parsed else {
+        debug!(
+            "Skipping file outside partition structure: {}",
+            object_meta.location
+        );
+        return Ok(None);
+    };
+
     let partition_values = parsed
         .into_iter()
-        .flatten()
         .zip(partition_cols)
         .map(|(parsed, (_, datatype))| {
             ScalarValue::try_from_string(parsed.to_string(), datatype)
@@ -359,7 +370,7 @@ fn try_into_partitioned_file(
     let mut pf: PartitionedFile = object_meta.into();
     pf.partition_values = partition_values;
 
-    Ok(pf)
+    Ok(Some(pf))
 }
 
 /// Discover the partitions on the given path and prune out files
@@ -404,13 +415,15 @@ pub async fn pruned_partition_list<'a>(
         )?;
 
         Ok(objects
-            .map_ok(|object_meta| {
-                try_into_partitioned_file(object_meta, partition_cols, table_path)
+            .try_filter_map(|object_meta| {
+                futures::future::ready(try_into_partitioned_file(
+                    object_meta,
+                    partition_cols,
+                    table_path,
+                ))
             })
             .try_filter_map(move |pf| {
-                futures::future::ready(
-                    pf.and_then(|pf| filter_partitions(pf, filters, &df_schema)),
-                )
+                futures::future::ready(filter_partitions(pf, filters, &df_schema))
             })
             .boxed())
     }
