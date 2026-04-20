@@ -623,15 +623,23 @@ impl Statistics {
         column_statistics.resize(max_cols, ColumnStatistics::new_unknown());
 
         for (idx, col_stats) in column_statistics.iter_mut().enumerate() {
-            if let Some(item_col_stats) = other.column_statistics.get(idx) {
-                col_stats.null_count = col_stats.null_count.add(&item_col_stats.null_count);
-                col_stats.max_value = col_stats.max_value.max(&item_col_stats.max_value);
-                col_stats.min_value = col_stats.min_value.min(&item_col_stats.min_value);
-                col_stats.sum_value = col_stats.sum_value.add(&item_col_stats.sum_value);
-                col_stats.distinct_count = Precision::Absent;
-                col_stats.byte_size = col_stats.byte_size.add(&item_col_stats.byte_size);
-            }
-            // Columns beyond `other`'s range keep their current (or unknown) values
+            // When the other side has fewer columns (schema evolution),
+            // treat the missing column as unknown so the merge is symmetric
+            // regardless of iteration order.
+            let unknown;
+            let item_col_stats = match other.column_statistics.get(idx) {
+                Some(cs) => cs,
+                None => {
+                    unknown = ColumnStatistics::new_unknown();
+                    &unknown
+                }
+            };
+            col_stats.null_count = col_stats.null_count.add(&item_col_stats.null_count);
+            col_stats.max_value = col_stats.max_value.max(&item_col_stats.max_value);
+            col_stats.min_value = col_stats.min_value.min(&item_col_stats.min_value);
+            col_stats.sum_value = col_stats.sum_value.add(&item_col_stats.sum_value);
+            col_stats.distinct_count = Precision::Absent;
+            col_stats.byte_size = col_stats.byte_size.add(&item_col_stats.byte_size);
         }
 
         Ok(Statistics {
@@ -1431,16 +1439,10 @@ mod tests {
             Precision::Exact(ScalarValue::from(20))
         );
 
-        // Column b: only in stats_new. stats_old has no col[1], so the
-        // accumulator keeps stats_new's values unchanged.
-        assert_eq!(
-            merged.column_statistics[1].min_value,
-            Precision::Exact(ScalarValue::from(100))
-        );
-        assert_eq!(
-            merged.column_statistics[1].max_value,
-            Precision::Exact(ScalarValue::from(200))
-        );
+        // Column b: only in stats_new, stats_old treated as unknown.
+        // Exact.min(Absent) = Absent — symmetric with forward order.
+        assert_eq!(merged.column_statistics[1].min_value, Precision::Absent);
+        assert_eq!(merged.column_statistics[1].max_value, Precision::Absent);
     }
 
     #[test]
