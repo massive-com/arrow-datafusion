@@ -21,7 +21,6 @@ use std::fmt::{self, Debug, Display};
 
 use crate::{Result, ScalarValue};
 
-use crate::error::_plan_err;
 use arrow::datatypes::{DataType, Schema};
 
 /// Represents a value with a degree of certainty. `Precision` is used to
@@ -557,8 +556,8 @@ impl Statistics {
         let Some(init) = items.next() else {
             return Ok(Statistics::new_unknown(schema));
         };
-        let mut merged =
-            items.try_fold(init.clone(), |acc: Statistics, item_stats: &Statistics| {
+        let mut merged = items
+            .try_fold(init.clone(), |acc: Statistics, item_stats: &Statistics| {
                 acc.try_merge(item_stats)
             })?;
 
@@ -1459,9 +1458,7 @@ mod tests {
     #[test]
     fn test_try_merge_same_column_count_unchanged() {
         // Ensure same-column-count merge still works identically
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int32, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
 
         let stats1 = Statistics::default()
             .with_num_rows(Precision::Exact(10))
