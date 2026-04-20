@@ -557,9 +557,20 @@ impl Statistics {
         let Some(init) = items.next() else {
             return Ok(Statistics::new_unknown(schema));
         };
-        items.try_fold(init.clone(), |acc: Statistics, item_stats: &Statistics| {
-            acc.try_merge(item_stats)
-        })
+        let mut merged =
+            items.try_fold(init.clone(), |acc: Statistics, item_stats: &Statistics| {
+                acc.try_merge(item_stats)
+            })?;
+
+        // Ensure the merged statistics cover all columns in the table schema.
+        // Files produced before schema evolution may have fewer columns;
+        // pad with unknown so downstream code sees the expected column count.
+        let num_schema_cols = schema.fields().len();
+        merged
+            .column_statistics
+            .resize(num_schema_cols, ColumnStatistics::new_unknown());
+
+        Ok(merged)
     }
 
     /// Merge this Statistics value with another Statistics value.
@@ -1481,6 +1492,90 @@ mod tests {
             merged.column_statistics[0].max_value,
             Precision::Exact(ScalarValue::from(100))
         );
+    }
+
+    #[test]
+    fn test_try_merge_iter_pads_to_schema() {
+        // Table schema has 3 columns but all files only have 2.
+        // Merged stats should be padded to 3 columns.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("c", DataType::Int32, true), // new column, no files have it
+        ]));
+
+        let stats1 = Statistics::default()
+            .with_num_rows(Precision::Exact(10))
+            .add_column_statistics(
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::from(1))),
+            )
+            .add_column_statistics(
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::from(10))),
+            );
+
+        let stats2 = Statistics::default()
+            .with_num_rows(Precision::Exact(20))
+            .add_column_statistics(
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::from(5))),
+            )
+            .add_column_statistics(
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::from(20))),
+            );
+
+        let items = vec![stats1, stats2];
+        let merged = Statistics::try_merge_iter(&items, &schema).unwrap();
+
+        assert_eq!(merged.num_rows, Precision::Exact(30));
+        // Must match schema column count, not file column count
+        assert_eq!(merged.column_statistics.len(), 3);
+
+        // Columns a, b: merged from both files
+        assert_eq!(
+            merged.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::from(1))
+        );
+        assert_eq!(
+            merged.column_statistics[1].min_value,
+            Precision::Exact(ScalarValue::from(10))
+        );
+
+        // Column c: not in any file, padded with unknown
+        assert_eq!(merged.column_statistics[2].min_value, Precision::Absent);
+        assert_eq!(merged.column_statistics[2].max_value, Precision::Absent);
+    }
+
+    #[test]
+    fn test_try_merge_iter_schema_with_partition_columns() {
+        // Schema includes partition column; files don't have stats for it.
+        // After merge, stats should cover all schema columns.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data_col", DataType::Int32, false),
+            Field::new("partition_col", DataType::Utf8, false),
+        ]));
+
+        let stats = Statistics::default()
+            .with_num_rows(Precision::Exact(100))
+            .add_column_statistics(
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::from(1)))
+                    .with_max_value(Precision::Exact(ScalarValue::from(999))),
+            );
+        // Only 1 column stat for a 2-column schema
+
+        let items = vec![stats];
+        let merged = Statistics::try_merge_iter(&items, &schema).unwrap();
+
+        assert_eq!(merged.column_statistics.len(), 2);
+        assert_eq!(
+            merged.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::from(1))
+        );
+        // Partition column: unknown
+        assert_eq!(merged.column_statistics[1].min_value, Precision::Absent);
     }
 
     #[test]
