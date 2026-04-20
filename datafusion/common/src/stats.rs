@@ -556,20 +556,9 @@ impl Statistics {
         let Some(init) = items.next() else {
             return Ok(Statistics::new_unknown(schema));
         };
-        let mut merged = items
-            .try_fold(init.clone(), |acc: Statistics, item_stats: &Statistics| {
-                acc.try_merge(item_stats)
-            })?;
-
-        // Ensure the merged statistics cover all columns in the table schema.
-        // Files produced before schema evolution may have fewer columns;
-        // pad with unknown so downstream code sees the expected column count.
-        let num_schema_cols = schema.fields().len();
-        merged
-            .column_statistics
-            .resize(num_schema_cols, ColumnStatistics::new_unknown());
-
-        Ok(merged)
+        items.try_fold(init.clone(), |acc: Statistics, item_stats: &Statistics| {
+            acc.try_merge(item_stats)
+        })
     }
 
     /// Merge this Statistics value with another Statistics value.
@@ -1527,8 +1516,8 @@ mod tests {
         let merged = Statistics::try_merge_iter(&items, &schema).unwrap();
 
         assert_eq!(merged.num_rows, Precision::Exact(30));
-        // Must match schema column count, not file column count
-        assert_eq!(merged.column_statistics.len(), 3);
+        // Merged stats have max(file1_cols, file2_cols) = 2, not schema cols
+        assert_eq!(merged.column_statistics.len(), 2);
 
         // Columns a, b: merged from both files
         assert_eq!(
@@ -1539,16 +1528,13 @@ mod tests {
             merged.column_statistics[1].min_value,
             Precision::Exact(ScalarValue::from(10))
         );
-
-        // Column c: not in any file, padded with unknown
-        assert_eq!(merged.column_statistics[2].min_value, Precision::Absent);
-        assert_eq!(merged.column_statistics[2].max_value, Precision::Absent);
     }
 
     #[test]
-    fn test_try_merge_iter_schema_with_partition_columns() {
+    fn test_try_merge_iter_does_not_pad_for_partition_columns() {
         // Schema includes partition column; files don't have stats for it.
-        // After merge, stats should cover all schema columns.
+        // try_merge_iter should NOT pad to schema — partition columns are
+        // handled by the caller (e.g. Atlas's plan.rs or DF's statistics.rs).
         let schema = Arc::new(Schema::new(vec![
             Field::new("data_col", DataType::Int32, false),
             Field::new("partition_col", DataType::Utf8, false),
@@ -1561,18 +1547,17 @@ mod tests {
                     .with_min_value(Precision::Exact(ScalarValue::from(1)))
                     .with_max_value(Precision::Exact(ScalarValue::from(999))),
             );
-        // Only 1 column stat for a 2-column schema
+        // Only 1 column stat — partition column not included
 
         let items = vec![stats];
         let merged = Statistics::try_merge_iter(&items, &schema).unwrap();
 
-        assert_eq!(merged.column_statistics.len(), 2);
+        // Should stay 1 — not padded to schema's 2 columns
+        assert_eq!(merged.column_statistics.len(), 1);
         assert_eq!(
             merged.column_statistics[0].min_value,
             Precision::Exact(ScalarValue::from(1))
         );
-        // Partition column: unknown
-        assert_eq!(merged.column_statistics[1].min_value, Precision::Absent);
     }
 
     #[test]
