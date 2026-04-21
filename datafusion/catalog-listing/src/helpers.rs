@@ -352,10 +352,7 @@ fn try_into_partitioned_file(
     let parsed = parse_partitions_for_path(table_path, &object_meta.location, cols);
 
     let Some(parsed) = parsed else {
-        debug!(
-            "Skipping file outside partition structure: {}",
-            object_meta.location
-        );
+        // parse_partitions_for_path already logs a debug message
         return Ok(None);
     };
 
@@ -592,7 +589,7 @@ mod tests {
         let partition_cols = vec![("year_month".to_string(), DataType::Utf8)];
         let meta = ObjectMeta {
             location: Path::from("bucket/mytable/year_month=2024-01/data.parquet"),
-            last_modified: chrono::Utc::now(),
+            last_modified: chrono::DateTime::from(std::time::SystemTime::UNIX_EPOCH),
             size: 100,
             e_tag: None,
             version: None,
@@ -615,7 +612,7 @@ mod tests {
         let partition_cols = vec![("year_month".to_string(), DataType::Utf8)];
         let meta = ObjectMeta {
             location: Path::from("bucket/mytable/data.parquet"),
-            last_modified: chrono::Utc::now(),
+            last_modified: chrono::DateTime::from(std::time::SystemTime::UNIX_EPOCH),
             size: 100,
             e_tag: None,
             version: None,
@@ -635,7 +632,7 @@ mod tests {
         let partition_cols = vec![("year_month".to_string(), DataType::Utf8)];
         let meta = ObjectMeta {
             location: Path::from("bucket/mytable/wrong_col=2024-01/data.parquet"),
-            last_modified: chrono::Utc::now(),
+            last_modified: chrono::DateTime::from(std::time::SystemTime::UNIX_EPOCH),
             size: 100,
             e_tag: None,
             version: None,
@@ -658,7 +655,7 @@ mod tests {
         ];
         let meta = ObjectMeta {
             location: Path::from("bucket/mytable/year=2024/month=01/data.parquet"),
-            last_modified: chrono::Utc::now(),
+            last_modified: chrono::DateTime::from(std::time::SystemTime::UNIX_EPOCH),
             size: 100,
             e_tag: None,
             version: None,
@@ -688,7 +685,7 @@ mod tests {
         ];
         let meta = ObjectMeta {
             location: Path::from("bucket/mytable/year=2024/data.parquet"),
-            last_modified: chrono::Utc::now(),
+            last_modified: chrono::DateTime::from(std::time::SystemTime::UNIX_EPOCH),
             size: 100,
             e_tag: None,
             version: None,
