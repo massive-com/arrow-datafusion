@@ -1058,6 +1058,12 @@ message ParquetScanExecNode {
   PhysicalExprNode predicate = 3;
 
   datafusion_common.TableParquetOptions parquet_options = 4;
+
+  // Runtime reverse-scan flags set by PushdownSort optimizer.
+  // Must be preserved across proto roundtrips so that remote executors
+  // produce correctly reversed output after SortExec removal.
+  bool reverse_row_groups = 5;
+  bool reverse_rows = 6;
 }
 
 message CsvScanExecNode {

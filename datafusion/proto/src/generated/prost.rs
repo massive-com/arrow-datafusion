@@ -1607,6 +1607,10 @@ pub struct ParquetScanExecNode {
     pub parquet_options: ::core::option::Option<
         super::datafusion_common::TableParquetOptions,
     >,
+    #[prost(bool, tag = "5")]
+    pub reverse_row_groups: bool,
+    #[prost(bool, tag = "6")]
+    pub reverse_rows: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CsvScanExecNode {
