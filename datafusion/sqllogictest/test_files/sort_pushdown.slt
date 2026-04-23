@@ -1641,6 +1641,57 @@ physical_plan
 01)SortExec: TopK(fetch=3), expr=[id@0 DESC], preserve_partitioning=[false]
 02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/exact_rev_data.parquet]]}, projection=[id, value, name], file_type=parquet, predicate=DynamicFilter [ empty ], reverse_row_groups=true
 
+# Test 12.9: Exact reverse works correctly with pushdown_filters enabled.
+# RowFilter may reduce actual rows below rg_row_counts, but
+# ReversedRowGroupStream handles this by flushing all remaining
+# buffered batches when the stream ends.
+
+statement ok
+SET datafusion.execution.parquet.enable_exact_reverse_scan = true;
+
+statement ok
+SET datafusion.execution.parquet.pushdown_filters = true;
+
+statement ok
+CREATE EXTERNAL TABLE exact_rev_pushdown_parquet(id INT, value INT, name VARCHAR)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/sort_pushdown/exact_rev_data.parquet'
+WITH ORDER (id ASC);
+
+# Sort removed (Exact), scan_direction=Reversed, with predicate pushed down
+query TT
+EXPLAIN SELECT * FROM exact_rev_pushdown_parquet WHERE value > 500 ORDER BY id DESC LIMIT 3;
+----
+logical_plan
+01)Sort: exact_rev_pushdown_parquet.id DESC NULLS FIRST, fetch=3
+02)--Filter: exact_rev_pushdown_parquet.value > Int32(500)
+03)----TableScan: exact_rev_pushdown_parquet projection=[id, value, name], partial_filters=[exact_rev_pushdown_parquet.value > Int32(500)]
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/exact_rev_data.parquet]]}, projection=[id, value, name], limit=3, output_ordering=[id@0 ASC NULLS LAST], file_type=parquet, predicate=value@1 > 500, scan_direction=Reversed, pruning_predicate=value_null_count@1 != row_count@2 AND value_max@0 > 500, required_guarantees=[]
+
+# Results correct in DESC order with filter
+query IIT
+SELECT * FROM exact_rev_pushdown_parquet WHERE value > 500 ORDER BY id DESC LIMIT 3;
+----
+10 1000 j
+9 900 i
+8 800 h
+
+# Without LIMIT — all filtered rows in DESC order
+query IIT
+SELECT * FROM exact_rev_pushdown_parquet WHERE value > 500 ORDER BY id DESC;
+----
+10 1000 j
+9 900 i
+8 800 h
+7 700 g
+6 600 f
+
+statement ok
+DROP TABLE exact_rev_pushdown_parquet;
+
+statement ok
+SET datafusion.execution.parquet.pushdown_filters = false;
+
 # Cleanup exact reverse test tables
 statement ok
 DROP TABLE exact_rev_data;

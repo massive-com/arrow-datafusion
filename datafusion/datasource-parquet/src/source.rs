@@ -856,6 +856,14 @@ impl FileSource for ParquetSource {
             // Exact: reverse both row groups and rows within each batch,
             // giving globally sorted output. This allows the Sort operator
             // to be removed entirely and fetch to be pushed down to the scan.
+            //
+            // Note: when pushdown_filters is enabled, RowFilter may reduce
+            // actual rows below what rg_row_counts predicts. This causes
+            // ReversedRowGroupStream's RG boundary detection to delay
+            // (multiple RGs may buffer together), but correctness is preserved
+            // because all buffered batches are flushed and reversed when the
+            // stream ends. Memory cost becomes O(all data) instead of
+            // O(largest RG), which is acceptable for LIMIT queries.
             let mut source = self.clone().with_reverse_row_groups(true);
             source.reverse_rows = true;
             Arc::new(source)
