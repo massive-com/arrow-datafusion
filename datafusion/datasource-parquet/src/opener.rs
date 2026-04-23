@@ -324,6 +324,9 @@ impl FileOpener for ParquetOpener {
 
         let reverse_row_groups = self.reverse_row_groups;
         let reverse_rows = self.reverse_rows;
+        let partition_index = self.partition_index;
+        let parquet_file_reader_factory = Arc::clone(&self.parquet_file_reader_factory);
+        let metrics = self.metrics.clone();
         Ok(Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
             let file_decryption_properties = encryption_context
@@ -478,6 +481,13 @@ impl FileOpener for ParquetOpener {
 
             metadata_timer.stop();
 
+            // Clone metadata before moving into builder — needed for per-RG
+            // reverse scan which creates independent builders per row group.
+            let reader_metadata_for_reverse = if reverse_rows {
+                Some(Arc::new(reader_metadata.clone()))
+            } else {
+                None
+            };
             let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
                 async_file_reader,
                 reader_metadata,
@@ -486,6 +496,9 @@ impl FileOpener for ParquetOpener {
             let indices = projection.column_indices();
 
             let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
+
+            // Save the physical predicate for per-RG reverse scan filter pushdown
+            let pushdown_predicate = predicate.clone();
 
             // Filter pushdown: evaluate predicates during scan
             if let Some(predicate) = pushdown_filters.then_some(predicate).flatten() {
@@ -608,180 +621,232 @@ impl FileOpener for ParquetOpener {
                 prepared_plan = prepared_plan.reverse(file_metadata.as_ref())?;
             }
 
-            // Collect per-RG *output* row counts for exact reverse buffering.
-            // When `row_selection` is present (e.g. page pruning via
-            // pushdown_filters), the stream emits only the selected rows, so
-            // `RowGroupMetaData::num_rows()` would over-count and cause
-            // ReversedRowGroupStream to misdetect row-group boundaries.
-            let rg_row_counts: Vec<usize> = if reverse_rows {
-                let rg_metadata = file_metadata.row_groups();
-                match prepared_plan.row_selection.as_ref() {
-                    Some(row_selection) => compute_selected_rows_per_rg(
-                        &prepared_plan.row_group_indexes,
-                        rg_metadata,
-                        row_selection,
-                    )?,
-                    None => prepared_plan
-                        .row_group_indexes
-                        .iter()
-                        .map(|&idx| rg_metadata[idx].num_rows() as usize)
-                        .collect(),
+            // When reverse_rows is enabled, read each row group independently
+            // and reverse rows within it. This avoids the rg_row_counts boundary
+            // detection issue when RowFilter reduces actual row counts.
+            // Memory: O(largest RG). Modeled after Atlas's ReverseParquetSource.
+            if reverse_rows {
+                let rg_indexes = prepared_plan.row_group_indexes.clone();
+                let files_ranges_pruned_statistics =
+                    file_metrics.files_ranges_pruned_statistics.clone();
+                let reader_metadata = reader_metadata_for_reverse
+                    .expect("reader_metadata_for_reverse set when reverse_rows=true");
+
+                let physical_file_schema_for_filter = Arc::clone(&physical_file_schema);
+                let file_metrics_for_rg = file_metrics.clone();
+
+                let stream = futures::stream::try_unfold(
+                    (rg_indexes, limit),
+                    move |(mut rg_indexes, mut remaining_limit)| {
+                        let reader_metadata = Arc::clone(&reader_metadata);
+                        let mask = mask.clone();
+                        let output_schema = Arc::clone(&output_schema);
+                        let projection = projection.clone();
+                        let partitioned_file = partitioned_file.clone();
+                        let parquet_file_reader_factory =
+                            Arc::clone(&parquet_file_reader_factory);
+                        let metrics = metrics.clone();
+                        let pushdown_predicate = pushdown_predicate.clone();
+                        let physical_file_schema =
+                            Arc::clone(&physical_file_schema_for_filter);
+                        let file_metrics = file_metrics_for_rg.clone();
+
+                        async move {
+                            // Pop from back — RGs are already in reversed order
+                            let rg_idx = match rg_indexes.pop() {
+                                Some(idx) if remaining_limit != Some(0) => idx,
+                                _ => {
+                                    return Ok::<_, DataFusionError>(None);
+                                }
+                            };
+
+                            // Create a fresh reader for this single RG
+                            let reader: Box<dyn AsyncFileReader> =
+                                parquet_file_reader_factory.create_reader(
+                                    partition_index,
+                                    partitioned_file.clone(),
+                                    metadata_size_hint,
+                                    &metrics,
+                                )?;
+
+                            let mut rg_builder =
+                                ParquetRecordBatchStreamBuilder::new_with_metadata(
+                                    reader,
+                                    reader_metadata.as_ref().clone(),
+                                );
+
+                            // Apply predicate pushdown to per-RG builder
+                            if let Some(ref pred) = pushdown_filters
+                                .then_some(pushdown_predicate.as_ref())
+                                .flatten()
+                            {
+                                let row_filter = row_filter::build_row_filter(
+                                    pred,
+                                    &physical_file_schema,
+                                    rg_builder.metadata(),
+                                    reorder_predicates,
+                                    &file_metrics,
+                                );
+                                match row_filter {
+                                    Ok(Some(filter)) => {
+                                        rg_builder = rg_builder.with_row_filter(filter);
+                                    }
+                                    Ok(None) => {}
+                                    Err(_) => {}
+                                };
+                            }
+
+                            if let Some(max_predicate_cache_size) = max_predicate_cache_size
+                            {
+                                rg_builder = rg_builder
+                                    .with_max_predicate_cache_size(max_predicate_cache_size);
+                            }
+
+                            let rg_stream = rg_builder
+                                .with_projection(mask.clone())
+                                .with_batch_size(batch_size)
+                                .with_row_groups(vec![rg_idx])
+                                .build()?;
+
+                            let stream_schema = Arc::clone(rg_stream.schema());
+                            let replace_schema = !stream_schema.eq(&output_schema);
+                            let projection = projection
+                                .try_map_exprs(|expr| {
+                                    reassign_expr_columns(expr, &stream_schema)
+                                })?;
+                            let projector = projection.make_projector(&stream_schema)?;
+
+                            // Read all batches for this RG, apply projection
+                            let batches: Vec<RecordBatch> = rg_stream
+                                .map_err(DataFusionError::from)
+                                .map(|b| {
+                                    b.and_then(|b| {
+                                        let b = projector.project_batch(&b)?;
+                                        if replace_schema {
+                                            adapt_batch_schema(&b, &output_schema)
+                                        } else {
+                                            Ok(b)
+                                        }
+                                    })
+                                })
+                                .try_collect()
+                                .await?;
+
+                            // Reverse each batch, then reverse batch order
+                            let mut reversed = Vec::with_capacity(batches.len());
+                            for batch in batches.into_iter().rev() {
+                                if batch.num_rows() <= 1 {
+                                    reversed.push(batch);
+                                    continue;
+                                }
+                                let indices =
+                                    arrow::array::UInt32Array::from_iter_values(
+                                        (0..batch.num_rows() as u32).rev(),
+                                    );
+                                reversed.push(
+                                    arrow::compute::take_record_batch(&batch, &indices)?,
+                                );
+                            }
+
+                            // Apply limit across RGs
+                            if let Some(ref mut lim) = remaining_limit {
+                                let mut limited = Vec::new();
+                                for batch in reversed {
+                                    if *lim == 0 {
+                                        break;
+                                    }
+                                    let take = batch.num_rows().min(*lim);
+                                    limited.push(batch.slice(0, take));
+                                    *lim -= take;
+                                }
+                                reversed = limited;
+                            }
+
+                            Ok(Some((
+                                futures::stream::iter(
+                                    reversed.into_iter().map(Ok::<_, DataFusionError>),
+                                ),
+                                (rg_indexes, remaining_limit),
+                            )))
+                        }
+                    },
+                )
+                .try_flatten()
+                .boxed();
+
+                if let Some(file_pruner) = file_pruner {
+                    Ok(EarlyStoppingStream::new(
+                        stream,
+                        file_pruner,
+                        files_ranges_pruned_statistics,
+                    )
+                    .boxed())
+                } else {
+                    Ok(stream.boxed())
                 }
             } else {
-                vec![]
-            };
+                // Non-reverse path: one stream for all RGs
 
-            // Apply the prepared plan to the builder
-            builder = prepared_plan.apply_to_builder(builder);
+                // Apply the prepared plan to the builder
+                builder = prepared_plan.apply_to_builder(builder);
 
-            // When reverse_rows is enabled, limit must be applied AFTER row
-            // reversal (in ReversedRowGroupStream), not at the parquet reader
-            // level. Applying limit here would read the first N rows in forward
-            // order and then reverse them, giving wrong results.
-            if let Some(limit) = limit
-                && !reverse_rows
-            {
-                builder = builder.with_limit(limit)
-            }
+                if let Some(limit) = limit {
+                    builder = builder.with_limit(limit)
+                }
 
-            if let Some(max_predicate_cache_size) = max_predicate_cache_size {
-                builder = builder.with_max_predicate_cache_size(max_predicate_cache_size);
-            }
+                if let Some(max_predicate_cache_size) = max_predicate_cache_size {
+                    builder = builder.with_max_predicate_cache_size(max_predicate_cache_size);
+                }
 
-            // metrics from the arrow reader itself
-            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+                let arrow_reader_metrics = ArrowReaderMetrics::enabled();
 
-            let stream = builder
-                .with_projection(mask)
-                .with_batch_size(batch_size)
-                .with_metrics(arrow_reader_metrics.clone())
-                .build()?;
+                let stream = builder
+                    .with_projection(mask)
+                    .with_batch_size(batch_size)
+                    .with_metrics(arrow_reader_metrics.clone())
+                    .build()?;
 
-            let files_ranges_pruned_statistics =
-                file_metrics.files_ranges_pruned_statistics.clone();
-            let predicate_cache_inner_records =
-                file_metrics.predicate_cache_inner_records.clone();
-            let predicate_cache_records = file_metrics.predicate_cache_records.clone();
+                let files_ranges_pruned_statistics =
+                    file_metrics.files_ranges_pruned_statistics.clone();
+                let predicate_cache_inner_records =
+                    file_metrics.predicate_cache_inner_records.clone();
+                let predicate_cache_records = file_metrics.predicate_cache_records.clone();
 
-            let stream_schema = Arc::clone(stream.schema());
-            // Check if we need to replace the schema to handle things like differing nullability or metadata.
-            // See note below about file vs. output schema.
-            let replace_schema = !stream_schema.eq(&output_schema);
+                let stream_schema = Arc::clone(stream.schema());
+                let replace_schema = !stream_schema.eq(&output_schema);
+                let projection = projection
+                    .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
+                let projector = projection.make_projector(&stream_schema)?;
 
-            // Rebase column indices to match the narrowed stream schema.
-            // The projection expressions have indices based on physical_file_schema,
-            // but the stream only contains the columns selected by the ProjectionMask.
-            let projection = projection
-                .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
+                let stream = stream.map_err(DataFusionError::from).map(move |b| {
+                    b.and_then(|mut b| {
+                        copy_arrow_reader_metrics(
+                            &arrow_reader_metrics,
+                            &predicate_cache_inner_records,
+                            &predicate_cache_records,
+                        );
+                        b = projector.project_batch(&b)?;
+                        if replace_schema {
+                            adapt_batch_schema(&b, &output_schema)
+                        } else {
+                            Ok(b)
+                        }
+                    })
+                });
 
-            let projector = projection.make_projector(&stream_schema)?;
+                let stream: futures::stream::BoxStream<'static, Result<RecordBatch>> =
+                    stream.boxed();
 
-            let stream = stream.map_err(DataFusionError::from).map(move |b| {
-                b.and_then(|mut b| {
-                    copy_arrow_reader_metrics(
-                        &arrow_reader_metrics,
-                        &predicate_cache_inner_records,
-                        &predicate_cache_records,
-                    );
-                    // Note: per-batch row reversal is handled by ReversedRowGroupStream
-                    // (wraps the stream below), NOT here. Reversing per-batch here would
-                    // double-reverse when combined with the RG-level buffer+reverse.
-                    b = projector.project_batch(&b)?;
-                    if replace_schema {
-                        // Ensure the output batch has the expected schema.
-                        //
-                        // In DataFusion 51, SchemaAdapter::map_batch() handled
-                        // schema mismatches by casting each column via
-                        // arrow::compute::cast_with_options(). DF 52 removed
-                        // SchemaAdapter, so we restore that behaviour here.
-                        //
-                        // This handles:
-                        // - Schema/field level metadata differences
-                        // - Nullability mismatches (OPTIONAL vs NOT NULL)
-                        // - Type mismatches from schema evolution (e.g. Utf8 → Date32)
-                        // - List/Struct inner field name/nullability differences
-                        //   (e.g. List(Field("conditions", Int32, false)) vs
-                        //    List(Field("element", Int32, true)))
-                        let (stream_schema, arrays, num_rows) = b.into_parts();
-                        let adapted_arrays: Vec<ArrayRef> = arrays
-                            .iter()
-                            .enumerate()
-                            .map(|(i, array)| {
-                                let target_type = output_schema.field(i).data_type();
-                                if array.data_type() == target_type {
-                                    Ok(Arc::clone(array))
-                                } else {
-                                    // Try cast first (handles value-level conversions
-                                    // like Utf8 → Date32)
-                                    let casted = if arrow::compute::can_cast_types(
-                                        array.data_type(),
-                                        target_type,
-                                    ) {
-                                        arrow::compute::cast(array, target_type)?
-                                    } else {
-                                        Arc::clone(array)
-                                    };
-                                    // If types still differ after cast (e.g. List inner
-                                    // field name/nullability), rebuild with target type
-                                    if casted.data_type() != target_type {
-                                        let data = casted
-                                            .to_data()
-                                            .into_builder()
-                                            .data_type(target_type.clone())
-                                            .build()
-                                            .map_err(|e| {
-                                                DataFusionError::ArrowError(Box::new(e), Some(format!(
-                                                    "Failed to adapt column '{}' from {} to {}",
-                                                    stream_schema.field(i).name(),
-                                                    array.data_type(),
-                                                    target_type,
-                                                )))
-                                            })?;
-                                        Ok(arrow::array::make_array(data))
-                                    } else {
-                                        Ok(casted)
-                                    }
-                                }
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        // Note: nullability handling is left to the caller
-                        // (e.g. atlas's adapt_table_schema_for_parquet which
-                        // forces file columns nullable without touching partition
-                        // columns). We only handle type/field-name adaptation here.
-                        let options =
-                            RecordBatchOptions::new().with_row_count(Some(num_rows));
-                        RecordBatch::try_new_with_options(
-                            Arc::clone(&output_schema),
-                            adapted_arrays,
-                            &options,
-                        )
-                        .map_err(Into::into)
-                    } else {
-                        Ok(b)
-                    }
-                })
-            });
-
-            // When exact reverse is enabled, wrap the stream to buffer
-            // and reverse rows per row group. Memory cost: O(largest_RG).
-            // The limit is applied here (after reversal) instead of at the
-            // parquet reader level so that we get the correct reversed rows.
-            let stream: futures::stream::BoxStream<'static, Result<RecordBatch>> =
-                if reverse_rows {
-                    ReversedRowGroupStream::new(stream, rg_row_counts, limit).boxed()
+                if let Some(file_pruner) = file_pruner {
+                    Ok(EarlyStoppingStream::new(
+                        stream,
+                        file_pruner,
+                        files_ranges_pruned_statistics,
+                    )
+                    .boxed())
                 } else {
-                    stream.boxed()
-                };
-
-            if let Some(file_pruner) = file_pruner {
-                Ok(EarlyStoppingStream::new(
-                    stream,
-                    file_pruner,
-                    files_ranges_pruned_statistics,
-                )
-                .boxed())
-            } else {
-                Ok(stream.boxed())
+                    Ok(stream.boxed())
+                }
             }
         }))
     }
@@ -950,6 +1015,59 @@ where
 
 /// Copies metrics from ArrowReaderMetrics (the metrics collected by the
 /// arrow-rs parquet reader) to the parquet file metrics for DataFusion
+/// Adapt a RecordBatch to match the expected output schema.
+/// Handles type mismatches from schema evolution, nullability differences,
+/// and List/Struct inner field name differences.
+fn adapt_batch_schema(
+    batch: &RecordBatch,
+    output_schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let (stream_schema, arrays, num_rows) = batch.clone().into_parts();
+    let adapted_arrays: Vec<ArrayRef> = arrays
+        .iter()
+        .enumerate()
+        .map(|(i, array)| {
+            let target_type = output_schema.field(i).data_type();
+            if array.data_type() == target_type {
+                Ok(Arc::clone(array))
+            } else {
+                let casted = if arrow::compute::can_cast_types(
+                    array.data_type(),
+                    target_type,
+                ) {
+                    arrow::compute::cast(array, target_type)?
+                } else {
+                    Arc::clone(array)
+                };
+                if casted.data_type() != target_type {
+                    let data = casted
+                        .to_data()
+                        .into_builder()
+                        .data_type(target_type.clone())
+                        .build()
+                        .map_err(|e| {
+                            DataFusionError::ArrowError(
+                                Box::new(e),
+                                Some(format!(
+                                    "Failed to adapt column '{}' from {} to {}",
+                                    stream_schema.field(i).name(),
+                                    array.data_type(),
+                                    target_type,
+                                )),
+                            )
+                        })?;
+                    Ok(arrow::array::make_array(data))
+                } else {
+                    Ok(casted)
+                }
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
+    RecordBatch::try_new_with_options(Arc::clone(output_schema), adapted_arrays, &options)
+        .map_err(Into::into)
+}
+
 fn copy_arrow_reader_metrics(
     arrow_reader_metrics: &ArrowReaderMetrics,
     predicate_cache_inner_records: &Count,
