@@ -172,6 +172,54 @@ impl PreparedAccessPlan {
         Ok(self)
     }
 
+    /// Split the overall row_selection into per-RG selections.
+    /// Returns a map from RG index → RowSelection for that RG.
+    pub(crate) fn per_rg_selections(
+        &self,
+        rg_metadata: &[RowGroupMetaData],
+    ) -> HashMap<usize, parquet::arrow::arrow_reader::RowSelection> {
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+        let mut result = HashMap::new();
+        let Some(ref overall) = self.row_selection else {
+            return result;
+        };
+
+        let mut selectors = overall.iter().peekable();
+        let mut current_remaining: usize = 0;
+        let mut current_skip: bool = false;
+
+        for &rg_idx in &self.row_group_indexes {
+            let mut rows_left = rg_metadata[rg_idx].num_rows() as usize;
+            let mut rg_selectors = Vec::new();
+
+            while rows_left > 0 {
+                if current_remaining == 0 {
+                    if let Some(sel) = selectors.next() {
+                        current_remaining = sel.row_count;
+                        current_skip = sel.skip;
+                    } else {
+                        break;
+                    }
+                }
+                let consumed = rows_left.min(current_remaining);
+                if current_skip {
+                    rg_selectors.push(RowSelector::skip(consumed));
+                } else {
+                    rg_selectors.push(RowSelector::select(consumed));
+                }
+                rows_left -= consumed;
+                current_remaining -= consumed;
+            }
+
+            if !rg_selectors.is_empty() {
+                result.insert(rg_idx, RowSelection::from(rg_selectors));
+            }
+        }
+
+        result
+    }
+
     /// Apply this access plan to a ParquetRecordBatchStreamBuilder
     fn apply_to_builder(
         self,
@@ -187,45 +235,6 @@ impl PreparedAccessPlan {
 /// Compute per-row-group *selected* row counts for exact reverse buffering.
 ///
 /// `RowSelection` is a flat sequence of `RowSelector` values (alternating
-/// skip/select) applied to the concatenation of all selected row groups.
-/// To know how many rows each row group will emit, we walk both sequences
-/// in lock-step and accumulate the `select` portions per row group.
-fn compute_selected_rows_per_rg(
-    row_group_indexes: &[usize],
-    rg_metadata: &[RowGroupMetaData],
-    row_selection: &parquet::arrow::arrow_reader::RowSelection,
-) -> Result<Vec<usize>> {
-    let mut selectors = row_selection.iter();
-    let mut current_remaining: usize = 0;
-    let mut current_skip: bool = false;
-
-    let mut result = Vec::with_capacity(row_group_indexes.len());
-    for &rg_idx in row_group_indexes {
-        let mut rows_left_in_rg = rg_metadata[rg_idx].num_rows() as usize;
-        let mut selected = 0usize;
-        while rows_left_in_rg > 0 {
-            if current_remaining == 0 {
-                let Some(sel) = selectors.next() else {
-                    return Err(DataFusionError::Internal(
-                        "RowSelection ended before covering all planned row groups"
-                            .to_string(),
-                    ));
-                };
-                current_remaining = sel.row_count;
-                current_skip = sel.skip;
-            }
-            let consumed = rows_left_in_rg.min(current_remaining);
-            if !current_skip {
-                selected += consumed;
-            }
-            rows_left_in_rg -= consumed;
-            current_remaining -= consumed;
-        }
-        result.push(selected);
-    }
-    Ok(result)
-}
-
 impl FileOpener for ParquetOpener {
     fn open(&self, partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
         let file_range = partitioned_file.range.clone();
@@ -627,6 +636,7 @@ impl FileOpener for ParquetOpener {
             // Memory: O(largest RG). Modeled after Atlas's ReverseParquetSource.
             if reverse_rows {
                 let rg_indexes = prepared_plan.row_group_indexes.clone();
+                let per_rg_sels = prepared_plan.per_rg_selections(rg_metadata);
                 let files_ranges_pruned_statistics =
                     file_metrics.files_ranges_pruned_statistics.clone();
                 let reader_metadata = reader_metadata_for_reverse
@@ -635,8 +645,11 @@ impl FileOpener for ParquetOpener {
                 let physical_file_schema_for_filter = Arc::clone(&physical_file_schema);
                 let file_metrics_for_rg = file_metrics.clone();
 
+                // rg_indexes is already in reversed order [3,2,1,0].
+                // Use VecDeque to pop from front (highest RG first).
+                let rg_deque: VecDeque<usize> = rg_indexes.into_iter().collect();
                 let stream = futures::stream::try_unfold(
-                    (rg_indexes, limit),
+                    (rg_deque, limit),
                     move |(mut rg_indexes, mut remaining_limit)| {
                         let reader_metadata = Arc::clone(&reader_metadata);
                         let mask = mask.clone();
@@ -650,10 +663,11 @@ impl FileOpener for ParquetOpener {
                         let physical_file_schema =
                             Arc::clone(&physical_file_schema_for_filter);
                         let file_metrics = file_metrics_for_rg.clone();
+                        let per_rg_sels = per_rg_sels.clone();
 
                         async move {
-                            // Pop from back — RGs are already in reversed order
-                            let rg_idx = match rg_indexes.pop() {
+                            // Pop from front — RGs are in reversed order [3,2,1,0]
+                            let rg_idx = match rg_indexes.pop_front() {
                                 Some(idx) if remaining_limit != Some(0) => idx,
                                 _ => {
                                     return Ok::<_, DataFusionError>(None);
@@ -676,7 +690,7 @@ impl FileOpener for ParquetOpener {
                                 );
 
                             // Apply predicate pushdown to per-RG builder
-                            if let Some(ref pred) = pushdown_filters
+                            if let Some(pred) = pushdown_filters
                                 .then_some(pushdown_predicate.as_ref())
                                 .flatten()
                             {
@@ -696,10 +710,18 @@ impl FileOpener for ParquetOpener {
                                 };
                             }
 
-                            if let Some(max_predicate_cache_size) = max_predicate_cache_size
+                            if let Some(max_predicate_cache_size) =
+                                max_predicate_cache_size
                             {
-                                rg_builder = rg_builder
-                                    .with_max_predicate_cache_size(max_predicate_cache_size);
+                                rg_builder = rg_builder.with_max_predicate_cache_size(
+                                    max_predicate_cache_size,
+                                );
+                            }
+
+                            // Apply per-RG row selection (from page pruning)
+                            if let Some(rg_sel) = per_rg_sels.get(&rg_idx) {
+                                rg_builder =
+                                    rg_builder.with_row_selection(rg_sel.clone());
                             }
 
                             let rg_stream = rg_builder
@@ -710,10 +732,9 @@ impl FileOpener for ParquetOpener {
 
                             let stream_schema = Arc::clone(rg_stream.schema());
                             let replace_schema = !stream_schema.eq(&output_schema);
-                            let projection = projection
-                                .try_map_exprs(|expr| {
-                                    reassign_expr_columns(expr, &stream_schema)
-                                })?;
+                            let projection = projection.try_map_exprs(|expr| {
+                                reassign_expr_columns(expr, &stream_schema)
+                            })?;
                             let projector = projection.make_projector(&stream_schema)?;
 
                             // Read all batches for this RG, apply projection
@@ -739,13 +760,12 @@ impl FileOpener for ParquetOpener {
                                     reversed.push(batch);
                                     continue;
                                 }
-                                let indices =
-                                    arrow::array::UInt32Array::from_iter_values(
-                                        (0..batch.num_rows() as u32).rev(),
-                                    );
-                                reversed.push(
-                                    arrow::compute::take_record_batch(&batch, &indices)?,
+                                let indices = arrow::array::UInt32Array::from_iter_values(
+                                    (0..batch.num_rows() as u32).rev(),
                                 );
+                                reversed.push(arrow::compute::take_record_batch(
+                                    &batch, &indices,
+                                )?);
                             }
 
                             // Apply limit across RGs
@@ -795,7 +815,8 @@ impl FileOpener for ParquetOpener {
                 }
 
                 if let Some(max_predicate_cache_size) = max_predicate_cache_size {
-                    builder = builder.with_max_predicate_cache_size(max_predicate_cache_size);
+                    builder =
+                        builder.with_max_predicate_cache_size(max_predicate_cache_size);
                 }
 
                 let arrow_reader_metrics = ArrowReaderMetrics::enabled();
@@ -810,7 +831,8 @@ impl FileOpener for ParquetOpener {
                     file_metrics.files_ranges_pruned_statistics.clone();
                 let predicate_cache_inner_records =
                     file_metrics.predicate_cache_inner_records.clone();
-                let predicate_cache_records = file_metrics.predicate_cache_records.clone();
+                let predicate_cache_records =
+                    file_metrics.predicate_cache_records.clone();
 
                 let stream_schema = Arc::clone(stream.schema());
                 let replace_schema = !stream_schema.eq(&output_schema);
@@ -852,167 +874,6 @@ impl FileOpener for ParquetOpener {
     }
 }
 
-/// Buffers batches per row group, then emits them in reversed order with
-/// reversed rows within each batch. Memory: O(largest row group).
-///
-/// The input stream has row groups already in reversed order (via
-/// `PreparedAccessPlan::reverse`). This stream reverses the row order
-/// *within* each row group so the final output is in exact descending order.
-struct ReversedRowGroupStream<S> {
-    inner: S,
-    /// Number of rows in each row group (in read order, already reversed)
-    rg_row_counts: Vec<usize>,
-    /// Index of the current row group being buffered
-    current_rg: usize,
-    /// Rows remaining in the current row group
-    rows_remaining_in_rg: usize,
-    /// Buffered batches for the current row group
-    buffer: Vec<RecordBatch>,
-    /// Reversed batches ready to emit
-    output_buffer: VecDeque<RecordBatch>,
-    /// Whether the inner stream is exhausted
-    done: bool,
-    /// Optional row limit (applied after reversal for correct results)
-    remaining_limit: Option<usize>,
-}
-
-impl<S> ReversedRowGroupStream<S> {
-    fn new(inner: S, rg_row_counts: Vec<usize>, limit: Option<usize>) -> Self {
-        // Skip leading empty RGs (all rows filtered by RowSelection).
-        // Without this, rows_remaining_in_rg=0 causes the first batch from
-        // the next real RG to immediately trigger flush_buffer(), attributing
-        // it to the wrong (empty) RG.
-        let mut current_rg = 0;
-        while current_rg < rg_row_counts.len() && rg_row_counts[current_rg] == 0 {
-            current_rg += 1;
-        }
-        let rows_remaining = rg_row_counts.get(current_rg).copied().unwrap_or(0);
-        Self {
-            inner,
-            rg_row_counts,
-            current_rg,
-            rows_remaining_in_rg: rows_remaining,
-            buffer: Vec::new(),
-            output_buffer: VecDeque::new(),
-            done: false,
-            remaining_limit: limit,
-        }
-    }
-
-    /// Truncate batch to remaining limit and update the counter.
-    /// Returns the (possibly truncated) batch.
-    fn apply_limit(&mut self, batch: RecordBatch) -> RecordBatch {
-        if let Some(remaining) = self.remaining_limit.as_mut() {
-            let rows = batch.num_rows();
-            if rows <= *remaining {
-                *remaining -= rows;
-                batch
-            } else {
-                let truncated = batch.slice(0, *remaining);
-                *remaining = 0;
-                truncated
-            }
-        } else {
-            batch
-        }
-    }
-
-    /// Reverse the buffered batches: reverse batch order, reverse rows
-    /// within each batch, and move them to output_buffer.
-    fn flush_buffer(&mut self) -> Result<()> {
-        let batches = std::mem::take(&mut self.buffer);
-        for batch in batches.into_iter().rev() {
-            if batch.num_rows() <= 1 {
-                self.output_buffer.push_back(batch);
-                continue;
-            }
-            let indices = arrow::array::UInt32Array::from_iter_values(
-                (0..batch.num_rows() as u32).rev(),
-            );
-            let reversed = arrow::compute::take_record_batch(&batch, &indices)?;
-            self.output_buffer.push_back(reversed);
-        }
-        // Advance to next row group, skipping any empty RGs (all rows
-        // filtered by RowSelection). Without this skip, rows_remaining_in_rg=0
-        // would cause the next batch to immediately trigger another flush,
-        // splitting a real RG's batches across two flush cycles.
-        self.current_rg += 1;
-        while self.current_rg < self.rg_row_counts.len()
-            && self.rg_row_counts[self.current_rg] == 0
-        {
-            self.current_rg += 1;
-        }
-        self.rows_remaining_in_rg = self
-            .rg_row_counts
-            .get(self.current_rg)
-            .copied()
-            .unwrap_or(0);
-        Ok(())
-    }
-}
-
-impl<S> Stream for ReversedRowGroupStream<S>
-where
-    S: Stream<Item = Result<RecordBatch>> + Unpin,
-{
-    type Item = Result<RecordBatch>;
-
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        // Check if limit has been reached
-        if self.remaining_limit == Some(0) {
-            return Poll::Ready(None);
-        }
-
-        // First, emit any already-reversed batches
-        if let Some(batch) = self.output_buffer.pop_front() {
-            return Poll::Ready(Some(Ok(self.apply_limit(batch))));
-        }
-
-        if self.done {
-            return Poll::Ready(None);
-        }
-
-        // Pull batches from the inner stream until we complete a row group
-        loop {
-            match ready!(self.inner.poll_next_unpin(cx)) {
-                Some(Ok(batch)) => {
-                    let num_rows = batch.num_rows();
-                    self.buffer.push(batch);
-                    self.rows_remaining_in_rg =
-                        self.rows_remaining_in_rg.saturating_sub(num_rows);
-
-                    if self.rows_remaining_in_rg == 0 {
-                        // Row group complete — flush buffer
-                        if let Err(e) = self.flush_buffer() {
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                        if let Some(batch) = self.output_buffer.pop_front() {
-                            return Poll::Ready(Some(Ok(self.apply_limit(batch))));
-                        }
-                    }
-                }
-                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                None => {
-                    self.done = true;
-                    // Flush any remaining buffered batches
-                    if !self.buffer.is_empty()
-                        && let Err(e) = self.flush_buffer()
-                    {
-                        return Poll::Ready(Some(Err(e)));
-                    }
-                    if let Some(batch) = self.output_buffer.pop_front() {
-                        return Poll::Ready(Some(Ok(self.apply_limit(batch))));
-                    }
-                    return Poll::Ready(None);
-                }
-            }
-        }
-    }
-}
-
 /// Copies metrics from ArrowReaderMetrics (the metrics collected by the
 /// arrow-rs parquet reader) to the parquet file metrics for DataFusion
 /// Adapt a RecordBatch to match the expected output schema.
@@ -1031,14 +892,12 @@ fn adapt_batch_schema(
             if array.data_type() == target_type {
                 Ok(Arc::clone(array))
             } else {
-                let casted = if arrow::compute::can_cast_types(
-                    array.data_type(),
-                    target_type,
-                ) {
-                    arrow::compute::cast(array, target_type)?
-                } else {
-                    Arc::clone(array)
-                };
+                let casted =
+                    if arrow::compute::can_cast_types(array.data_type(), target_type) {
+                        arrow::compute::cast(array, target_type)?
+                    } else {
+                        Arc::clone(array)
+                    };
                 if casted.data_type() != target_type {
                     let data = casted
                         .to_data()
@@ -1405,9 +1264,7 @@ mod test {
     use std::pin::Pin;
     use std::sync::Arc;
 
-    use super::{
-        ConstantColumns, compute_selected_rows_per_rg, constant_columns_from_stats,
-    };
+    use super::{ConstantColumns, constant_columns_from_stats};
     use crate::{DefaultParquetFileReaderFactory, RowGroupAccess, opener::ParquetOpener};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use bytes::{BufMut, BytesMut};
@@ -1430,7 +1287,6 @@ mod test {
     use futures::{Stream, StreamExt};
     use object_store::{ObjectStore, memory::InMemory, path::Path};
     use parquet::arrow::ArrowWriter;
-    use parquet::file::metadata::RowGroupMetaData;
     use parquet::file::properties::WriterProperties;
 
     /// Builder for creating [`ParquetOpener`] instances with sensible defaults for tests.
@@ -2729,87 +2585,6 @@ mod test {
     //   reverse_row_groups only: Inexact — RGs reversed, rows within RG still ASC.
     //   reverse_row_groups + reverse_rows: Exact — globally DESC.
     //
-    // The helper `compute_selected_rows_per_rg` is also unit-tested below, since a
-    // `RowSelection` produced by page pruning can make the parquet stream emit
-    // fewer rows per RG than `RowGroupMetaData::num_rows()` would suggest.
-
-    /// Build a `RowSelection` from a flat list of `(skip, row_count)` pairs.
-    fn row_selection_from_pairs(
-        pairs: &[(bool, usize)],
-    ) -> parquet::arrow::arrow_reader::RowSelection {
-        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
-        let selectors: Vec<RowSelector> = pairs
-            .iter()
-            .map(|&(skip, n)| {
-                if skip {
-                    RowSelector::skip(n)
-                } else {
-                    RowSelector::select(n)
-                }
-            })
-            .collect();
-        RowSelection::from(selectors)
-    }
-
-    /// Build a stub `RowGroupMetaData` with the given row count.
-    ///
-    /// `compute_selected_rows_per_rg` only reads `num_rows()` from the metadata,
-    /// so we can construct a minimal one with just that field populated.
-    fn stub_rg(num_rows: i64) -> RowGroupMetaData {
-        use parquet::schema::types::{SchemaDescriptor, Type};
-        let schema = Arc::new(SchemaDescriptor::new(Arc::new(
-            Type::group_type_builder("schema").build().unwrap(),
-        )));
-        RowGroupMetaData::builder(schema)
-            .set_num_rows(num_rows)
-            .build()
-            .unwrap()
-    }
-
-    #[test]
-    fn test_compute_selected_rows_per_rg_no_skip() {
-        // Selection that selects everything → output == raw num_rows per RG.
-        let rgs = vec![stub_rg(4), stub_rg(6), stub_rg(5)];
-        let sel = row_selection_from_pairs(&[(false, 15)]);
-        let counts = compute_selected_rows_per_rg(&[0, 1, 2], &rgs, &sel).unwrap();
-        assert_eq!(counts, vec![4, 6, 5]);
-    }
-
-    #[test]
-    fn test_compute_selected_rows_per_rg_skip_spanning_rgs() {
-        // RG sizes: [4, 6, 5] = 15 rows total.
-        // Selection: skip 5, select 7, skip 3 → rows [6..=12] chosen.
-        //   RG0 (rows 0..4)  : skip all 4       → 0 selected
-        //   RG1 (rows 4..10) : skip 1, select 5 → 5 selected
-        //   RG2 (rows 10..15): select 2, skip 3 → 2 selected
-        let rgs = vec![stub_rg(4), stub_rg(6), stub_rg(5)];
-        let sel = row_selection_from_pairs(&[(true, 5), (false, 7), (true, 3)]);
-        let counts = compute_selected_rows_per_rg(&[0, 1, 2], &rgs, &sel).unwrap();
-        assert_eq!(counts, vec![0, 5, 2]);
-    }
-
-    #[test]
-    fn test_compute_selected_rows_per_rg_all_skipped() {
-        // Every row is skipped — each RG emits 0 rows.
-        let rgs = vec![stub_rg(3), stub_rg(3)];
-        let sel = row_selection_from_pairs(&[(true, 6)]);
-        let counts = compute_selected_rows_per_rg(&[0, 1], &rgs, &sel).unwrap();
-        assert_eq!(counts, vec![0, 0]);
-    }
-
-    #[test]
-    fn test_compute_selected_rows_per_rg_short_selection_errors() {
-        // Selection covers only 5 rows but RGs sum to 10 → must error instead of
-        // silently returning garbage counts.
-        let rgs = vec![stub_rg(5), stub_rg(5)];
-        let sel = row_selection_from_pairs(&[(false, 5)]);
-        let err = compute_selected_rows_per_rg(&[0, 1], &rgs, &sel).unwrap_err();
-        assert!(
-            format!("{err}").contains("RowSelection ended before"),
-            "unexpected error: {err}"
-        );
-    }
-
     #[tokio::test]
     async fn test_exact_reverse_scan_multi_rg_produces_global_desc() {
         // Three RGs, each with an ascending run. With reverse_row_groups +
@@ -3137,15 +2912,5 @@ mod test {
             vec![12, 11, 10, 9, 4, 3, 2, 1],
             "empty RG (all rows skipped) must be handled without corrupting order"
         );
-    }
-
-    #[test]
-    fn test_compute_selected_rows_per_rg_with_fully_skipped_middle_rg() {
-        // RG sizes: [4, 4, 4]. RG1 fully skipped.
-        // Selection: select 4, skip 4, select 4
-        let rgs = vec![stub_rg(4), stub_rg(4), stub_rg(4)];
-        let sel = row_selection_from_pairs(&[(false, 4), (true, 4), (false, 4)]);
-        let counts = compute_selected_rows_per_rg(&[0, 1, 2], &rgs, &sel).unwrap();
-        assert_eq!(counts, vec![4, 0, 4], "middle RG fully skipped → 0 rows");
     }
 }

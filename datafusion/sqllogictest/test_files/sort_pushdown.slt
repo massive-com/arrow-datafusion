@@ -1692,6 +1692,105 @@ DROP TABLE exact_rev_pushdown_parquet;
 statement ok
 SET datafusion.execution.parquet.pushdown_filters = false;
 
+# Test 12.10: Multi-RG exact reverse — create a file with small row groups
+# to verify per-RG independent reverse works across RG boundaries.
+
+statement ok
+SET datafusion.execution.parquet.enable_exact_reverse_scan = true;
+
+statement ok
+SET datafusion.execution.parquet.max_row_group_size = 3;
+
+statement ok
+CREATE TABLE exact_rev_multi_rg_data(id INT, value INT) AS VALUES
+(1, 10), (2, 20), (3, 30), (4, 40), (5, 50),
+(6, 60), (7, 70), (8, 80), (9, 90), (10, 100);
+
+query I
+COPY (SELECT * FROM exact_rev_multi_rg_data ORDER BY id ASC)
+TO 'test_files/scratch/sort_pushdown/exact_rev_multi_rg.parquet';
+----
+10
+
+statement ok
+CREATE EXTERNAL TABLE exact_rev_multi_rg(id INT, value INT)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/sort_pushdown/exact_rev_multi_rg.parquet'
+WITH ORDER (id ASC);
+
+# Sort removed (Exact), correct DESC results across multiple row groups
+query TT
+EXPLAIN SELECT * FROM exact_rev_multi_rg ORDER BY id DESC;
+----
+logical_plan
+01)Sort: exact_rev_multi_rg.id DESC NULLS FIRST
+02)--TableScan: exact_rev_multi_rg projection=[id, value]
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/exact_rev_multi_rg.parquet]]}, projection=[id, value], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet, scan_direction=Reversed
+
+query II
+SELECT * FROM exact_rev_multi_rg ORDER BY id DESC;
+----
+10 100
+9 90
+8 80
+7 70
+6 60
+5 50
+4 40
+3 30
+2 20
+1 10
+
+# LIMIT across RG boundaries (limit=4 spans RGs of size 3)
+query II
+SELECT * FROM exact_rev_multi_rg ORDER BY id DESC LIMIT 4;
+----
+10 100
+9 90
+8 80
+7 70
+
+# Test 12.11: Multi-RG + pushdown_filters — per-RG RowFilter applied correctly
+statement ok
+SET datafusion.execution.parquet.pushdown_filters = true;
+
+statement ok
+CREATE EXTERNAL TABLE exact_rev_multi_rg_filtered(id INT, value INT)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/sort_pushdown/exact_rev_multi_rg.parquet'
+WITH ORDER (id ASC);
+
+query II
+SELECT * FROM exact_rev_multi_rg_filtered WHERE value > 50 ORDER BY id DESC;
+----
+10 100
+9 90
+8 80
+7 70
+6 60
+
+query II
+SELECT * FROM exact_rev_multi_rg_filtered WHERE value > 50 ORDER BY id DESC LIMIT 3;
+----
+10 100
+9 90
+8 80
+
+statement ok
+DROP TABLE exact_rev_multi_rg_filtered;
+
+statement ok
+SET datafusion.execution.parquet.pushdown_filters = false;
+
+statement ok
+SET datafusion.execution.parquet.max_row_group_size = 1048576;
+
+statement ok
+DROP TABLE exact_rev_multi_rg;
+
+statement ok
+DROP TABLE exact_rev_multi_rg_data;
+
 # Cleanup exact reverse test tables
 statement ok
 DROP TABLE exact_rev_data;

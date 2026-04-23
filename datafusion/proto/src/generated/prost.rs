@@ -1607,6 +1607,9 @@ pub struct ParquetScanExecNode {
     pub parquet_options: ::core::option::Option<
         super::datafusion_common::TableParquetOptions,
     >,
+    /// Runtime reverse-scan flags set by PushdownSort optimizer.
+    /// Must be preserved across proto roundtrips so that remote executors
+    /// produce correctly reversed output after SortExec removal.
     #[prost(bool, tag = "5")]
     pub reverse_row_groups: bool,
     #[prost(bool, tag = "6")]
