@@ -1524,6 +1524,283 @@ SELECT * FROM multi_partition_parquet ORDER BY id ASC;
 statement ok
 SET datafusion.execution.target_partitions = 2;
 
+# ============================================================================
+# Test 12: Exact Reverse Scan
+# ============================================================================
+# When enable_exact_reverse_scan=true, the Sort operator is removed entirely
+# and fetch is pushed down to the scan.
+
+# Enable exact reverse scan BEFORE creating table so ParquetSource picks it up
+statement ok
+SET datafusion.execution.parquet.enable_exact_reverse_scan = true;
+
+statement ok
+CREATE TABLE exact_rev_data(id INT, value INT, name VARCHAR) AS VALUES
+(1, 100, 'a'), (2, 200, 'b'), (3, 300, 'c'), (4, 400, 'd'), (5, 500, 'e'),
+(6, 600, 'f'), (7, 700, 'g'), (8, 800, 'h'), (9, 900, 'i'), (10, 1000, 'j');
+
+query I
+COPY (SELECT * FROM exact_rev_data ORDER BY id ASC)
+TO 'test_files/scratch/sort_pushdown/exact_rev_data.parquet';
+----
+10
+
+statement ok
+CREATE EXTERNAL TABLE exact_rev_parquet(id INT, value INT, name VARCHAR)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/sort_pushdown/exact_rev_data.parquet'
+WITH ORDER (id ASC);
+
+# Test 12.1: Sort is removed, scan_direction=Reversed (exact), no SortExec
+query TT
+EXPLAIN SELECT * FROM exact_rev_parquet ORDER BY id DESC;
+----
+logical_plan
+01)Sort: exact_rev_parquet.id DESC NULLS FIRST
+02)--TableScan: exact_rev_parquet projection=[id, value, name]
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/exact_rev_data.parquet]]}, projection=[id, value, name], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet, scan_direction=Reversed
+
+# Test 12.2: Results are correct in DESC order
+query IIT
+SELECT * FROM exact_rev_parquet ORDER BY id DESC;
+----
+10 1000 j
+9 900 i
+8 800 h
+7 700 g
+6 600 f
+5 500 e
+4 400 d
+3 300 c
+2 200 b
+1 100 a
+
+# Test 12.3: Sort removed, fetch pushed to scan (applied after row reversal in opener)
+query TT
+EXPLAIN SELECT * FROM exact_rev_parquet ORDER BY id DESC LIMIT 3;
+----
+logical_plan
+01)Sort: exact_rev_parquet.id DESC NULLS FIRST, fetch=3
+02)--TableScan: exact_rev_parquet projection=[id, value, name]
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/exact_rev_data.parquet]]}, projection=[id, value, name], limit=3, output_ordering=[id@0 ASC NULLS LAST], file_type=parquet, scan_direction=Reversed
+
+# Test 12.4: Results correct with LIMIT
+query IIT
+SELECT * FROM exact_rev_parquet ORDER BY id DESC LIMIT 3;
+----
+10 1000 j
+9 900 i
+8 800 h
+
+# Test 12.5: OFFSET + LIMIT with exact reverse
+query TT
+EXPLAIN SELECT * FROM exact_rev_parquet ORDER BY id DESC LIMIT 3 OFFSET 2;
+----
+logical_plan
+01)Limit: skip=2, fetch=3
+02)--Sort: exact_rev_parquet.id DESC NULLS FIRST, fetch=5
+03)----TableScan: exact_rev_parquet projection=[id, value, name]
+physical_plan
+01)GlobalLimitExec: skip=2, fetch=3
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/exact_rev_data.parquet]]}, projection=[id, value, name], limit=5, output_ordering=[id@0 ASC NULLS LAST], file_type=parquet, scan_direction=Reversed
+
+# Test 12.6: Results correct with OFFSET + LIMIT
+query IIT
+SELECT * FROM exact_rev_parquet ORDER BY id DESC LIMIT 3 OFFSET 2;
+----
+8 800 h
+7 700 g
+6 600 f
+
+# Test 12.7: ASC order should NOT use reverse scan (same direction as source)
+query TT
+EXPLAIN SELECT * FROM exact_rev_parquet ORDER BY id ASC LIMIT 3;
+----
+logical_plan
+01)Sort: exact_rev_parquet.id ASC NULLS LAST, fetch=3
+02)--TableScan: exact_rev_parquet projection=[id, value, name]
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/exact_rev_data.parquet]]}, projection=[id, value, name], limit=3, output_ordering=[id@0 ASC NULLS LAST], file_type=parquet
+
+# Test 12.8: Verify default (exact_reverse=false) keeps Sort as TopK
+statement ok
+SET datafusion.execution.parquet.enable_exact_reverse_scan = false;
+
+statement ok
+CREATE EXTERNAL TABLE exact_rev_disabled_parquet(id INT, value INT, name VARCHAR)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/sort_pushdown/exact_rev_data.parquet'
+WITH ORDER (id ASC);
+
+query TT
+EXPLAIN SELECT * FROM exact_rev_disabled_parquet ORDER BY id DESC LIMIT 3;
+----
+logical_plan
+01)Sort: exact_rev_disabled_parquet.id DESC NULLS FIRST, fetch=3
+02)--TableScan: exact_rev_disabled_parquet projection=[id, value, name]
+physical_plan
+01)SortExec: TopK(fetch=3), expr=[id@0 DESC], preserve_partitioning=[false]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/exact_rev_data.parquet]]}, projection=[id, value, name], file_type=parquet, predicate=DynamicFilter [ empty ], reverse_row_groups=true
+
+# Test 12.9: Exact reverse works correctly with pushdown_filters enabled.
+# RowFilter may reduce actual rows below rg_row_counts, but
+# ReversedRowGroupStream handles this by flushing all remaining
+# buffered batches when the stream ends.
+
+statement ok
+SET datafusion.execution.parquet.enable_exact_reverse_scan = true;
+
+statement ok
+SET datafusion.execution.parquet.pushdown_filters = true;
+
+statement ok
+CREATE EXTERNAL TABLE exact_rev_pushdown_parquet(id INT, value INT, name VARCHAR)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/sort_pushdown/exact_rev_data.parquet'
+WITH ORDER (id ASC);
+
+# Sort removed (Exact), scan_direction=Reversed, with predicate pushed down
+query TT
+EXPLAIN SELECT * FROM exact_rev_pushdown_parquet WHERE value > 500 ORDER BY id DESC LIMIT 3;
+----
+logical_plan
+01)Sort: exact_rev_pushdown_parquet.id DESC NULLS FIRST, fetch=3
+02)--Filter: exact_rev_pushdown_parquet.value > Int32(500)
+03)----TableScan: exact_rev_pushdown_parquet projection=[id, value, name], partial_filters=[exact_rev_pushdown_parquet.value > Int32(500)]
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/exact_rev_data.parquet]]}, projection=[id, value, name], limit=3, output_ordering=[id@0 ASC NULLS LAST], file_type=parquet, predicate=value@1 > 500, scan_direction=Reversed, pruning_predicate=value_null_count@1 != row_count@2 AND value_max@0 > 500, required_guarantees=[]
+
+# Results correct in DESC order with filter
+query IIT
+SELECT * FROM exact_rev_pushdown_parquet WHERE value > 500 ORDER BY id DESC LIMIT 3;
+----
+10 1000 j
+9 900 i
+8 800 h
+
+# Without LIMIT — all filtered rows in DESC order
+query IIT
+SELECT * FROM exact_rev_pushdown_parquet WHERE value > 500 ORDER BY id DESC;
+----
+10 1000 j
+9 900 i
+8 800 h
+7 700 g
+6 600 f
+
+statement ok
+DROP TABLE exact_rev_pushdown_parquet;
+
+statement ok
+SET datafusion.execution.parquet.pushdown_filters = false;
+
+# Test 12.10: Multi-RG exact reverse — create a file with small row groups
+# to verify per-RG independent reverse works across RG boundaries.
+
+statement ok
+SET datafusion.execution.parquet.enable_exact_reverse_scan = true;
+
+statement ok
+SET datafusion.execution.parquet.max_row_group_size = 3;
+
+statement ok
+CREATE TABLE exact_rev_multi_rg_data(id INT, value INT) AS VALUES
+(1, 10), (2, 20), (3, 30), (4, 40), (5, 50),
+(6, 60), (7, 70), (8, 80), (9, 90), (10, 100);
+
+query I
+COPY (SELECT * FROM exact_rev_multi_rg_data ORDER BY id ASC)
+TO 'test_files/scratch/sort_pushdown/exact_rev_multi_rg.parquet';
+----
+10
+
+statement ok
+CREATE EXTERNAL TABLE exact_rev_multi_rg(id INT, value INT)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/sort_pushdown/exact_rev_multi_rg.parquet'
+WITH ORDER (id ASC);
+
+# Sort removed (Exact), correct DESC results across multiple row groups
+query TT
+EXPLAIN SELECT * FROM exact_rev_multi_rg ORDER BY id DESC;
+----
+logical_plan
+01)Sort: exact_rev_multi_rg.id DESC NULLS FIRST
+02)--TableScan: exact_rev_multi_rg projection=[id, value]
+physical_plan DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/exact_rev_multi_rg.parquet]]}, projection=[id, value], output_ordering=[id@0 ASC NULLS LAST], file_type=parquet, scan_direction=Reversed
+
+query II
+SELECT * FROM exact_rev_multi_rg ORDER BY id DESC;
+----
+10 100
+9 90
+8 80
+7 70
+6 60
+5 50
+4 40
+3 30
+2 20
+1 10
+
+# LIMIT across RG boundaries (limit=4 spans RGs of size 3)
+query II
+SELECT * FROM exact_rev_multi_rg ORDER BY id DESC LIMIT 4;
+----
+10 100
+9 90
+8 80
+7 70
+
+# Test 12.11: Multi-RG + pushdown_filters — per-RG RowFilter applied correctly
+statement ok
+SET datafusion.execution.parquet.pushdown_filters = true;
+
+statement ok
+CREATE EXTERNAL TABLE exact_rev_multi_rg_filtered(id INT, value INT)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/sort_pushdown/exact_rev_multi_rg.parquet'
+WITH ORDER (id ASC);
+
+query II
+SELECT * FROM exact_rev_multi_rg_filtered WHERE value > 50 ORDER BY id DESC;
+----
+10 100
+9 90
+8 80
+7 70
+6 60
+
+query II
+SELECT * FROM exact_rev_multi_rg_filtered WHERE value > 50 ORDER BY id DESC LIMIT 3;
+----
+10 100
+9 90
+8 80
+
+statement ok
+DROP TABLE exact_rev_multi_rg_filtered;
+
+statement ok
+SET datafusion.execution.parquet.pushdown_filters = false;
+
+statement ok
+SET datafusion.execution.parquet.max_row_group_size = 1048576;
+
+statement ok
+DROP TABLE exact_rev_multi_rg;
+
+statement ok
+DROP TABLE exact_rev_multi_rg_data;
+
+# Cleanup exact reverse test tables
+statement ok
+DROP TABLE exact_rev_data;
+
+statement ok
+DROP TABLE exact_rev_parquet;
+
+statement ok
+DROP TABLE exact_rev_disabled_parquet;
+
 # Cleanup
 statement ok
 DROP TABLE reversed_high;

@@ -33,9 +33,9 @@ use std::sync::Arc;
 
 use crate::physical_optimizer::test_utils::{
     OptimizationTest, coalesce_batches_exec, coalesce_partitions_exec, parquet_exec,
-    parquet_exec_with_sort, projection_exec, projection_exec_with_alias,
-    repartition_exec, schema, simple_projection_exec, sort_exec, sort_exec_with_fetch,
-    sort_expr, sort_expr_named, test_scan_with_ordering,
+    parquet_exec_with_sort, parquet_exec_with_sort_exact_reverse, projection_exec,
+    projection_exec_with_alias, repartition_exec, schema, simple_projection_exec,
+    sort_exec, sort_exec_with_fetch, sort_expr, sort_expr_named, test_scan_with_ordering,
 };
 
 #[test]
@@ -1035,6 +1035,122 @@ fn test_sort_pushdown_with_test_scan_arbitrary_ordering() {
         Ok:
           - SortExec: expr=[a@0 ASC, b@1 DESC NULLS LAST], preserve_partitioning=[false]
           -   TestScan: output_ordering=[a@0 ASC, b@1 ASC], requested_ordering=[a@0 ASC, b@1 DESC NULLS LAST]
+    "
+    );
+}
+
+// ============================================================================
+// EXACT REVERSE SCAN TESTS
+// ============================================================================
+// These tests verify behavior when exact_reverse is enabled on ParquetSource.
+// With exact reverse, the Sort operator is removed entirely and fetch is pushed
+// down to the scan.
+
+#[test]
+fn test_exact_reverse_removes_sort() {
+    // With exact_reverse=true, Sort should be removed entirely
+    let schema = schema();
+    let a = sort_expr("a", &schema);
+    let source_ordering = LexOrdering::new(vec![a.clone()]).unwrap();
+    let source =
+        parquet_exec_with_sort_exact_reverse(schema.clone(), vec![source_ordering]);
+
+    let desc_ordering = LexOrdering::new(vec![a.reverse()]).unwrap();
+    let plan = sort_exec(desc_ordering, source);
+
+    insta::assert_snapshot!(
+        OptimizationTest::new(plan, PushdownSort::new(), true),
+        @r"
+    OptimizationTest:
+      input:
+        - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
+        -   DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet
+      output:
+        Ok:
+          - DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet, scan_direction=Reversed
+    "
+    );
+}
+
+#[test]
+fn test_exact_reverse_with_fetch_pushes_limit() {
+    // With exact_reverse=true, Sort with fetch should be removed and fetch
+    // pushed down to the scan
+    let schema = schema();
+    let a = sort_expr("a", &schema);
+    let source_ordering = LexOrdering::new(vec![a.clone()]).unwrap();
+    let source =
+        parquet_exec_with_sort_exact_reverse(schema.clone(), vec![source_ordering]);
+
+    let desc_ordering = LexOrdering::new(vec![a.reverse()]).unwrap();
+    let plan = sort_exec_with_fetch(desc_ordering, Some(10), source);
+
+    insta::assert_snapshot!(
+        OptimizationTest::new(plan, PushdownSort::new(), true),
+        @r"
+    OptimizationTest:
+      input:
+        - SortExec: TopK(fetch=10), expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
+        -   DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet
+      output:
+        Ok:
+          - DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], limit=10, output_ordering=[a@0 ASC], file_type=parquet, scan_direction=Reversed
+    "
+    );
+}
+
+#[test]
+fn test_exact_reverse_through_projection_with_fetch() {
+    // Exact reverse with fetch pushes through projection
+    let schema = schema();
+    let a = sort_expr("a", &schema);
+    let source_ordering = LexOrdering::new(vec![a.clone()]).unwrap();
+    let source =
+        parquet_exec_with_sort_exact_reverse(schema.clone(), vec![source_ordering]);
+
+    let projection = simple_projection_exec(source, vec![0, 1]);
+
+    let desc_ordering = LexOrdering::new(vec![a.reverse()]).unwrap();
+    let plan = sort_exec_with_fetch(desc_ordering, Some(5), projection);
+
+    insta::assert_snapshot!(
+        OptimizationTest::new(plan, PushdownSort::new(), true),
+        @r"
+    OptimizationTest:
+      input:
+        - SortExec: TopK(fetch=5), expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
+        -   ProjectionExec: expr=[a@0 as a, b@1 as b]
+        -     DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet
+      output:
+        Ok:
+          - ProjectionExec: expr=[a@0 as a, b@1 as b]
+          -   DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], limit=5, output_ordering=[a@0 ASC], file_type=parquet, scan_direction=Reversed
+    "
+    );
+}
+
+#[test]
+fn test_exact_reverse_without_fetch_no_limit() {
+    // Exact reverse without fetch: Sort removed, no limit on scan
+    let schema = schema();
+    let a = sort_expr("a", &schema);
+    let source_ordering = LexOrdering::new(vec![a.clone()]).unwrap();
+    let source =
+        parquet_exec_with_sort_exact_reverse(schema.clone(), vec![source_ordering]);
+
+    let desc_ordering = LexOrdering::new(vec![a.reverse()]).unwrap();
+    let plan = sort_exec(desc_ordering, source); // no fetch
+
+    insta::assert_snapshot!(
+        OptimizationTest::new(plan, PushdownSort::new(), true),
+        @r"
+    OptimizationTest:
+      input:
+        - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
+        -   DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet
+      output:
+        Ok:
+          - DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet, scan_direction=Reversed
     "
     );
 }

@@ -95,7 +95,16 @@ impl PhysicalOptimizerRule for PushdownSort {
             // Each node type defines its own pushdown behavior via try_pushdown_sort()
             match sort_input.try_pushdown_sort(required_ordering)? {
                 SortOrderPushdownResult::Exact { inner } => {
-                    // Data source guarantees perfect ordering - remove the Sort operator
+                    // Data source guarantees perfect ordering - remove the Sort.
+                    // If Sort had a fetch (TopK), push it into the inner plan
+                    // tree for file-level early termination. Traverse
+                    // single-child nodes (Projection, Cooperative) to reach
+                    // the leaf data source that supports with_fetch.
+                    let inner = if let Some(fetch) = sort_exec.fetch() {
+                        push_fetch_into_plan(inner, fetch)
+                    } else {
+                        inner
+                    };
                     Ok(Transformed::yes(inner))
                 }
                 SortOrderPushdownResult::Inexact { inner } => {
@@ -126,4 +135,35 @@ impl PhysicalOptimizerRule for PushdownSort {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// Push fetch (limit) into a plan tree for Exact sort pushdown.
+///
+/// Traverses single-child nodes (ProjectionExec, CooperativeExec, etc.)
+/// to find the deepest node that supports `with_fetch` (typically
+/// FileScanExec or DataSourceExec) and sets fetch on it.
+///
+/// Falls back to wrapping with GlobalLimitExec if no node supports it.
+fn push_fetch_into_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    fetch: usize,
+) -> Arc<dyn ExecutionPlan> {
+    // Try with_fetch on the current node
+    if let Some(plan_with_fetch) = plan.with_fetch(Some(fetch)) {
+        return plan_with_fetch;
+    }
+
+    // Single-child node: recurse into child, then rebuild parent
+    let children = plan.children();
+    if children.len() == 1 {
+        let child = Arc::clone(children[0]);
+        let new_child = push_fetch_into_plan(child, fetch);
+        if let Ok(rebuilt) = Arc::clone(&plan).with_new_children(vec![new_child]) {
+            return rebuilt;
+        }
+    }
+
+    // Fallback: wrap with GlobalLimitExec
+    use datafusion_physical_plan::limit::GlobalLimitExec;
+    Arc::new(GlobalLimitExec::new(plan, 0, Some(fetch)))
 }

@@ -724,6 +724,14 @@ impl protobuf::PhysicalPlanNode {
             if let Some(predicate) = predicate {
                 source = source.with_predicate(predicate);
             }
+
+            // Restore runtime reverse-scan flags from proto
+            if scan.reverse_row_groups {
+                source = source.with_reverse_row_groups(true);
+            }
+            if scan.reverse_rows {
+                source = source.with_reverse_rows(true);
+            }
             let base_config = parse_protobuf_file_scan_config(
                 base_conf,
                 ctx,
@@ -2672,6 +2680,8 @@ impl protobuf::PhysicalPlanNode {
                         )?),
                         predicate,
                         parquet_options: Some(conf.table_parquet_options().try_into()?),
+                        reverse_row_groups: conf.reverse_row_groups(),
+                        reverse_rows: conf.reverse_rows(),
                     },
                 )),
             }));

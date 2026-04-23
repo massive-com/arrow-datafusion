@@ -101,6 +101,23 @@ pub(crate) fn parquet_exec_with_sort(
     DataSourceExec::from_data_source(config)
 }
 
+/// Create a single parquet file that is sorted with exact_reverse enabled
+pub(crate) fn parquet_exec_with_sort_exact_reverse(
+    schema: SchemaRef,
+    output_ordering: Vec<LexOrdering>,
+) -> Arc<DataSourceExec> {
+    let source = ParquetSource::new(schema).with_exact_reverse(true);
+    let config = FileScanConfigBuilder::new(
+        ObjectStoreUrl::parse("test:///").unwrap(),
+        Arc::new(source),
+    )
+    .with_file(PartitionedFile::new("x".to_string(), 100))
+    .with_output_ordering(output_ordering)
+    .build();
+
+    DataSourceExec::from_data_source(config)
+}
+
 fn int64_stats() -> ColumnStatistics {
     ColumnStatistics {
         null_count: Precision::Absent,

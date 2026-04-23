@@ -29,7 +29,7 @@ use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -122,6 +122,8 @@ pub(super) struct ParquetOpener {
     /// discard partially-matched row groups because they may contain rows that
     /// sort before fully-matched groups.
     pub preserve_order: bool,
+    /// Whether to reverse rows within each batch (for Exact reverse scan)
+    pub reverse_rows: bool,
 }
 
 /// Represents a prepared access plan with optional row selection
@@ -170,6 +172,54 @@ impl PreparedAccessPlan {
         Ok(self)
     }
 
+    /// Split the overall row_selection into per-RG selections.
+    /// Returns a map from RG index → RowSelection for that RG.
+    pub(crate) fn per_rg_selections(
+        &self,
+        rg_metadata: &[RowGroupMetaData],
+    ) -> HashMap<usize, parquet::arrow::arrow_reader::RowSelection> {
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+        let mut result = HashMap::new();
+        let Some(ref overall) = self.row_selection else {
+            return result;
+        };
+
+        let mut selectors = overall.iter().peekable();
+        let mut current_remaining: usize = 0;
+        let mut current_skip: bool = false;
+
+        for &rg_idx in &self.row_group_indexes {
+            let mut rows_left = rg_metadata[rg_idx].num_rows() as usize;
+            let mut rg_selectors = Vec::new();
+
+            while rows_left > 0 {
+                if current_remaining == 0 {
+                    if let Some(sel) = selectors.next() {
+                        current_remaining = sel.row_count;
+                        current_skip = sel.skip;
+                    } else {
+                        break;
+                    }
+                }
+                let consumed = rows_left.min(current_remaining);
+                if current_skip {
+                    rg_selectors.push(RowSelector::skip(consumed));
+                } else {
+                    rg_selectors.push(RowSelector::select(consumed));
+                }
+                rows_left -= consumed;
+                current_remaining -= consumed;
+            }
+
+            if !rg_selectors.is_empty() {
+                result.insert(rg_idx, RowSelection::from(rg_selectors));
+            }
+        }
+
+        result
+    }
+
     /// Apply this access plan to a ParquetRecordBatchStreamBuilder
     fn apply_to_builder(
         self,
@@ -182,6 +232,9 @@ impl PreparedAccessPlan {
     }
 }
 
+/// Compute per-row-group *selected* row counts for exact reverse buffering.
+///
+/// `RowSelection` is a flat sequence of `RowSelector` values (alternating
 impl FileOpener for ParquetOpener {
     fn open(&self, partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
         let file_range = partitioned_file.range.clone();
@@ -279,6 +332,10 @@ impl FileOpener for ParquetOpener {
         let max_predicate_cache_size = self.max_predicate_cache_size;
 
         let reverse_row_groups = self.reverse_row_groups;
+        let reverse_rows = self.reverse_rows;
+        let partition_index = self.partition_index;
+        let parquet_file_reader_factory = Arc::clone(&self.parquet_file_reader_factory);
+        let metrics = self.metrics.clone();
         Ok(Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
             let file_decryption_properties = encryption_context
@@ -433,6 +490,13 @@ impl FileOpener for ParquetOpener {
 
             metadata_timer.stop();
 
+            // Clone metadata before moving into builder — needed for per-RG
+            // reverse scan which creates independent builders per row group.
+            let reader_metadata_for_reverse = if reverse_rows {
+                Some(Arc::new(reader_metadata.clone()))
+            } else {
+                None
+            };
             let mut builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
                 async_file_reader,
                 reader_metadata,
@@ -441,6 +505,9 @@ impl FileOpener for ParquetOpener {
             let indices = projection.column_indices();
 
             let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
+
+            // Save the physical predicate for per-RG reverse scan filter pushdown
+            let pushdown_predicate = predicate.clone();
 
             // Filter pushdown: evaluate predicates during scan
             if let Some(predicate) = pushdown_filters.then_some(predicate).flatten() {
@@ -563,137 +630,245 @@ impl FileOpener for ParquetOpener {
                 prepared_plan = prepared_plan.reverse(file_metadata.as_ref())?;
             }
 
-            // Apply the prepared plan to the builder
-            builder = prepared_plan.apply_to_builder(builder);
+            // When reverse_rows is enabled, read each row group independently
+            // and reverse rows within it. This avoids the rg_row_counts boundary
+            // detection issue when RowFilter reduces actual row counts.
+            // Memory: O(largest RG). Modeled after Atlas's ReverseParquetSource.
+            if reverse_rows {
+                let rg_indexes = prepared_plan.row_group_indexes.clone();
+                let per_rg_sels = prepared_plan.per_rg_selections(rg_metadata);
+                let files_ranges_pruned_statistics =
+                    file_metrics.files_ranges_pruned_statistics.clone();
+                let reader_metadata = reader_metadata_for_reverse
+                    .expect("reader_metadata_for_reverse set when reverse_rows=true");
 
-            if let Some(limit) = limit {
-                builder = builder.with_limit(limit)
-            }
+                let physical_file_schema_for_filter = Arc::clone(&physical_file_schema);
+                let file_metrics_for_rg = file_metrics.clone();
 
-            if let Some(max_predicate_cache_size) = max_predicate_cache_size {
-                builder = builder.with_max_predicate_cache_size(max_predicate_cache_size);
-            }
+                // rg_indexes is already in reversed order [3,2,1,0].
+                // Use VecDeque to pop from front (highest RG first).
+                let rg_deque: VecDeque<usize> = rg_indexes.into_iter().collect();
+                let stream = futures::stream::try_unfold(
+                    (rg_deque, limit),
+                    move |(mut rg_indexes, mut remaining_limit)| {
+                        let reader_metadata = Arc::clone(&reader_metadata);
+                        let mask = mask.clone();
+                        let output_schema = Arc::clone(&output_schema);
+                        let projection = projection.clone();
+                        let partitioned_file = partitioned_file.clone();
+                        let parquet_file_reader_factory =
+                            Arc::clone(&parquet_file_reader_factory);
+                        let metrics = metrics.clone();
+                        let pushdown_predicate = pushdown_predicate.clone();
+                        let physical_file_schema =
+                            Arc::clone(&physical_file_schema_for_filter);
+                        let file_metrics = file_metrics_for_rg.clone();
+                        let per_rg_sels = per_rg_sels.clone();
 
-            // metrics from the arrow reader itself
-            let arrow_reader_metrics = ArrowReaderMetrics::enabled();
-
-            let stream = builder
-                .with_projection(mask)
-                .with_batch_size(batch_size)
-                .with_metrics(arrow_reader_metrics.clone())
-                .build()?;
-
-            let files_ranges_pruned_statistics =
-                file_metrics.files_ranges_pruned_statistics.clone();
-            let predicate_cache_inner_records =
-                file_metrics.predicate_cache_inner_records.clone();
-            let predicate_cache_records = file_metrics.predicate_cache_records.clone();
-
-            let stream_schema = Arc::clone(stream.schema());
-            // Check if we need to replace the schema to handle things like differing nullability or metadata.
-            // See note below about file vs. output schema.
-            let replace_schema = !stream_schema.eq(&output_schema);
-
-            // Rebase column indices to match the narrowed stream schema.
-            // The projection expressions have indices based on physical_file_schema,
-            // but the stream only contains the columns selected by the ProjectionMask.
-            let projection = projection
-                .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
-
-            let projector = projection.make_projector(&stream_schema)?;
-
-            let stream = stream.map_err(DataFusionError::from).map(move |b| {
-                b.and_then(|mut b| {
-                    copy_arrow_reader_metrics(
-                        &arrow_reader_metrics,
-                        &predicate_cache_inner_records,
-                        &predicate_cache_records,
-                    );
-                    b = projector.project_batch(&b)?;
-                    if replace_schema {
-                        // Ensure the output batch has the expected schema.
-                        //
-                        // In DataFusion 51, SchemaAdapter::map_batch() handled
-                        // schema mismatches by casting each column via
-                        // arrow::compute::cast_with_options(). DF 52 removed
-                        // SchemaAdapter, so we restore that behaviour here.
-                        //
-                        // This handles:
-                        // - Schema/field level metadata differences
-                        // - Nullability mismatches (OPTIONAL vs NOT NULL)
-                        // - Type mismatches from schema evolution (e.g. Utf8 → Date32)
-                        // - List/Struct inner field name/nullability differences
-                        //   (e.g. List(Field("conditions", Int32, false)) vs
-                        //    List(Field("element", Int32, true)))
-                        let (stream_schema, arrays, num_rows) = b.into_parts();
-                        let adapted_arrays: Vec<ArrayRef> = arrays
-                            .iter()
-                            .enumerate()
-                            .map(|(i, array)| {
-                                let target_type = output_schema.field(i).data_type();
-                                if array.data_type() == target_type {
-                                    Ok(Arc::clone(array))
-                                } else {
-                                    // Try cast first (handles value-level conversions
-                                    // like Utf8 → Date32)
-                                    let casted = if arrow::compute::can_cast_types(
-                                        array.data_type(),
-                                        target_type,
-                                    ) {
-                                        arrow::compute::cast(array, target_type)?
-                                    } else {
-                                        Arc::clone(array)
-                                    };
-                                    // If types still differ after cast (e.g. List inner
-                                    // field name/nullability), rebuild with target type
-                                    if casted.data_type() != target_type {
-                                        let data = casted
-                                            .to_data()
-                                            .into_builder()
-                                            .data_type(target_type.clone())
-                                            .build()
-                                            .map_err(|e| {
-                                                DataFusionError::ArrowError(Box::new(e), Some(format!(
-                                                    "Failed to adapt column '{}' from {} to {}",
-                                                    stream_schema.field(i).name(),
-                                                    array.data_type(),
-                                                    target_type,
-                                                )))
-                                            })?;
-                                        Ok(arrow::array::make_array(data))
-                                    } else {
-                                        Ok(casted)
-                                    }
+                        async move {
+                            // Pop from front — RGs are in reversed order [3,2,1,0]
+                            let rg_idx = match rg_indexes.pop_front() {
+                                Some(idx) if remaining_limit != Some(0) => idx,
+                                _ => {
+                                    return Ok::<_, DataFusionError>(None);
                                 }
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        // Note: nullability handling is left to the caller
-                        // (e.g. atlas's adapt_table_schema_for_parquet which
-                        // forces file columns nullable without touching partition
-                        // columns). We only handle type/field-name adaptation here.
-                        let options =
-                            RecordBatchOptions::new().with_row_count(Some(num_rows));
-                        RecordBatch::try_new_with_options(
-                            Arc::clone(&output_schema),
-                            adapted_arrays,
-                            &options,
-                        )
-                        .map_err(Into::into)
-                    } else {
-                        Ok(b)
-                    }
-                })
-            });
+                            };
 
-            if let Some(file_pruner) = file_pruner {
-                Ok(EarlyStoppingStream::new(
-                    stream,
-                    file_pruner,
-                    files_ranges_pruned_statistics,
+                            // Create a fresh reader for this single RG
+                            let reader: Box<dyn AsyncFileReader> =
+                                parquet_file_reader_factory.create_reader(
+                                    partition_index,
+                                    partitioned_file.clone(),
+                                    metadata_size_hint,
+                                    &metrics,
+                                )?;
+
+                            let mut rg_builder =
+                                ParquetRecordBatchStreamBuilder::new_with_metadata(
+                                    reader,
+                                    reader_metadata.as_ref().clone(),
+                                );
+
+                            // Apply predicate pushdown to per-RG builder
+                            if let Some(pred) = pushdown_filters
+                                .then_some(pushdown_predicate.as_ref())
+                                .flatten()
+                            {
+                                let row_filter = row_filter::build_row_filter(
+                                    pred,
+                                    &physical_file_schema,
+                                    rg_builder.metadata(),
+                                    reorder_predicates,
+                                    &file_metrics,
+                                );
+                                match row_filter {
+                                    Ok(Some(filter)) => {
+                                        rg_builder = rg_builder.with_row_filter(filter);
+                                    }
+                                    Ok(None) => {}
+                                    Err(_) => {}
+                                };
+                            }
+
+                            if let Some(max_predicate_cache_size) =
+                                max_predicate_cache_size
+                            {
+                                rg_builder = rg_builder.with_max_predicate_cache_size(
+                                    max_predicate_cache_size,
+                                );
+                            }
+
+                            // Apply per-RG row selection (from page pruning)
+                            if let Some(rg_sel) = per_rg_sels.get(&rg_idx) {
+                                rg_builder =
+                                    rg_builder.with_row_selection(rg_sel.clone());
+                            }
+
+                            let rg_stream = rg_builder
+                                .with_projection(mask.clone())
+                                .with_batch_size(batch_size)
+                                .with_row_groups(vec![rg_idx])
+                                .build()?;
+
+                            let stream_schema = Arc::clone(rg_stream.schema());
+                            let replace_schema = !stream_schema.eq(&output_schema);
+                            let projection = projection.try_map_exprs(|expr| {
+                                reassign_expr_columns(expr, &stream_schema)
+                            })?;
+                            let projector = projection.make_projector(&stream_schema)?;
+
+                            // Read all batches for this RG, apply projection
+                            let batches: Vec<RecordBatch> = rg_stream
+                                .map_err(DataFusionError::from)
+                                .map(|b| {
+                                    b.and_then(|b| {
+                                        let b = projector.project_batch(&b)?;
+                                        if replace_schema {
+                                            adapt_batch_schema(&b, &output_schema)
+                                        } else {
+                                            Ok(b)
+                                        }
+                                    })
+                                })
+                                .try_collect()
+                                .await?;
+
+                            // Reverse each batch, then reverse batch order
+                            let mut reversed = Vec::with_capacity(batches.len());
+                            for batch in batches.into_iter().rev() {
+                                if batch.num_rows() <= 1 {
+                                    reversed.push(batch);
+                                    continue;
+                                }
+                                let indices = arrow::array::UInt32Array::from_iter_values(
+                                    (0..batch.num_rows() as u32).rev(),
+                                );
+                                reversed.push(arrow::compute::take_record_batch(
+                                    &batch, &indices,
+                                )?);
+                            }
+
+                            // Apply limit across RGs
+                            if let Some(ref mut lim) = remaining_limit {
+                                let mut limited = Vec::new();
+                                for batch in reversed {
+                                    if *lim == 0 {
+                                        break;
+                                    }
+                                    let take = batch.num_rows().min(*lim);
+                                    limited.push(batch.slice(0, take));
+                                    *lim -= take;
+                                }
+                                reversed = limited;
+                            }
+
+                            Ok(Some((
+                                futures::stream::iter(
+                                    reversed.into_iter().map(Ok::<_, DataFusionError>),
+                                ),
+                                (rg_indexes, remaining_limit),
+                            )))
+                        }
+                    },
                 )
-                .boxed())
+                .try_flatten()
+                .boxed();
+
+                if let Some(file_pruner) = file_pruner {
+                    Ok(EarlyStoppingStream::new(
+                        stream,
+                        file_pruner,
+                        files_ranges_pruned_statistics,
+                    )
+                    .boxed())
+                } else {
+                    Ok(stream.boxed())
+                }
             } else {
-                Ok(stream.boxed())
+                // Non-reverse path: one stream for all RGs
+
+                // Apply the prepared plan to the builder
+                builder = prepared_plan.apply_to_builder(builder);
+
+                if let Some(limit) = limit {
+                    builder = builder.with_limit(limit)
+                }
+
+                if let Some(max_predicate_cache_size) = max_predicate_cache_size {
+                    builder =
+                        builder.with_max_predicate_cache_size(max_predicate_cache_size);
+                }
+
+                let arrow_reader_metrics = ArrowReaderMetrics::enabled();
+
+                let stream = builder
+                    .with_projection(mask)
+                    .with_batch_size(batch_size)
+                    .with_metrics(arrow_reader_metrics.clone())
+                    .build()?;
+
+                let files_ranges_pruned_statistics =
+                    file_metrics.files_ranges_pruned_statistics.clone();
+                let predicate_cache_inner_records =
+                    file_metrics.predicate_cache_inner_records.clone();
+                let predicate_cache_records =
+                    file_metrics.predicate_cache_records.clone();
+
+                let stream_schema = Arc::clone(stream.schema());
+                let replace_schema = !stream_schema.eq(&output_schema);
+                let projection = projection
+                    .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
+                let projector = projection.make_projector(&stream_schema)?;
+
+                let stream = stream.map_err(DataFusionError::from).map(move |b| {
+                    b.and_then(|mut b| {
+                        copy_arrow_reader_metrics(
+                            &arrow_reader_metrics,
+                            &predicate_cache_inner_records,
+                            &predicate_cache_records,
+                        );
+                        b = projector.project_batch(&b)?;
+                        if replace_schema {
+                            adapt_batch_schema(&b, &output_schema)
+                        } else {
+                            Ok(b)
+                        }
+                    })
+                });
+
+                let stream: futures::stream::BoxStream<'static, Result<RecordBatch>> =
+                    stream.boxed();
+
+                if let Some(file_pruner) = file_pruner {
+                    Ok(EarlyStoppingStream::new(
+                        stream,
+                        file_pruner,
+                        files_ranges_pruned_statistics,
+                    )
+                    .boxed())
+                } else {
+                    Ok(stream.boxed())
+                }
             }
         }))
     }
@@ -701,6 +876,57 @@ impl FileOpener for ParquetOpener {
 
 /// Copies metrics from ArrowReaderMetrics (the metrics collected by the
 /// arrow-rs parquet reader) to the parquet file metrics for DataFusion
+/// Adapt a RecordBatch to match the expected output schema.
+/// Handles type mismatches from schema evolution, nullability differences,
+/// and List/Struct inner field name differences.
+fn adapt_batch_schema(
+    batch: &RecordBatch,
+    output_schema: &SchemaRef,
+) -> Result<RecordBatch> {
+    let (stream_schema, arrays, num_rows) = batch.clone().into_parts();
+    let adapted_arrays: Vec<ArrayRef> = arrays
+        .iter()
+        .enumerate()
+        .map(|(i, array)| {
+            let target_type = output_schema.field(i).data_type();
+            if array.data_type() == target_type {
+                Ok(Arc::clone(array))
+            } else {
+                let casted =
+                    if arrow::compute::can_cast_types(array.data_type(), target_type) {
+                        arrow::compute::cast(array, target_type)?
+                    } else {
+                        Arc::clone(array)
+                    };
+                if casted.data_type() != target_type {
+                    let data = casted
+                        .to_data()
+                        .into_builder()
+                        .data_type(target_type.clone())
+                        .build()
+                        .map_err(|e| {
+                            DataFusionError::ArrowError(
+                                Box::new(e),
+                                Some(format!(
+                                    "Failed to adapt column '{}' from {} to {}",
+                                    stream_schema.field(i).name(),
+                                    array.data_type(),
+                                    target_type,
+                                )),
+                            )
+                        })?;
+                    Ok(arrow::array::make_array(data))
+                } else {
+                    Ok(casted)
+                }
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
+    RecordBatch::try_new_with_options(Arc::clone(output_schema), adapted_arrays, &options)
+        .map_err(Into::into)
+}
+
 fn copy_arrow_reader_metrics(
     arrow_reader_metrics: &ArrowReaderMetrics,
     predicate_cache_inner_records: &Count,
@@ -1035,6 +1261,7 @@ fn should_enable_page_index(
 
 #[cfg(test)]
 mod test {
+    use std::pin::Pin;
     use std::sync::Arc;
 
     use super::{ConstantColumns, constant_columns_from_stats};
@@ -1085,6 +1312,7 @@ mod test {
         max_predicate_cache_size: Option<usize>,
         reverse_row_groups: bool,
         preserve_order: bool,
+        reverse_rows: bool,
     }
 
     impl ParquetOpenerBuilder {
@@ -1111,6 +1339,7 @@ mod test {
                 max_predicate_cache_size: None,
                 reverse_row_groups: false,
                 preserve_order: false,
+                reverse_rows: false,
             }
         }
 
@@ -1165,6 +1394,12 @@ mod test {
         /// Set reverse row groups flag.
         fn with_reverse_row_groups(mut self, enable: bool) -> Self {
             self.reverse_row_groups = enable;
+            self
+        }
+
+        /// Set reverse_rows flag (Exact reverse scan: per-RG buffer + row reversal).
+        fn with_reverse_rows(mut self, enable: bool) -> Self {
+            self.reverse_rows = enable;
             self
         }
 
@@ -1231,6 +1466,7 @@ mod test {
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
                 preserve_order: self.preserve_order,
+                reverse_rows: self.reverse_rows,
             }
         }
     }
@@ -1319,7 +1555,7 @@ mod test {
     }
 
     async fn count_batches_and_rows(
-        mut stream: std::pin::Pin<
+        mut stream: Pin<
             Box<
                 dyn Stream<Item = Result<arrow::array::RecordBatch, DataFusionError>>
                     + Send,
@@ -1337,7 +1573,7 @@ mod test {
 
     /// Helper to collect all int32 values from the first column of batches
     async fn collect_int32_values(
-        mut stream: std::pin::Pin<
+        mut stream: Pin<
             Box<
                 dyn Stream<Item = Result<arrow::array::RecordBatch, DataFusionError>>
                     + Send,
@@ -2337,5 +2573,344 @@ mod test {
                 "With preserve_order, partially-matched RG0 is scanned first"
             );
         }
+    }
+
+    // ============================================================================
+    // Exact reverse scan tests
+    // ============================================================================
+    //
+    // These cover the `reverse_rows=true` path (per-RG buffer + row reversal) that
+    // is layered on top of `reverse_row_groups`:
+    //
+    //   reverse_row_groups only: Inexact — RGs reversed, rows within RG still ASC.
+    //   reverse_row_groups + reverse_rows: Exact — globally DESC.
+    //
+    #[tokio::test]
+    async fn test_exact_reverse_scan_multi_rg_produces_global_desc() {
+        // Three RGs, each with an ascending run. With reverse_row_groups +
+        // reverse_rows, the output must be globally descending.
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 =
+            record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(3) // one RG per batch
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2, batch3],
+            Some(props),
+        )
+        .await;
+
+        let schema = batch1.schema();
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        );
+
+        // Inexact (only RGs reversed; rows within RG still ASC).
+        let inexact = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_reverse_row_groups(true)
+            .build();
+        let stream = inexact.open(file.clone()).unwrap().await.unwrap();
+        let inexact_values = collect_int32_values(stream).await;
+        assert_eq!(
+            inexact_values,
+            vec![7, 8, 9, 4, 5, 6, 1, 2, 3],
+            "Inexact: RGs reversed but rows within RG stay ASC"
+        );
+
+        // Exact (reverse_rows adds per-RG row reversal → globally DESC).
+        let exact = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_reverse_row_groups(true)
+            .with_reverse_rows(true)
+            .build();
+        let stream = exact.open(file.clone()).unwrap().await.unwrap();
+        let exact_values = collect_int32_values(stream).await;
+        assert_eq!(
+            exact_values,
+            vec![9, 8, 7, 6, 5, 4, 3, 2, 1],
+            "Exact: globally sorted DESC"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_reverse_scan_applies_limit_after_reversal() {
+        // With exact reverse + limit, the limit must come from the *end* of the
+        // logical forward order, not the first N rows pre-reversal.
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)])).unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(4), Some(5), Some(6)])).unwrap();
+        let batch3 =
+            record_batch!(("a", Int32, vec![Some(7), Some(8), Some(9)])).unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(3)
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2, batch3],
+            Some(props),
+        )
+        .await;
+
+        let schema = batch1.schema();
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        );
+
+        let opener = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_reverse_row_groups(true)
+            .with_reverse_rows(true)
+            .with_limit(Some(4))
+            .build();
+        let stream = opener.open(file).unwrap().await.unwrap();
+        let values = collect_int32_values(stream).await;
+        assert_eq!(
+            values,
+            vec![9, 8, 7, 6],
+            "Limit must be applied AFTER row reversal; \
+             applying it at the parquet reader layer would produce [1,2,3,4] \
+             reversed to [4,3,2,1] — wrong."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_reverse_scan_with_row_selection_across_rgs() {
+        // Regression test for copilot review comment #2: when `row_selection`
+        // (e.g. from page pruning / pushdown filters) causes the stream to emit
+        // fewer rows per RG than `num_rows()` suggests, `ReversedRowGroupStream`
+        // must still detect RG boundaries correctly. Before the fix,
+        // `rg_row_counts` was seeded from `RowGroupMetaData::num_rows()` and the
+        // boundary detector drifted, silently mixing batches from multiple RGs.
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        // Three RGs of 4 rows each. Each RG's rows are ASC (and so are the RGs
+        // relative to one another), so forward scan = [1..12] and any correct
+        // reverse scan over the selected rows must be DESC.
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3), Some(4)]))
+                .unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(5), Some(6), Some(7), Some(8)]))
+                .unwrap();
+        let batch3 =
+            record_batch!(("a", Int32, vec![Some(9), Some(10), Some(11), Some(12)]))
+                .unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(4)
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2, batch3],
+            Some(props),
+        )
+        .await;
+
+        let schema = batch1.schema();
+
+        // Attach a ParquetAccessPlan with a per-RG RowSelection:
+        //   RG0 : skip first 2, select last 2  → selects rows {3, 4}
+        //   RG1 : select all                    → selects rows {5, 6, 7, 8}
+        //   RG2 : select first 2, skip last 2   → selects rows {9, 10}
+        //
+        // Exact reverse over this selection must return [10, 9, 8, 7, 6, 5, 4, 3].
+        use crate::ParquetAccessPlan;
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+        let mut access_plan = ParquetAccessPlan::new_all(3);
+        access_plan.scan_selection(
+            0,
+            RowSelection::from(vec![RowSelector::skip(2), RowSelector::select(2)]),
+        );
+        access_plan.scan_selection(
+            2,
+            RowSelection::from(vec![RowSelector::select(2), RowSelector::skip(2)]),
+        );
+
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        )
+        .with_extensions(Arc::new(access_plan));
+
+        let opener = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_reverse_row_groups(true)
+            .with_reverse_rows(true)
+            .build();
+        let stream = opener.open(file).unwrap().await.unwrap();
+        let values = collect_int32_values(stream).await;
+        assert_eq!(
+            values,
+            vec![10, 9, 8, 7, 6, 5, 4, 3],
+            "Exact reverse must respect row_selection when computing RG boundaries"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_reverse_scan_with_row_selection_and_limit() {
+        // Exact reverse + row_selection + limit. Must produce the top-N in DESC
+        // order taken from the selected rows (not the unselected ones).
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3), Some(4)]))
+                .unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(5), Some(6), Some(7), Some(8)]))
+                .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(4)
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2],
+            Some(props),
+        )
+        .await;
+
+        let schema = batch1.schema();
+
+        // Select only rows {2, 3, 6, 7}.
+        use crate::ParquetAccessPlan;
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+        let mut access_plan = ParquetAccessPlan::new_all(2);
+        access_plan.scan_selection(
+            0,
+            RowSelection::from(vec![
+                RowSelector::skip(1),
+                RowSelector::select(2),
+                RowSelector::skip(1),
+            ]),
+        );
+        access_plan.scan_selection(
+            1,
+            RowSelection::from(vec![
+                RowSelector::skip(1),
+                RowSelector::select(2),
+                RowSelector::skip(1),
+            ]),
+        );
+
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        )
+        .with_extensions(Arc::new(access_plan));
+
+        let opener = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_reverse_row_groups(true)
+            .with_reverse_rows(true)
+            .with_limit(Some(3))
+            .build();
+        let stream = opener.open(file).unwrap().await.unwrap();
+        let values = collect_int32_values(stream).await;
+        assert_eq!(
+            values,
+            vec![7, 6, 3],
+            "top 3 of {{2, 3, 6, 7}} in DESC order"
+        );
+    }
+
+    /// Regression test: when RowSelection skips ALL rows in an RG (empty RG),
+    /// `rg_row_counts` has a 0 entry. Without the skip-empty-RG fix,
+    /// `rows_remaining_in_rg=0` causes the first batch from the next real RG
+    /// to immediately trigger `flush_buffer()`, attributing that batch to the
+    /// wrong (empty) RG and corrupting the output order.
+    #[tokio::test]
+    async fn test_exact_reverse_scan_with_empty_rg_from_row_selection() {
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        // Three RGs of 4 rows each.
+        let batch1 =
+            record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3), Some(4)]))
+                .unwrap();
+        let batch2 =
+            record_batch!(("a", Int32, vec![Some(5), Some(6), Some(7), Some(8)]))
+                .unwrap();
+        let batch3 =
+            record_batch!(("a", Int32, vec![Some(9), Some(10), Some(11), Some(12)]))
+                .unwrap();
+
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(4)
+            .build();
+        let data_len = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch1.clone(), batch2, batch3],
+            Some(props),
+        )
+        .await;
+
+        let schema = batch1.schema();
+
+        // RG0: select all 4 rows → {1,2,3,4}
+        // RG1: skip ALL rows → empty (0 selected)
+        // RG2: select all 4 rows → {9,10,11,12}
+        use crate::ParquetAccessPlan;
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+        let mut access_plan = ParquetAccessPlan::new_all(3);
+        // RG1: skip all 4 rows
+        access_plan.scan_selection(1, RowSelection::from(vec![RowSelector::skip(4)]));
+
+        let file = PartitionedFile::new(
+            "test.parquet".to_string(),
+            u64::try_from(data_len).unwrap(),
+        )
+        .with_extensions(Arc::new(access_plan));
+
+        let opener = ParquetOpenerBuilder::new()
+            .with_store(Arc::clone(&store))
+            .with_schema(Arc::clone(&schema))
+            .with_projection_indices(&[0])
+            .with_reverse_row_groups(true)
+            .with_reverse_rows(true)
+            .build();
+        let stream = opener.open(file).unwrap().await.unwrap();
+        let values = collect_int32_values(stream).await;
+
+        // Reversed: RG2 first [12,11,10,9], skip empty RG1, then RG0 [4,3,2,1]
+        assert_eq!(
+            values,
+            vec![12, 11, 10, 9, 4, 3, 2, 1],
+            "empty RG (all rows skipped) must be handled without corrupting order"
+        );
     }
 }

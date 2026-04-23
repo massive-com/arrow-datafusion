@@ -732,6 +732,13 @@ config_namespace! {
         /// parquet reader setting. 0 means no caching.
         pub max_predicate_cache_size: Option<usize>, default = None
 
+        /// (reading) If true, reverse scans produce exact descending order
+        /// by reversing rows within each row group. This allows the Sort
+        /// operator to be removed entirely and fetch/limit to be pushed
+        /// down to the scan. If false (default), reverse scans only reverse
+        /// row group order (inexact), keeping TopK above for final sorting.
+        pub enable_exact_reverse_scan: bool, default = false
+
         // The following options affect writing to parquet files
         // and map to parquet::file::properties::WriterProperties
 
