@@ -500,12 +500,16 @@ impl ExecutionPlan for InterleaveExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // New children are no longer interleavable, which might be a bug of optimization rewrite.
-        assert_or_internal_err!(
-            can_interleave(children.iter()),
-            "Can not create InterleaveExec: new children can not be interleaved"
-        );
-        Ok(Arc::new(InterleaveExec::try_new(children)?))
+        // After optimizer rewrites (e.g. join_selection changing join modes,
+        // or a second EnforceDistribution pass), children may no longer have
+        // consistent hash partitioning. Fall back to UnionExec instead of
+        // panicking — correctness is preserved, only the interleave
+        // optimization is lost.
+        if can_interleave(children.iter()) {
+            Ok(Arc::new(InterleaveExec::try_new(children)?))
+        } else {
+            UnionExec::try_new(children)
+        }
     }
 
     fn execute(
