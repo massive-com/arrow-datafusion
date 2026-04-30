@@ -116,6 +116,23 @@ fn min_fetch(f1: Option<usize>, f2: Option<usize>) -> Option<usize> {
     }
 }
 
+/// Returns the stricter of two distribution requirements when propagating
+/// `parent_distribution` down through pass-through operators.
+///
+/// `SinglePartition` is the strictest requirement we care about for the
+/// purposes of inserting `SortPreservingMergeExec` above a partition-
+/// preserving `SortExec`. If either side requests it, we keep that.
+fn stronger_distribution(a: &Distribution, b: &Distribution) -> Distribution {
+    match (a, b) {
+        (Distribution::SinglePartition, _) | (_, Distribution::SinglePartition) => {
+            Distribution::SinglePartition
+        }
+        (Distribution::HashPartitioned(_), _) => a.clone(),
+        (_, Distribution::HashPartitioned(_)) => b.clone(),
+        _ => Distribution::UnspecifiedDistribution,
+    }
+}
+
 fn pushdown_sorts_helper(
     mut sort_push_down: SortPushDown,
 ) -> Result<Transformed<SortPushDown>> {
@@ -155,6 +172,19 @@ fn pushdown_sorts_helper(
             return pushdown_sorts_helper(sort_push_down);
         }
         sort_push_down.plan = plan;
+        // No ordering work to do at this node, but we still need to propagate
+        // the distribution requirement to children before transform_down
+        // descends. Otherwise, when we eventually reach a node where a sort
+        // must be added, `parent_distribution` has decayed to
+        // `UnspecifiedDistribution` and `add_sort_above_with_distribution`
+        // skips the wrapping `SortPreservingMergeExec`.
+        let dists = sort_push_down.plan.required_input_distribution();
+        for (idx, child) in sort_push_down.children.iter_mut().enumerate() {
+            child.data.distribution_requirement = stronger_distribution(
+                &parent_distribution,
+                dists.get(idx).unwrap_or(&Distribution::UnspecifiedDistribution),
+            );
+        }
         return Ok(Transformed::no(sort_push_down));
     };
 
@@ -234,10 +264,16 @@ fn pushdown_sorts_helper(
         {
             child.data.ordering_requirement = order;
             child.data.fetch = min_fetch(parent_fetch, child.data.fetch);
-            child.data.distribution_requirement = dists
-                .get(idx)
-                .cloned()
-                .unwrap_or(Distribution::UnspecifiedDistribution);
+            // Any sort we materialise inside this child subtree must still
+            // satisfy the strongest distribution requirement we've seen on
+            // the way down. Pass-through operators (Projection, Filter, etc.)
+            // don't change partitioning, so a `SinglePartition` requirement
+            // from a higher consumer must propagate, not get reset to this
+            // node's own (often `UnspecifiedDistribution`) input requirement.
+            child.data.distribution_requirement = stronger_distribution(
+                &parent_distribution,
+                dists.get(idx).unwrap_or(&Distribution::UnspecifiedDistribution),
+            );
         }
     } else if let Some(adjusted) = pushdown_requirement_to_children(
         &sort_push_down.plan,
@@ -253,10 +289,10 @@ fn pushdown_sorts_helper(
         {
             child.data.ordering_requirement = order;
             child.data.fetch = min_fetch(current_fetch, parent_fetch);
-            child.data.distribution_requirement = dists
-                .get(idx)
-                .cloned()
-                .unwrap_or(Distribution::UnspecifiedDistribution);
+            child.data.distribution_requirement = stronger_distribution(
+                &parent_distribution,
+                dists.get(idx).unwrap_or(&Distribution::UnspecifiedDistribution),
+            );
         }
         sort_push_down.data.ordering_requirement = None;
     } else {
