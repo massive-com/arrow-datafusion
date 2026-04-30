@@ -3676,3 +3676,33 @@ fn test_replace_order_preserving_variants_with_fetch() -> Result<()> {
 
     Ok(())
 }
+
+/// Verifies that `adjust_input_keys_ordering` returns `Transformed::no`
+/// for a simple scan plan with no key requirements, avoiding an
+/// unnecessary plan rebuild.
+#[test]
+fn adjust_input_keys_ordering_no_transform_for_scan() -> Result<()> {
+    let plan: Arc<dyn ExecutionPlan> = parquet_exec();
+    let requirements = PlanWithKeyRequirements::new_default(plan);
+    let result = adjust_input_keys_ordering(requirements)?;
+    assert!(
+        !result.transformed,
+        "expected Transformed::no for a scan plan with empty requirements"
+    );
+    Ok(())
+}
+
+/// Verifies that `adjust_input_keys_ordering` applied via `transform_down`
+/// over a filter -> scan tree returns `Transformed::no` when there are no
+/// join/aggregate key requirements.
+#[test]
+fn adjust_input_keys_ordering_no_transform_for_filter_scan() -> Result<()> {
+    let plan: Arc<dyn ExecutionPlan> = filter_exec(parquet_exec());
+    let requirements = PlanWithKeyRequirements::new_default(plan);
+    let result = requirements.transform_down(adjust_input_keys_ordering)?;
+    assert!(
+        !result.transformed,
+        "expected Transformed::no for a filter->scan tree with no key requirements"
+    );
+    Ok(())
+}
