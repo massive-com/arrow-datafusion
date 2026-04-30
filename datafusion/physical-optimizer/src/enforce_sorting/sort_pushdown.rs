@@ -182,7 +182,9 @@ fn pushdown_sorts_helper(
         for (idx, child) in sort_push_down.children.iter_mut().enumerate() {
             child.data.distribution_requirement = stronger_distribution(
                 &parent_distribution,
-                dists.get(idx).unwrap_or(&Distribution::UnspecifiedDistribution),
+                dists
+                    .get(idx)
+                    .unwrap_or(&Distribution::UnspecifiedDistribution),
             );
         }
         return Ok(Transformed::no(sort_push_down));
@@ -272,7 +274,9 @@ fn pushdown_sorts_helper(
             // node's own (often `UnspecifiedDistribution`) input requirement.
             child.data.distribution_requirement = stronger_distribution(
                 &parent_distribution,
-                dists.get(idx).unwrap_or(&Distribution::UnspecifiedDistribution),
+                dists
+                    .get(idx)
+                    .unwrap_or(&Distribution::UnspecifiedDistribution),
             );
         }
     } else if let Some(adjusted) = pushdown_requirement_to_children(
@@ -291,7 +295,9 @@ fn pushdown_sorts_helper(
             child.data.fetch = min_fetch(current_fetch, parent_fetch);
             child.data.distribution_requirement = stronger_distribution(
                 &parent_distribution,
-                dists.get(idx).unwrap_or(&Distribution::UnspecifiedDistribution),
+                dists
+                    .get(idx)
+                    .unwrap_or(&Distribution::UnspecifiedDistribution),
             );
         }
         sort_push_down.data.ordering_requirement = None;
