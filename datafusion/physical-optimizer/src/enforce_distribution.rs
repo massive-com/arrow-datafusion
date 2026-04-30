@@ -415,6 +415,9 @@ pub fn adjust_input_keys_ordering(
         || plan.as_any().downcast_ref::<WindowAggExec>().is_some()
     {
         requirements.data.clear();
+    } else if requirements.data.is_empty() {
+        // No requirements to push down and no plan changes — skip rebuild.
+        return Ok(Transformed::no(requirements));
     } else {
         // By default, push down the parent requirements to children
         for child in requirements.children.iter_mut() {
