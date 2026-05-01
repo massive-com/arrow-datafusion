@@ -19,7 +19,8 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::utils::{
-    add_sort_above, is_sort, is_sort_preserving_merge, is_union, is_window,
+    add_sort_above_with_distribution, is_sort, is_sort_preserving_merge, is_union,
+    is_window,
 };
 
 use arrow::datatypes::SchemaRef;
@@ -29,7 +30,7 @@ use datafusion_expr::JoinType;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{
-    EquivalenceProperties, add_offset_to_physical_sort_exprs,
+    Distribution, EquivalenceProperties, add_offset_to_physical_sort_exprs,
 };
 use datafusion_physical_expr_common::sort_expr::{
     LexOrdering, LexRequirement, OrderingRequirements, PhysicalSortExpr,
@@ -55,10 +56,26 @@ use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 /// of the parent node as its data.
 ///
 /// [`EnforceSorting`]: crate::enforce_sorting::EnforceSorting
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct ParentRequirements {
     ordering_requirement: Option<OrderingRequirements>,
     fetch: Option<usize>,
+    /// The distribution required by whatever consumer will sit above any
+    /// `SortExec` we materialise here. When a sort is added by `add_sort_above`
+    /// over a multi-partition input, we use this to decide whether the new
+    /// sort needs a `SortPreservingMergeExec` wrapper to produce a single
+    /// partition.
+    distribution_requirement: Distribution,
+}
+
+impl Default for ParentRequirements {
+    fn default() -> Self {
+        Self {
+            ordering_requirement: None,
+            fetch: None,
+            distribution_requirement: Distribution::UnspecifiedDistribution,
+        }
+    }
 }
 
 pub type SortPushDown = PlanContext<ParentRequirements>;
@@ -66,12 +83,19 @@ pub type SortPushDown = PlanContext<ParentRequirements>;
 /// Assigns the ordering requirement of the root node to the its children.
 pub fn assign_initial_requirements(sort_push_down: &mut SortPushDown) {
     let reqs = sort_push_down.plan.required_input_ordering();
-    for (child, requirement) in sort_push_down.children.iter_mut().zip(reqs) {
+    let dists = sort_push_down.plan.required_input_distribution();
+    for (idx, (child, requirement)) in
+        sort_push_down.children.iter_mut().zip(reqs).enumerate()
+    {
         child.data = ParentRequirements {
             ordering_requirement: requirement,
             // If the parent has a fetch value, assign it to the children
             // Or use the fetch value of the child.
             fetch: child.plan.fetch(),
+            distribution_requirement: dists
+                .get(idx)
+                .cloned()
+                .unwrap_or(Distribution::UnspecifiedDistribution),
         };
     }
 }
@@ -92,11 +116,34 @@ fn min_fetch(f1: Option<usize>, f2: Option<usize>) -> Option<usize> {
     }
 }
 
+/// Returns the stricter of two distribution requirements when propagating
+/// `parent_distribution` down through pass-through operators.
+///
+/// `SinglePartition` is the strictest requirement we care about for the
+/// purposes of inserting `SortPreservingMergeExec` above a partition-
+/// preserving `SortExec`. If either side requests it, we keep that.
+fn stronger_distribution(a: &Distribution, b: &Distribution) -> Distribution {
+    match (a, b) {
+        (Distribution::SinglePartition, _) | (_, Distribution::SinglePartition) => {
+            Distribution::SinglePartition
+        }
+        (Distribution::HashPartitioned(_), _) => a.clone(),
+        (_, Distribution::HashPartitioned(_)) => b.clone(),
+        _ => Distribution::UnspecifiedDistribution,
+    }
+}
+
 fn pushdown_sorts_helper(
     mut sort_push_down: SortPushDown,
 ) -> Result<Transformed<SortPushDown>> {
     let plan = sort_push_down.plan;
     let parent_fetch = sort_push_down.data.fetch;
+    // The distribution required by whatever sits above any new sort we add
+    // here. When this node is a SortExec we are about to remove or replace,
+    // the new sort takes the removed sort's slot, so its consumer is the
+    // grandparent — i.e. the same distribution requirement that flowed into
+    // this call.
+    let parent_distribution = sort_push_down.data.distribution_requirement.clone();
 
     let Some(parent_requirement) = sort_push_down.data.ordering_requirement.clone()
     else {
@@ -116,11 +163,28 @@ fn pushdown_sorts_helper(
             sort_push_down.data.fetch = fetch;
             sort_push_down.data.ordering_requirement =
                 Some(OrderingRequirements::from(sort_ordering));
+            // The new context now sits where the SortExec was; preserve the
+            // grandparent's distribution requirement so a subsequent
+            // `add_sort_above` knows whether to wrap in SortPreservingMergeExec.
+            sort_push_down.data.distribution_requirement = parent_distribution;
             // Recursive call to helper, so it doesn't transform_down and miss
             // the new node (previous child of sort):
             return pushdown_sorts_helper(sort_push_down);
         }
         sort_push_down.plan = plan;
+        // No ordering is being pushed down here, so only use the node's own
+        // distribution requirement. Do NOT propagate parent_distribution
+        // through partition-merging nodes (e.g. SortPreservingMergeExec):
+        // those nodes already satisfy SinglePartition themselves, so the
+        // children below them should not be forced to also produce a single
+        // partition.
+        let dists = sort_push_down.plan.required_input_distribution();
+        for (idx, child) in sort_push_down.children.iter_mut().enumerate() {
+            child.data.distribution_requirement = dists
+                .get(idx)
+                .cloned()
+                .unwrap_or(Distribution::UnspecifiedDistribution);
+        }
         return Ok(Transformed::no(sort_push_down));
     };
 
@@ -149,16 +213,21 @@ fn pushdown_sorts_helper(
             // The sort was imposing a different ordering than the one being
             // pushed down. Replace it with a sort that matches the pushed-down
             // ordering, and continue the pushdown.
-            // Add back the sort:
-            sort_push_down = add_sort_above(
+            // Add back the sort. The new sort sits where the old one did, so
+            // its consumer is the grandparent and we must respect that
+            // distribution requirement (otherwise a multi-partition input
+            // produces preserve_partitioning=true with no SPM above).
+            sort_push_down = add_sort_above_with_distribution(
                 sort_push_down,
                 parent_requirement.into_single(),
                 parent_fetch,
+                &parent_distribution,
             );
             // Update pushdown requirements:
             sort_push_down.children[0].data = ParentRequirements {
                 ordering_requirement: Some(OrderingRequirements::from(sort_ordering)),
                 fetch: sort_fetch,
+                distribution_requirement: Distribution::UnspecifiedDistribution,
             };
             return Ok(Transformed::yes(sort_push_down));
         } else {
@@ -174,6 +243,10 @@ fn pushdown_sorts_helper(
             } else {
                 Some(parent_requirement)
             };
+            // The sort was removed; carry the grandparent's distribution
+            // requirement so any sort we materialise deeper down still
+            // satisfies it.
+            sort_push_down.data.distribution_requirement = parent_distribution;
             // Recursive call to helper, so it doesn't transform_down and miss
             // the new node (previous child of sort):
             return pushdown_sorts_helper(sort_push_down);
@@ -184,10 +257,35 @@ fn pushdown_sorts_helper(
     if satisfy_parent {
         // For non-sort operators which satisfy ordering:
         let reqs = sort_push_down.plan.required_input_ordering();
+        let dists = sort_push_down.plan.required_input_distribution();
 
-        for (child, order) in sort_push_down.children.iter_mut().zip(reqs) {
+        // If this node already produces a single partition it has absorbed any
+        // SinglePartition requirement from the consumer above.  Don't push
+        // that requirement down into children that live below the merge point.
+        let effective_parent_dist =
+            if sort_push_down.plan.output_partitioning().partition_count() == 1 {
+                Distribution::UnspecifiedDistribution
+            } else {
+                parent_distribution.clone()
+            };
+
+        for (idx, (child, order)) in
+            sort_push_down.children.iter_mut().zip(reqs).enumerate()
+        {
             child.data.ordering_requirement = order;
             child.data.fetch = min_fetch(parent_fetch, child.data.fetch);
+            // Any sort we materialise inside this child subtree must still
+            // satisfy the strongest distribution requirement we've seen on
+            // the way down. Pass-through operators (Projection, Filter, etc.)
+            // don't change partitioning, so a `SinglePartition` requirement
+            // from a higher consumer must propagate, not get reset to this
+            // node's own (often `UnspecifiedDistribution`) input requirement.
+            child.data.distribution_requirement = stronger_distribution(
+                &effective_parent_dist,
+                dists
+                    .get(idx)
+                    .unwrap_or(&Distribution::UnspecifiedDistribution),
+            );
         }
     } else if let Some(adjusted) = pushdown_requirement_to_children(
         &sort_push_down.plan,
@@ -197,17 +295,29 @@ fn pushdown_sorts_helper(
         // For operators that can take a sort pushdown, continue with updated
         // requirements:
         let current_fetch = sort_push_down.plan.fetch();
-        for (child, order) in sort_push_down.children.iter_mut().zip(adjusted) {
+        let dists = sort_push_down.plan.required_input_distribution();
+        for (idx, (child, order)) in
+            sort_push_down.children.iter_mut().zip(adjusted).enumerate()
+        {
             child.data.ordering_requirement = order;
             child.data.fetch = min_fetch(current_fetch, parent_fetch);
+            child.data.distribution_requirement = stronger_distribution(
+                &parent_distribution,
+                dists
+                    .get(idx)
+                    .unwrap_or(&Distribution::UnspecifiedDistribution),
+            );
         }
         sort_push_down.data.ordering_requirement = None;
     } else {
-        // Can not push down requirements, add new `SortExec`:
-        sort_push_down = add_sort_above(
+        // Can not push down requirements, add new `SortExec`. The new sort sits
+        // between this node and its parent, so its consumer's distribution
+        // requirement is the one carried in `parent_distribution`.
+        sort_push_down = add_sort_above_with_distribution(
             sort_push_down,
             parent_requirement.into_single(),
             parent_fetch,
+            &parent_distribution,
         );
         assign_initial_requirements(&mut sort_push_down);
     }
