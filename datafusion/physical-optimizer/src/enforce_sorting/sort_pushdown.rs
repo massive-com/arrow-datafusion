@@ -172,20 +172,18 @@ fn pushdown_sorts_helper(
             return pushdown_sorts_helper(sort_push_down);
         }
         sort_push_down.plan = plan;
-        // No ordering work to do at this node, but we still need to propagate
-        // the distribution requirement to children before transform_down
-        // descends. Otherwise, when we eventually reach a node where a sort
-        // must be added, `parent_distribution` has decayed to
-        // `UnspecifiedDistribution` and `add_sort_above_with_distribution`
-        // skips the wrapping `SortPreservingMergeExec`.
+        // No ordering is being pushed down here, so only use the node's own
+        // distribution requirement. Do NOT propagate parent_distribution
+        // through partition-merging nodes (e.g. SortPreservingMergeExec):
+        // those nodes already satisfy SinglePartition themselves, so the
+        // children below them should not be forced to also produce a single
+        // partition.
         let dists = sort_push_down.plan.required_input_distribution();
         for (idx, child) in sort_push_down.children.iter_mut().enumerate() {
-            child.data.distribution_requirement = stronger_distribution(
-                &parent_distribution,
-                dists
-                    .get(idx)
-                    .unwrap_or(&Distribution::UnspecifiedDistribution),
-            );
+            child.data.distribution_requirement = dists
+                .get(idx)
+                .cloned()
+                .unwrap_or(Distribution::UnspecifiedDistribution);
         }
         return Ok(Transformed::no(sort_push_down));
     };
@@ -261,6 +259,16 @@ fn pushdown_sorts_helper(
         let reqs = sort_push_down.plan.required_input_ordering();
         let dists = sort_push_down.plan.required_input_distribution();
 
+        // If this node already produces a single partition it has absorbed any
+        // SinglePartition requirement from the consumer above.  Don't push
+        // that requirement down into children that live below the merge point.
+        let effective_parent_dist =
+            if sort_push_down.plan.output_partitioning().partition_count() == 1 {
+                Distribution::UnspecifiedDistribution
+            } else {
+                parent_distribution.clone()
+            };
+
         for (idx, (child, order)) in
             sort_push_down.children.iter_mut().zip(reqs).enumerate()
         {
@@ -273,7 +281,7 @@ fn pushdown_sorts_helper(
             // from a higher consumer must propagate, not get reset to this
             // node's own (often `UnspecifiedDistribution`) input requirement.
             child.data.distribution_requirement = stronger_distribution(
-                &parent_distribution,
+                &effective_parent_dist,
                 dists
                     .get(idx)
                     .unwrap_or(&Distribution::UnspecifiedDistribution),
