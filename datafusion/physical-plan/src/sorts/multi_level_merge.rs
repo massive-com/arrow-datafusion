@@ -30,6 +30,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion_common::Result;
 use datafusion_execution::memory_pool::MemoryReservation;
 
+use crate::sorts::builder::try_grow_reservation_to_at_least;
 use crate::sorts::sort::get_reserved_bytes_for_record_batch_size;
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::stream::RecordBatchStreamAdapter;
@@ -253,7 +254,7 @@ impl MultiLevelMergeBuilder {
 
             // Need to merge multiple streams
             (_, _) => {
-                let mut memory_reservation = self.reservation.new_empty();
+                let mut memory_reservation = self.reservation.take();
 
                 // Don't account for existing streams memory
                 // as we are not holding the memory for them
@@ -268,6 +269,9 @@ impl MultiLevelMergeBuilder {
                     )?;
 
                 let is_only_merging_memory_streams = sorted_spill_files.is_empty();
+                if is_only_merging_memory_streams {
+                    mem::swap(&mut self.reservation, &mut memory_reservation);
+                }
 
                 for spill in sorted_spill_files {
                     let stream = self
@@ -338,7 +342,7 @@ impl MultiLevelMergeBuilder {
         } else {
             // If we are only merging in-memory streams, we need to use the memory reservation
             // because we don't know the maximum size of the batches in the streams
-            builder = builder.with_reservation(self.reservation.new_empty());
+            builder = builder.with_reservation(self.reservation.take());
         }
 
         builder.build()
@@ -356,17 +360,19 @@ impl MultiLevelMergeBuilder {
     ) -> Result<(Vec<SortedSpillFile>, usize)> {
         assert_ne!(buffer_len, 0, "Buffer length must be greater than 0");
         let mut number_of_spills_to_read_for_current_phase = 0;
+        let mut total_needed: usize = 0;
 
         for spill in &self.sorted_spill_files {
+            let per_spill = get_reserved_bytes_for_record_batch_size(
+                spill.max_record_batch_memory,
+                // Size will be the same as the sliced size, bc it is a spilled batch.
+                spill.max_record_batch_memory,
+            ) * buffer_len;
+            total_needed += per_spill;
+
             // For memory pools that are not shared this is good, for other this is not
             // and there should be some upper limit to memory reservation so we won't starve the system
-            match reservation.try_grow(
-                get_reserved_bytes_for_record_batch_size(
-                    spill.max_record_batch_memory,
-                    // Size will be the same as the sliced size, bc it is a spilled batch.
-                    spill.max_record_batch_memory,
-                ) * buffer_len,
-            ) {
+            match try_grow_reservation_to_at_least(reservation, total_needed) {
                 Ok(_) => {
                     number_of_spills_to_read_for_current_phase += 1;
                 }
