@@ -1165,6 +1165,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(feature = "force_hash_collisions"))]
     #[test]
     fn create_hashes_with_custom_hasher() {
         let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
