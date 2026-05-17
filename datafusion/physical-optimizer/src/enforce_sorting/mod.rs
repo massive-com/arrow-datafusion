@@ -49,8 +49,8 @@ use crate::enforce_sorting::sort_pushdown::{
 };
 use crate::output_requirements::OutputRequirementExec;
 use crate::utils::{
-    add_sort_above, add_sort_above_with_check, is_coalesce_partitions, is_limit,
-    is_repartition, is_sort, is_sort_preserving_merge, is_window,
+    add_sort_above_with_check, add_sort_above_with_distribution, is_coalesce_partitions,
+    is_limit, is_repartition, is_sort, is_sort_preserving_merge, is_window,
 };
 
 use datafusion_common::Result;
@@ -489,6 +489,7 @@ pub fn ensure_sorting(
     };
 
     let plan = &requirements.plan;
+    let required_distributions = plan.required_input_distribution();
     let mut updated_children = vec![];
     for (idx, (required_ordering, mut child)) in plan
         .required_input_ordering()
@@ -506,13 +507,14 @@ pub fn ensure_sorting(
                 if physical_ordering.is_some() {
                     child = update_child_to_remove_unnecessary_sort(idx, child, plan)?;
                 }
-                child = add_sort_above(
+                child = add_sort_above_with_distribution(
                     child,
                     req,
                     plan.as_any()
                         .downcast_ref::<OutputRequirementExec>()
                         .map(|output| output.fetch())
                         .unwrap_or(None),
+                    &required_distributions[idx],
                 );
                 child = update_sort_ctx_children_data(child, true)?;
             }
@@ -609,13 +611,17 @@ fn analyze_immediate_sort_removal(
 fn adjust_window_sort_removal(
     mut window_tree: PlanWithCorrespondingSort,
 ) -> Result<PlanWithCorrespondingSort> {
+    let required_distribution = window_tree
+        .plan
+        .required_input_distribution()
+        .swap_remove(0);
+    let requires_single_partition =
+        matches!(required_distribution, Distribution::SinglePartition);
+
     // Window operators have a single child we need to adjust:
     let child_node = remove_corresponding_sort_from_sub_plan(
         window_tree.children.swap_remove(0),
-        matches!(
-            window_tree.plan.required_input_distribution()[0],
-            Distribution::SinglePartition
-        ),
+        requires_single_partition,
     )?;
     window_tree.children.push(child_node);
 
@@ -647,7 +653,12 @@ fn adjust_window_sort_removal(
         // Satisfy the ordering requirement so that the window can run:
         let mut child_node = window_tree.children.swap_remove(0);
         if let Some(reqs) = reqs {
-            child_node = add_sort_above(child_node, reqs.into_single(), None);
+            child_node = add_sort_above_with_distribution(
+                child_node,
+                reqs.into_single(),
+                None,
+                &required_distribution,
+            );
         }
         let child_plan = Arc::clone(&child_node.plan);
         window_tree.children.push(child_node);

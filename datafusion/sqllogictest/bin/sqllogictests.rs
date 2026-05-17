@@ -19,10 +19,12 @@ use clap::{ColorChoice, Parser, ValueEnum};
 use datafusion::common::instant::Instant;
 use datafusion::common::utils::get_available_parallelism;
 use datafusion::common::{DataFusionError, Result, exec_datafusion_err, exec_err};
+#[cfg(feature = "substrait")]
+use datafusion_sqllogictest::DataFusionSubstraitRoundTrip;
 use datafusion_sqllogictest::{
-    CurrentlyExecutingSqlTracker, DataFusion, DataFusionSubstraitRoundTrip, Filter,
-    TestContext, df_value_validator, read_dir_recursive, setup_scratch_dir,
-    should_skip_file, should_skip_record, value_normalizer,
+    CurrentlyExecutingSqlTracker, DataFusion, Filter, TestContext, df_value_validator,
+    read_dir_recursive, setup_scratch_dir, should_skip_file, should_skip_record,
+    value_normalizer,
 };
 use futures::stream::StreamExt;
 use indicatif::{
@@ -444,6 +446,7 @@ fn parse_timing_top_n(arg: &str) -> std::result::Result<usize, String> {
     Ok(parsed)
 }
 
+#[cfg(feature = "substrait")]
 async fn run_test_file_substrait_round_trip(
     test_file: TestFile,
     validator: Validator,
@@ -484,6 +487,20 @@ async fn run_test_file_substrait_round_trip(
     let res = run_file_in_runner(path, runner, filters, colored_output).await;
     pb.finish_and_clear();
     res
+}
+
+#[cfg(not(feature = "substrait"))]
+async fn run_test_file_substrait_round_trip(
+    _test_file: TestFile,
+    _validator: Validator,
+    _mp: MultiProgress,
+    _mp_style: ProgressStyle,
+    _filters: &[Filter],
+    _currently_executing_sql_tracker: CurrentlyExecutingSqlTracker,
+    _colored_output: bool,
+) -> Result<()> {
+    use datafusion::common::plan_err;
+    plan_err!("Can not run substrait round-trip as the substrait feature is not enabled")
 }
 
 async fn run_test_file(

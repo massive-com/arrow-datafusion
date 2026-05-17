@@ -53,6 +53,12 @@ pub(crate) struct SortPreservingMergeStream<C: CursorValues> {
     /// `fetch` limit.
     done: bool,
 
+    /// Whether buffered rows should be drained after `done` is set.
+    ///
+    /// This is enabled for fetch termination and disabled for terminal errors,
+    /// so the stream does not yield data after returning `Err`.
+    drain_in_progress_on_done: bool,
+
     /// A loser tree that always produces the minimum cursor
     ///
     /// Node 0 stores the top winner, Nodes 1..num_streams store
@@ -164,6 +170,7 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
             streams,
             metrics,
             done: false,
+            drain_in_progress_on_done: false,
             cursors: (0..stream_count).map(|_| None).collect(),
             prev_cursors: (0..stream_count).map(|_| None).collect(),
             round_robin_tie_breaker_mode: false,
@@ -178,6 +185,13 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
             uninitiated_partitions: (0..stream_count).collect(),
             enable_round_robin_tie_breaker,
         }
+    }
+
+    fn emit_in_progress_batch(&mut self) -> Result<Option<RecordBatch>> {
+        let rows_before = self.in_progress.len();
+        let result = self.in_progress.build_record_batch();
+        self.produced += rows_before - self.in_progress.len();
+        result
     }
 
     /// If the stream at the given index is not exhausted, and the last cursor for the
@@ -208,6 +222,9 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<RecordBatch>>> {
         if self.done {
+            if self.drain_in_progress_on_done && !self.in_progress.is_empty() {
+                return Poll::Ready(self.emit_in_progress_batch().transpose());
+            }
             return Poll::Ready(None);
         }
         // Once all partitions have set their corresponding cursors for the loser tree,
@@ -283,14 +300,13 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
                 // stop sorting if fetch has been reached
                 if self.fetch_reached() {
                     self.done = true;
+                    self.drain_in_progress_on_done = true;
                 } else if self.in_progress.len() < self.batch_size {
                     continue;
                 }
             }
 
-            self.produced += self.in_progress.len();
-
-            return Poll::Ready(self.in_progress.build_record_batch().transpose());
+            return Poll::Ready(self.emit_in_progress_batch().transpose());
         }
     }
 

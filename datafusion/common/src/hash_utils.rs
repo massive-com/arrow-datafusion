@@ -20,11 +20,14 @@
 use ahash::RandomState;
 use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
 use arrow::array::*;
+#[cfg(not(feature = "force_hash_collisions"))]
 use arrow::compute::take;
 use arrow::datatypes::*;
 #[cfg(not(feature = "force_hash_collisions"))]
 use arrow::{downcast_dictionary_array, downcast_primitive_array};
+#[cfg(not(feature = "force_hash_collisions"))]
 use itertools::Itertools;
+#[cfg(not(feature = "force_hash_collisions"))]
 use std::collections::HashMap;
 
 #[cfg(not(feature = "force_hash_collisions"))]
@@ -36,7 +39,7 @@ use crate::cast::{
 };
 use crate::error::Result;
 use crate::error::{_internal_datafusion_err, _internal_err};
-use std::cell::RefCell;
+use std::{cell::RefCell, hash::BuildHasher};
 
 // Combines two hashes into one hash
 #[inline]
@@ -100,6 +103,23 @@ where
     T: AsDynArray,
     F: FnOnce(&[u64]) -> Result<R>,
 {
+    with_hashes_with_hasher(arrays, random_state, callback)
+}
+
+/// Creates hashes for the given arrays using a thread-local buffer and a custom
+/// hash builder, then calls the provided callback with an immutable reference
+/// to the computed hashes.
+pub fn with_hashes_with_hasher<I, T, F, R, S>(
+    arrays: I,
+    hash_builder: &S,
+    callback: F,
+) -> Result<R>
+where
+    I: IntoIterator<Item = T>,
+    T: AsDynArray,
+    F: FnOnce(&[u64]) -> Result<R>,
+    S: BuildHasher,
+{
     // Peek at the first array to determine buffer size without fully collecting
     let mut iter = arrays.into_iter().peekable();
 
@@ -118,7 +138,7 @@ where
         buffer.resize(required_size, 0);
 
         // Create hashes in the buffer - this consumes the iterator
-        create_hashes(iter, random_state, &mut buffer[..required_size])?;
+        create_hashes_with_hasher(iter, hash_builder, &mut buffer[..required_size])?;
 
         // Execute the callback with an immutable slice
         let result = callback(&buffer[..required_size])?;
@@ -134,25 +154,29 @@ where
 }
 
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_null(random_state: &RandomState, hashes_buffer: &'_ mut [u64], mul_col: bool) {
+fn hash_null<S: BuildHasher>(
+    hash_builder: &S,
+    hashes_buffer: &'_ mut [u64],
+    mul_col: bool,
+) {
     if mul_col {
         hashes_buffer.iter_mut().for_each(|hash| {
             // stable hash for null value
-            *hash = combine_hashes(random_state.hash_one(1), *hash);
+            *hash = combine_hashes(hash_builder.hash_one(1), *hash);
         })
     } else {
         hashes_buffer.iter_mut().for_each(|hash| {
-            *hash = random_state.hash_one(1);
+            *hash = hash_builder.hash_one(1);
         })
     }
 }
 
 pub trait HashValue {
-    fn hash_one(&self, state: &RandomState) -> u64;
+    fn hash_one<S: BuildHasher>(&self, state: &S) -> u64;
 }
 
 impl<T: HashValue + ?Sized> HashValue for &T {
-    fn hash_one(&self, state: &RandomState) -> u64 {
+    fn hash_one<S: BuildHasher>(&self, state: &S) -> u64 {
         T::hash_one(self, state)
     }
 }
@@ -160,7 +184,7 @@ impl<T: HashValue + ?Sized> HashValue for &T {
 macro_rules! hash_value {
     ($($t:ty),+) => {
         $(impl HashValue for $t {
-            fn hash_one(&self, state: &RandomState) -> u64 {
+            fn hash_one<S: BuildHasher>(&self, state: &S) -> u64 {
                 state.hash_one(self)
             }
         })+
@@ -172,7 +196,7 @@ hash_value!(bool, str, [u8], IntervalDayTime, IntervalMonthDayNano);
 macro_rules! hash_float_value {
     ($(($t:ty, $i:ty)),+) => {
         $(impl HashValue for $t {
-            fn hash_one(&self, state: &RandomState) -> u64 {
+            fn hash_one<S: BuildHasher>(&self, state: &S) -> u64 {
                 state.hash_one(<$i>::from_ne_bytes(self.to_ne_bytes()))
             }
         })+
@@ -184,13 +208,14 @@ hash_float_value!((half::f16, u16), (f32, u32), (f64, u64));
 /// If `rehash==true` this combines the previous hash value in the buffer
 /// with the new hash using `combine_hashes`
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_array_primitive<T>(
+fn hash_array_primitive<T, S>(
     array: &PrimitiveArray<T>,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
     rehash: bool,
 ) where
     T: ArrowPrimitiveType<Native: HashValue>,
+    S: BuildHasher,
 {
     assert_eq!(
         hashes_buffer.len(),
@@ -201,25 +226,25 @@ fn hash_array_primitive<T>(
     if array.null_count() == 0 {
         if rehash {
             for (hash, &value) in hashes_buffer.iter_mut().zip(array.values().iter()) {
-                *hash = combine_hashes(value.hash_one(random_state), *hash);
+                *hash = combine_hashes(value.hash_one(hash_builder), *hash);
             }
         } else {
             for (hash, &value) in hashes_buffer.iter_mut().zip(array.values().iter()) {
-                *hash = value.hash_one(random_state);
+                *hash = value.hash_one(hash_builder);
             }
         }
     } else if rehash {
         for (i, hash) in hashes_buffer.iter_mut().enumerate() {
             if !array.is_null(i) {
                 let value = unsafe { array.value_unchecked(i) };
-                *hash = combine_hashes(value.hash_one(random_state), *hash);
+                *hash = combine_hashes(value.hash_one(hash_builder), *hash);
             }
         }
     } else {
         for (i, hash) in hashes_buffer.iter_mut().enumerate() {
             if !array.is_null(i) {
                 let value = unsafe { array.value_unchecked(i) };
-                *hash = value.hash_one(random_state);
+                *hash = value.hash_one(hash_builder);
             }
         }
     }
@@ -229,14 +254,11 @@ fn hash_array_primitive<T>(
 /// If `rehash==true` this combines the previous hash value in the buffer
 /// with the new hash using `combine_hashes`
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_array<T>(
-    array: &T,
-    random_state: &RandomState,
-    hashes_buffer: &mut [u64],
-    rehash: bool,
-) where
+fn hash_array<T, S>(array: &T, hash_builder: &S, hashes_buffer: &mut [u64], rehash: bool)
+where
     T: ArrayAccessor,
     T::Item: HashValue,
+    S: BuildHasher,
 {
     assert_eq!(
         hashes_buffer.len(),
@@ -248,26 +270,26 @@ fn hash_array<T>(
         if rehash {
             for (i, hash) in hashes_buffer.iter_mut().enumerate() {
                 let value = unsafe { array.value_unchecked(i) };
-                *hash = combine_hashes(value.hash_one(random_state), *hash);
+                *hash = combine_hashes(value.hash_one(hash_builder), *hash);
             }
         } else {
             for (i, hash) in hashes_buffer.iter_mut().enumerate() {
                 let value = unsafe { array.value_unchecked(i) };
-                *hash = value.hash_one(random_state);
+                *hash = value.hash_one(hash_builder);
             }
         }
     } else if rehash {
         for (i, hash) in hashes_buffer.iter_mut().enumerate() {
             if !array.is_null(i) {
                 let value = unsafe { array.value_unchecked(i) };
-                *hash = combine_hashes(value.hash_one(random_state), *hash);
+                *hash = combine_hashes(value.hash_one(hash_builder), *hash);
             }
         }
     } else {
         for (i, hash) in hashes_buffer.iter_mut().enumerate() {
             if !array.is_null(i) {
                 let value = unsafe { array.value_unchecked(i) };
-                *hash = value.hash_one(random_state);
+                *hash = value.hash_one(hash_builder);
             }
         }
     }
@@ -283,12 +305,13 @@ fn hash_array<T>(
 #[inline(never)]
 fn hash_string_view_array_inner<
     T: ByteViewType,
+    S: BuildHasher,
     const HAS_NULLS: bool,
     const HAS_BUFFERS: bool,
     const REHASH: bool,
 >(
     array: &GenericByteViewArray<T>,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
 ) {
     assert_eq!(
@@ -317,18 +340,18 @@ fn hash_string_view_array_inner<
         // all views are inlined, no need to access external buffers
         if !HAS_BUFFERS || view_len <= 12 {
             if REHASH {
-                *hash = combine_hashes(v.hash_one(random_state), *hash);
+                *hash = combine_hashes(v.hash_one(hash_builder), *hash);
             } else {
-                *hash = v.hash_one(random_state);
+                *hash = v.hash_one(hash_builder);
             }
             continue;
         }
         // view is not inlined, so we need to hash the bytes as well
         let value = view_bytes(view_len, v);
         if REHASH {
-            *hash = combine_hashes(value.hash_one(random_state), *hash);
+            *hash = combine_hashes(value.hash_one(hash_builder), *hash);
         } else {
-            *hash = value.hash_one(random_state);
+            *hash = value.hash_one(hash_builder);
         }
     }
 }
@@ -337,9 +360,9 @@ fn hash_string_view_array_inner<
 /// If `rehash==true` this combines the previous hash value in the buffer
 /// with the new hash using `combine_hashes`
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_generic_byte_view_array<T: ByteViewType>(
+fn hash_generic_byte_view_array<T: ByteViewType, S: BuildHasher>(
     array: &GenericByteViewArray<T>,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
     rehash: bool,
 ) {
@@ -353,42 +376,42 @@ fn hash_generic_byte_view_array<T: ByteViewType>(
         // don't call the inner function as Rust seems better able to inline this simpler code (2-3% faster)
         (false, false, false) => {
             for (hash, &view) in hashes_buffer.iter_mut().zip(array.views().iter()) {
-                *hash = view.hash_one(random_state);
+                *hash = view.hash_one(hash_builder);
             }
         }
         (false, false, true) => {
             for (hash, &view) in hashes_buffer.iter_mut().zip(array.views().iter()) {
-                *hash = combine_hashes(view.hash_one(random_state), *hash);
+                *hash = combine_hashes(view.hash_one(hash_builder), *hash);
             }
         }
-        (false, true, false) => hash_string_view_array_inner::<T, false, true, false>(
+        (false, true, false) => hash_string_view_array_inner::<T, S, false, true, false>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
-        (false, true, true) => hash_string_view_array_inner::<T, false, true, true>(
+        (false, true, true) => hash_string_view_array_inner::<T, S, false, true, true>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
-        (true, false, false) => hash_string_view_array_inner::<T, true, false, false>(
+        (true, false, false) => hash_string_view_array_inner::<T, S, true, false, false>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
-        (true, false, true) => hash_string_view_array_inner::<T, true, false, true>(
+        (true, false, true) => hash_string_view_array_inner::<T, S, true, false, true>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
-        (true, true, false) => hash_string_view_array_inner::<T, true, true, false>(
+        (true, true, false) => hash_string_view_array_inner::<T, S, true, true, false>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
-        (true, true, true) => hash_string_view_array_inner::<T, true, true, true>(
+        (true, true, true) => hash_string_view_array_inner::<T, S, true, true, true>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
     }
@@ -403,12 +426,13 @@ fn hash_generic_byte_view_array<T: ByteViewType>(
 #[inline(never)]
 fn hash_dictionary_inner<
     K: ArrowDictionaryKeyType,
+    S: BuildHasher,
     const HAS_NULL_KEYS: bool,
     const HAS_NULL_VALUES: bool,
     const MULTI_COL: bool,
 >(
     array: &DictionaryArray<K>,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
     // Hash each dictionary value once, and then use that computed
@@ -416,7 +440,7 @@ fn hash_dictionary_inner<
     // redundant hashing for large dictionary elements (e.g. strings)
     let dict_values = array.values();
     let mut dict_hashes = vec![0; dict_values.len()];
-    create_hashes([dict_values], random_state, &mut dict_hashes)?;
+    create_hashes_with_hasher([dict_values], hash_builder, &mut dict_hashes)?;
 
     if HAS_NULL_KEYS {
         for (hash, key) in hashes_buffer.iter_mut().zip(array.keys().iter()) {
@@ -448,9 +472,9 @@ fn hash_dictionary_inner<
 
 /// Hash the values in a dictionary array
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_dictionary<K: ArrowDictionaryKeyType>(
+fn hash_dictionary<K: ArrowDictionaryKeyType, S: BuildHasher>(
     array: &DictionaryArray<K>,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
     multi_col: bool,
 ) -> Result<()> {
@@ -460,53 +484,53 @@ fn hash_dictionary<K: ArrowDictionaryKeyType>(
     // Dispatcher based on null presence and multi-column mode
     // Should reduce branching within hot loops
     match (has_null_keys, has_null_values, multi_col) {
-        (false, false, false) => hash_dictionary_inner::<K, false, false, false>(
+        (false, false, false) => hash_dictionary_inner::<K, S, false, false, false>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
-        (false, false, true) => hash_dictionary_inner::<K, false, false, true>(
+        (false, false, true) => hash_dictionary_inner::<K, S, false, false, true>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
-        (false, true, false) => hash_dictionary_inner::<K, false, true, false>(
+        (false, true, false) => hash_dictionary_inner::<K, S, false, true, false>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
-        (false, true, true) => hash_dictionary_inner::<K, false, true, true>(
+        (false, true, true) => hash_dictionary_inner::<K, S, false, true, true>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
-        (true, false, false) => hash_dictionary_inner::<K, true, false, false>(
+        (true, false, false) => hash_dictionary_inner::<K, S, true, false, false>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
-        (true, false, true) => hash_dictionary_inner::<K, true, false, true>(
+        (true, false, true) => hash_dictionary_inner::<K, S, true, false, true>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
-        (true, true, false) => hash_dictionary_inner::<K, true, true, false>(
+        (true, true, false) => hash_dictionary_inner::<K, S, true, true, false>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
-        (true, true, true) => hash_dictionary_inner::<K, true, true, true>(
+        (true, true, true) => hash_dictionary_inner::<K, S, true, true, true>(
             array,
-            random_state,
+            hash_builder,
             hashes_buffer,
         ),
     }
 }
 
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_struct_array(
+fn hash_struct_array<S: BuildHasher>(
     array: &StructArray,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
     let nulls = array.nulls();
@@ -514,7 +538,7 @@ fn hash_struct_array(
 
     // Create hashes for each row that combines the hashes over all the column at that row.
     let mut values_hashes = vec![0u64; row_len];
-    create_hashes(array.columns(), random_state, &mut values_hashes)?;
+    create_hashes_with_hasher(array.columns(), hash_builder, &mut values_hashes)?;
 
     // Separate paths to avoid allocating Vec when there are no nulls
     if let Some(nulls) = nulls {
@@ -534,9 +558,9 @@ fn hash_struct_array(
 
 // only adding this `cfg` b/c this function is only used with this `cfg`
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_map_array(
+fn hash_map_array<S: BuildHasher>(
     array: &MapArray,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
     let nulls = array.nulls();
@@ -555,7 +579,7 @@ fn hash_map_array(
         .iter()
         .map(|col| col.slice(first_offset, entries_len))
         .collect();
-    create_hashes(&sliced_columns, random_state, &mut values_hashes)?;
+    create_hashes_with_hasher(&sliced_columns, hash_builder, &mut values_hashes)?;
 
     // Combine the hashes for entries on each row with each other and previous hash for that row
     // Adjust indices by first_offset since values_hashes is sliced starting from first_offset
@@ -585,24 +609,25 @@ fn hash_map_array(
 }
 
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_list_array<OffsetSize>(
+fn hash_list_array<OffsetSize, S>(
     array: &GenericListArray<OffsetSize>,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
 ) -> Result<()>
 where
     OffsetSize: OffsetSizeTrait,
+    S: BuildHasher,
 {
     // In case values is sliced, hash only the bytes used by the offsets of this ListArray
     let first_offset = array.value_offsets().first().cloned().unwrap_or_default();
     let last_offset = array.value_offsets().last().cloned().unwrap_or_default();
     let value_bytes_len = (last_offset - first_offset).as_usize();
     let mut values_hashes = vec![0u64; value_bytes_len];
-    create_hashes(
+    create_hashes_with_hasher(
         [array
             .values()
             .slice(first_offset.as_usize(), value_bytes_len)],
-        random_state,
+        hash_builder,
         &mut values_hashes,
     )?;
 
@@ -636,20 +661,21 @@ where
 }
 
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_list_view_array<OffsetSize>(
+fn hash_list_view_array<OffsetSize, S>(
     array: &GenericListViewArray<OffsetSize>,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
 ) -> Result<()>
 where
     OffsetSize: OffsetSizeTrait,
+    S: BuildHasher,
 {
     let values = array.values();
     let offsets = array.value_offsets();
     let sizes = array.value_sizes();
     let nulls = array.nulls();
     let mut values_hashes = vec![0u64; values.len()];
-    create_hashes([values], random_state, &mut values_hashes)?;
+    create_hashes_with_hasher([values], hash_builder, &mut values_hashes)?;
     if let Some(nulls) = nulls {
         for (i, (offset, size)) in offsets.iter().zip(sizes.iter()).enumerate() {
             if nulls.is_valid(i) {
@@ -675,9 +701,9 @@ where
 }
 
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_union_array(
+fn hash_union_array<S: BuildHasher>(
     array: &UnionArray,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
     let DataType::Union(union_fields, _mode) = array.data_type() else {
@@ -687,12 +713,12 @@ fn hash_union_array(
     if array.is_dense() {
         // Dense union: children only contain values of their type, so they're already compact.
         // Use the default hashing approach which is efficient for dense unions.
-        hash_union_array_default(array, union_fields, random_state, hashes_buffer)
+        hash_union_array_default(array, union_fields, hash_builder, hashes_buffer)
     } else {
         // Sparse union: each child has the same length as the union array.
         // Optimization: only hash the elements that are actually referenced by type_ids,
         // instead of hashing all K*N elements (where K = num types, N = array length).
-        hash_sparse_union_array(array, union_fields, random_state, hashes_buffer)
+        hash_sparse_union_array(array, union_fields, hash_builder, hashes_buffer)
     }
 }
 
@@ -706,10 +732,10 @@ fn hash_union_array(
 /// `hash_sparse_union_array` is more efficient, but for 1-2 types or dense unions,
 /// this simpler approach is preferred.
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_union_array_default(
+fn hash_union_array_default<S: BuildHasher>(
     array: &UnionArray,
     union_fields: &UnionFields,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
     let mut child_hashes: HashMap<i8, Vec<u64>> =
@@ -719,7 +745,7 @@ fn hash_union_array_default(
     for (type_id, _field) in union_fields.iter() {
         let child = array.child(type_id);
         let mut child_hash_buffer = vec![0; child.len()];
-        create_hashes([child], random_state, &mut child_hash_buffer)?;
+        create_hashes_with_hasher([child], hash_builder, &mut child_hash_buffer)?;
 
         child_hashes.insert(type_id, child_hash_buffer);
     }
@@ -747,10 +773,10 @@ fn hash_union_array_default(
 /// For 1-2 types, the overhead of take/scatter outweighs the benefit, so we use
 /// the default approach of hashing all children (same as dense unions).
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_sparse_union_array(
+fn hash_sparse_union_array<S: BuildHasher>(
     array: &UnionArray,
     union_fields: &UnionFields,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
     use std::collections::HashMap;
@@ -761,7 +787,7 @@ fn hash_sparse_union_array(
         return hash_union_array_default(
             array,
             union_fields,
-            random_state,
+            hash_builder,
             hashes_buffer,
         );
     }
@@ -789,7 +815,7 @@ fn hash_sparse_union_array(
 
             // Hash the filtered array
             let mut filtered_hashes = vec![0u64; filtered.len()];
-            create_hashes([&filtered], random_state, &mut filtered_hashes)?;
+            create_hashes_with_hasher([&filtered], hash_builder, &mut filtered_hashes)?;
 
             // Scatter hashes back to correct positions
             for (hash, &idx) in filtered_hashes.iter().zip(indices.iter()) {
@@ -803,16 +829,16 @@ fn hash_sparse_union_array(
 }
 
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_fixed_list_array(
+fn hash_fixed_list_array<S: BuildHasher>(
     array: &FixedSizeListArray,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
     let values = array.values();
     let value_length = array.value_length() as usize;
     let nulls = array.nulls();
     let mut values_hashes = vec![0u64; values.len()];
-    create_hashes([values], random_state, &mut values_hashes)?;
+    create_hashes_with_hasher([values], hash_builder, &mut values_hashes)?;
     if let Some(nulls) = nulls {
         for i in 0..array.len() {
             if nulls.is_valid(i) {
@@ -840,11 +866,12 @@ fn hash_fixed_list_array(
 #[cfg(not(feature = "force_hash_collisions"))]
 fn hash_run_array_inner<
     R: RunEndIndexType,
+    S: BuildHasher,
     const HAS_NULL_VALUES: bool,
     const REHASH: bool,
 >(
     array: &RunArray<R>,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
 ) -> Result<()> {
     // We find the relevant runs that cover potentially sliced arrays, so we can only hash those
@@ -871,9 +898,9 @@ fn hash_run_array_inner<
         end_physical_index - start_physical_index,
     );
     let mut values_hashes = vec![0u64; sliced_values.len()];
-    create_hashes(
+    create_hashes_with_hasher(
         std::slice::from_ref(&sliced_values),
-        random_state,
+        hash_builder,
         &mut values_hashes,
     )?;
 
@@ -909,9 +936,9 @@ fn hash_run_array_inner<
 }
 
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_run_array<R: RunEndIndexType>(
+fn hash_run_array<R: RunEndIndexType, S: BuildHasher>(
     array: &RunArray<R>,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
     rehash: bool,
 ) -> Result<()> {
@@ -919,16 +946,16 @@ fn hash_run_array<R: RunEndIndexType>(
 
     match (has_null_values, rehash) {
         (false, false) => {
-            hash_run_array_inner::<R, false, false>(array, random_state, hashes_buffer)
+            hash_run_array_inner::<R, S, false, false>(array, hash_builder, hashes_buffer)
         }
         (false, true) => {
-            hash_run_array_inner::<R, false, true>(array, random_state, hashes_buffer)
+            hash_run_array_inner::<R, S, false, true>(array, hash_builder, hashes_buffer)
         }
         (true, false) => {
-            hash_run_array_inner::<R, true, false>(array, random_state, hashes_buffer)
+            hash_run_array_inner::<R, S, true, false>(array, hash_builder, hashes_buffer)
         }
         (true, true) => {
-            hash_run_array_inner::<R, true, true>(array, random_state, hashes_buffer)
+            hash_run_array_inner::<R, S, true, true>(array, hash_builder, hashes_buffer)
         }
     }
 }
@@ -936,64 +963,64 @@ fn hash_run_array<R: RunEndIndexType>(
 /// Internal helper function that hashes a single array and either initializes or combines
 /// the hash values in the buffer.
 #[cfg(not(feature = "force_hash_collisions"))]
-fn hash_single_array(
+fn hash_single_array<S: BuildHasher>(
     array: &dyn Array,
-    random_state: &RandomState,
+    hash_builder: &S,
     hashes_buffer: &mut [u64],
     rehash: bool,
 ) -> Result<()> {
     downcast_primitive_array! {
-        array => hash_array_primitive(array, random_state, hashes_buffer, rehash),
-        DataType::Null => hash_null(random_state, hashes_buffer, rehash),
-        DataType::Boolean => hash_array(&as_boolean_array(array)?, random_state, hashes_buffer, rehash),
-        DataType::Utf8 => hash_array(&as_string_array(array)?, random_state, hashes_buffer, rehash),
-        DataType::Utf8View => hash_generic_byte_view_array(as_string_view_array(array)?, random_state, hashes_buffer, rehash),
-        DataType::LargeUtf8 => hash_array(&as_largestring_array(array), random_state, hashes_buffer, rehash),
-        DataType::Binary => hash_array(&as_generic_binary_array::<i32>(array)?, random_state, hashes_buffer, rehash),
-        DataType::BinaryView => hash_generic_byte_view_array(as_binary_view_array(array)?, random_state, hashes_buffer, rehash),
-        DataType::LargeBinary => hash_array(&as_generic_binary_array::<i64>(array)?, random_state, hashes_buffer, rehash),
+        array => hash_array_primitive(array, hash_builder, hashes_buffer, rehash),
+        DataType::Null => hash_null(hash_builder, hashes_buffer, rehash),
+        DataType::Boolean => hash_array(&as_boolean_array(array)?, hash_builder, hashes_buffer, rehash),
+        DataType::Utf8 => hash_array(&as_string_array(array)?, hash_builder, hashes_buffer, rehash),
+        DataType::Utf8View => hash_generic_byte_view_array(as_string_view_array(array)?, hash_builder, hashes_buffer, rehash),
+        DataType::LargeUtf8 => hash_array(&as_largestring_array(array), hash_builder, hashes_buffer, rehash),
+        DataType::Binary => hash_array(&as_generic_binary_array::<i32>(array)?, hash_builder, hashes_buffer, rehash),
+        DataType::BinaryView => hash_generic_byte_view_array(as_binary_view_array(array)?, hash_builder, hashes_buffer, rehash),
+        DataType::LargeBinary => hash_array(&as_generic_binary_array::<i64>(array)?, hash_builder, hashes_buffer, rehash),
         DataType::FixedSizeBinary(_) => {
             let array: &FixedSizeBinaryArray = array.as_any().downcast_ref().unwrap();
-            hash_array(&array, random_state, hashes_buffer, rehash)
+            hash_array(&array, hash_builder, hashes_buffer, rehash)
         }
         DataType::Dictionary(_, _) => downcast_dictionary_array! {
-            array => hash_dictionary(array, random_state, hashes_buffer, rehash)?,
+            array => hash_dictionary(array, hash_builder, hashes_buffer, rehash)?,
             _ => unreachable!()
         }
         DataType::Struct(_) => {
             let array = as_struct_array(array)?;
-            hash_struct_array(array, random_state, hashes_buffer)?;
+            hash_struct_array(array, hash_builder, hashes_buffer)?;
         }
         DataType::List(_) => {
             let array = as_list_array(array)?;
-            hash_list_array(array, random_state, hashes_buffer)?;
+            hash_list_array(array, hash_builder, hashes_buffer)?;
         }
         DataType::LargeList(_) => {
             let array = as_large_list_array(array)?;
-            hash_list_array(array, random_state, hashes_buffer)?;
+            hash_list_array(array, hash_builder, hashes_buffer)?;
         }
         DataType::ListView(_) => {
             let array = as_list_view_array(array)?;
-            hash_list_view_array(array, random_state, hashes_buffer)?;
+            hash_list_view_array(array, hash_builder, hashes_buffer)?;
         }
         DataType::LargeListView(_) => {
             let array = as_large_list_view_array(array)?;
-            hash_list_view_array(array, random_state, hashes_buffer)?;
+            hash_list_view_array(array, hash_builder, hashes_buffer)?;
         }
         DataType::Map(_, _) => {
             let array = as_map_array(array)?;
-            hash_map_array(array, random_state, hashes_buffer)?;
+            hash_map_array(array, hash_builder, hashes_buffer)?;
         }
         DataType::FixedSizeList(_,_) => {
             let array = as_fixed_size_list_array(array)?;
-            hash_fixed_list_array(array, random_state, hashes_buffer)?;
+            hash_fixed_list_array(array, hash_builder, hashes_buffer)?;
         }
         DataType::Union(_, _) => {
             let array = as_union_array(array)?;
-            hash_union_array(array, random_state, hashes_buffer)?;
+            hash_union_array(array, hash_builder, hashes_buffer)?;
         }
         DataType::RunEndEncoded(_, _) => downcast_run_array! {
-            array => hash_run_array(array, random_state, hashes_buffer, rehash)?,
+            array => hash_run_array(array, hash_builder, hashes_buffer, rehash)?,
             _ => unreachable!()
         }
         _ => {
@@ -1009,9 +1036,9 @@ fn hash_single_array(
 
 /// Test version of `hash_single_array` that forces all hashes to collide to zero.
 #[cfg(feature = "force_hash_collisions")]
-fn hash_single_array(
+fn hash_single_array<S: BuildHasher>(
     _array: &dyn Array,
-    _random_state: &RandomState,
+    _hash_builder: &S,
     hashes_buffer: &mut [u64],
     _rehash: bool,
 ) -> Result<()> {
@@ -1071,16 +1098,34 @@ where
     I: IntoIterator<Item = T>,
     T: AsDynArray,
 {
+    create_hashes_with_hasher(arrays, random_state, hashes_buffer)
+}
+
+/// Creates hash values for every row using a caller-provided hash builder.
+///
+/// The number of rows to hash is determined by `hashes_buffer.len()`.
+/// `hashes_buffer` should be pre-sized appropriately.
+pub fn create_hashes_with_hasher<'a, I, T, S>(
+    arrays: I,
+    hash_builder: &S,
+    hashes_buffer: &'a mut [u64],
+) -> Result<&'a mut [u64]>
+where
+    I: IntoIterator<Item = T>,
+    T: AsDynArray,
+    S: BuildHasher,
+{
     for (i, array) in arrays.into_iter().enumerate() {
         // combine hashes with `combine_hashes` for all columns besides the first
         let rehash = i >= 1;
-        hash_single_array(array.as_dyn_array(), random_state, hashes_buffer, rehash)?;
+        hash_single_array(array.as_dyn_array(), hash_builder, hashes_buffer, rehash)?;
     }
     Ok(hashes_buffer)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::hash::{BuildHasherDefault, Hasher};
     use std::sync::Arc;
 
     use arrow::array::*;
@@ -1088,6 +1133,21 @@ mod tests {
     use arrow::datatypes::*;
 
     use super::*;
+
+    #[derive(Default)]
+    struct TestHasher(u64);
+
+    impl Hasher for TestHasher {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            for byte in bytes {
+                self.0 = self.0.wrapping_mul(37).wrapping_add(u64::from(*byte));
+            }
+        }
+    }
 
     #[test]
     fn create_hashes_for_decimal_array() -> Result<()> {
@@ -1103,6 +1163,41 @@ mod tests {
         let hashes = create_hashes(&[array_ref], &random_state, hashes_buff)?;
         assert_eq!(hashes.len(), 4);
         Ok(())
+    }
+
+    #[test]
+    fn create_hashes_with_custom_hasher() {
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let mut custom_hashes = vec![0; array.len()];
+        let hash_builder = BuildHasherDefault::<TestHasher>::default();
+        create_hashes_with_hasher(
+            [Arc::<dyn Array>::clone(&array)],
+            &hash_builder,
+            &mut custom_hashes,
+        )
+        .unwrap();
+
+        let random_state = RandomState::with_seeds(0, 0, 0, 0);
+        let mut ahash_hashes = vec![0; array.len()];
+        create_hashes([array], &random_state, &mut ahash_hashes).unwrap();
+
+        assert_ne!(custom_hashes, ahash_hashes);
+    }
+
+    #[test]
+    fn with_hashes_with_custom_hasher() {
+        let int_array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let str_array: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+        let hash_builder = BuildHasherDefault::<TestHasher>::default();
+
+        let len =
+            with_hashes_with_hasher([int_array, str_array], &hash_builder, |hashes| {
+                assert_eq!(hashes.len(), 3);
+                Ok(hashes.len())
+            })
+            .unwrap();
+
+        assert_eq!(len, 3);
     }
 
     #[test]

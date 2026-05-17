@@ -56,6 +56,7 @@ use datafusion_physical_optimizer::enforce_sorting::replace_with_order_preservin
 use datafusion_physical_optimizer::enforce_sorting::sort_pushdown::{SortPushDown, assign_initial_requirements, pushdown_sorts};
 use datafusion_physical_optimizer::enforce_distribution::EnforceDistribution;
 use datafusion_physical_optimizer::output_requirements::OutputRequirementExec;
+use datafusion_physical_optimizer::sanity_checker::SanityCheckPlan;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion::prelude::*;
 use arrow::array::{record_batch, ArrayRef, Int32Array, RecordBatch};
@@ -412,6 +413,46 @@ async fn union_with_mix_of_presorted_and_explicitly_resorted_inputs_with_reparti
           UnionExec
             DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
             DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], output_ordering=[nullable_col@0 ASC], file_type=parquet
+    ");
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_requirement_adds_merge_after_partition_preserving_sort() -> Result<()> {
+    let schema = create_test_schema()?;
+    let input = union_exec(vec![memory_exec(&schema), memory_exec(&schema)]);
+    let requirement = [PhysicalSortRequirement::new(
+        col("nullable_col", &schema)?,
+        Some(SortOptions::new(false, true)),
+    )]
+    .into();
+    let physical_plan: Arc<dyn ExecutionPlan> = Arc::new(OutputRequirementExec::new(
+        input,
+        Some(OrderingRequirements::new(requirement)),
+        Distribution::SinglePartition,
+        Some(21),
+    ));
+
+    let config = ConfigOptions::new();
+    let optimized_plan =
+        EnforceSorting::new().optimize(Arc::clone(&physical_plan), &config)?;
+    SanityCheckPlan::new().optimize(optimized_plan, &config)?;
+
+    let test = EnforceSortingTest::new(physical_plan);
+    assert_snapshot!(test.run(), @r"
+    Input Plan:
+    OutputRequirementExec: order_by=[(nullable_col@0, asc)], dist_by=SinglePartition
+      UnionExec
+        DataSourceExec: partitions=1, partition_sizes=[0]
+        DataSourceExec: partitions=1, partition_sizes=[0]
+
+    Optimized Plan:
+    OutputRequirementExec: order_by=[(nullable_col@0, asc)], dist_by=SinglePartition
+      SortPreservingMergeExec: [nullable_col@0 ASC], fetch=21
+        SortExec: TopK(fetch=21), expr=[nullable_col@0 ASC], preserve_partitioning=[true]
+          UnionExec
+            DataSourceExec: partitions=1, partition_sizes=[0]
+            DataSourceExec: partitions=1, partition_sizes=[0]
     ");
     Ok(())
 }
