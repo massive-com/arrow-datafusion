@@ -341,11 +341,6 @@ impl ExternalSorter {
     /// 2. A combined streaming merge incorporating both in-memory
     ///    batches and data from spill files on disk.
     async fn sort(&mut self) -> Result<SendableRecordBatchStream> {
-        // Release the memory reserved for merge back to the pool so
-        // there is some left when `in_mem_sort_stream` requests an
-        // allocation.
-        self.merge_reservation.free();
-
         if self.spilled_before() {
             // Sort `in_mem_batches` and spill it first. If there are many
             // `in_mem_batches` and the memory limit is almost reached, merging
@@ -362,11 +357,21 @@ impl ExternalSorter {
                 .with_metrics(self.metrics.baseline.clone())
                 .with_batch_size(self.batch_size)
                 .with_fetch(None)
-                .with_reservation(self.merge_reservation.new_empty())
+                .with_reservation(self.merge_reservation.take())
                 .build()
         } else {
+            // Release the memory reserved for merge back to the pool so
+            // there is some left when `in_mem_sort_stream` requests an
+            // allocation. The spill path transfers the reservation instead.
+            self.merge_reservation.free();
             self.in_mem_sort_stream(self.metrics.baseline.clone())
         }
+    }
+
+    /// How much memory is reserved for the merge phase?
+    #[cfg(test)]
+    fn merge_reservation_size(&self) -> usize {
+        self.merge_reservation.size()
     }
 
     /// How much memory is buffered in this `ExternalSorter`?
@@ -695,7 +700,7 @@ impl ExternalSorter {
             .with_metrics(metrics)
             .with_batch_size(self.batch_size)
             .with_fetch(None)
-            .with_reservation(self.merge_reservation.new_empty())
+            .with_reservation(self.merge_reservation.take())
             .build()
     }
 
@@ -1432,7 +1437,7 @@ mod tests {
     use datafusion_physical_expr::EquivalenceProperties;
     use datafusion_physical_expr::expressions::{Column, Literal};
 
-    use futures::{FutureExt, Stream};
+    use futures::{FutureExt, Stream, TryStreamExt};
     use insta::assert_snapshot;
 
     #[derive(Debug, Clone)]
@@ -2767,6 +2772,90 @@ mod tests {
         ));
         // But the TopK self-filter should be pushed down.
         assert_eq!(desc.self_filters()[0].len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sort_merge_reservation_transferred_not_freed() -> Result<()> {
+        use datafusion_execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
+
+        let sort_spill_reservation_bytes: usize = 10 * 1024;
+        let sort_working_memory: usize = 40 * 1024;
+        let pool_size = sort_spill_reservation_bytes + sort_working_memory;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(pool_size));
+
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()?;
+
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+
+        let mut sorter = ExternalSorter::new(
+            0,
+            Arc::clone(&schema),
+            [PhysicalSortExpr::new_default(Arc::new(Column::new("x", 0)))].into(),
+            128,
+            sort_spill_reservation_bytes,
+            usize::MAX,
+            SpillCompression::Uncompressed,
+            &metrics_set,
+            Arc::clone(&runtime),
+        )?;
+
+        let num_batches = 200;
+        for i in 0..num_batches {
+            let values: Vec<i32> = ((i * 100)..((i + 1) * 100)).rev().collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(values))],
+            )?;
+            sorter.insert_batch(batch).await?;
+        }
+
+        assert!(
+            sorter.spilled_before(),
+            "Test requires spilling to exercise the merge path"
+        );
+        assert!(
+            sorter.merge_reservation_size() >= sort_spill_reservation_bytes,
+            "merge_reservation should hold pre-reserved bytes before sort()"
+        );
+
+        let merge_stream = sorter.sort().await?;
+        assert_eq!(
+            sorter.merge_reservation_size(),
+            0,
+            "sort() should transfer pre-reserved bytes to the merge stream"
+        );
+
+        drop(sorter);
+
+        let contender = MemoryConsumer::new("CompetingPartition").register(&pool);
+        let available = pool_size.saturating_sub(pool.reserved());
+        if available > 0 {
+            contender.try_grow(available).unwrap();
+        }
+
+        let batches: Vec<RecordBatch> = merge_stream.try_collect().await?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, (num_batches * 100) as usize);
+
+        let merged = concat_batches(&schema, &batches)?;
+        let col = merged.column(0).as_primitive::<Int32Type>();
+        for i in 1..col.len() {
+            assert!(
+                col.value(i - 1) <= col.value(i),
+                "Output should be sorted, but found {} > {} at index {}",
+                col.value(i - 1),
+                col.value(i),
+                i
+            );
+        }
+
+        drop(contender);
         Ok(())
     }
 }
