@@ -254,11 +254,6 @@ impl MultiLevelMergeBuilder {
 
             // Need to merge multiple streams
             (_, _) => {
-                // Transfer any pre-reserved bytes (from sort_spill_reservation_bytes)
-                // to the merge memory reservation. This prevents starvation when
-                // concurrent sort partitions compete for pool memory: the pre-reserved
-                // bytes cover spill file buffer reservations without additional pool
-                // allocation.
                 let mut memory_reservation = self.reservation.take();
 
                 // Don't account for existing streams memory
@@ -274,6 +269,9 @@ impl MultiLevelMergeBuilder {
                     )?;
 
                 let is_only_merging_memory_streams = sorted_spill_files.is_empty();
+                if is_only_merging_memory_streams {
+                    mem::swap(&mut self.reservation, &mut memory_reservation);
+                }
 
                 // If no spill files were selected (e.g. all too large for
                 // available memory but enough in-memory streams exist),
@@ -352,9 +350,7 @@ impl MultiLevelMergeBuilder {
             builder = builder.with_bypass_mempool();
         } else {
             // If we are only merging in-memory streams, we need to use the memory reservation
-            // because we don't know the maximum size of the batches in the streams.
-            // Use take() to transfer any pre-reserved bytes so the merge can use them
-            // as its initial budget without additional pool allocation.
+            // because we don't know the maximum size of the batches in the streams
             builder = builder.with_reservation(self.reservation.take());
         }
 
@@ -373,10 +369,6 @@ impl MultiLevelMergeBuilder {
     ) -> Result<(Vec<SortedSpillFile>, usize)> {
         assert_ne!(buffer_len, 0, "Buffer length must be greater than 0");
         let mut number_of_spills_to_read_for_current_phase = 0;
-        // Track total memory needed for spill file buffers. When the
-        // reservation has pre-reserved bytes (from sort_spill_reservation_bytes),
-        // those bytes cover the first N spill files without additional pool
-        // allocation, preventing starvation under memory pressure.
         let mut total_needed: usize = 0;
 
         for spill in &self.sorted_spill_files {
@@ -387,9 +379,8 @@ impl MultiLevelMergeBuilder {
             ) * buffer_len;
             total_needed += per_spill;
 
-            // For memory pools that are not shared this is good, for other
-            // this is not and there should be some upper limit to memory
-            // reservation so we won't starve the system.
+            // For memory pools that are not shared this is good, for other this is not
+            // and there should be some upper limit to memory reservation so we won't starve the system
             match try_grow_reservation_to_at_least(reservation, total_needed) {
                 Ok(_) => {
                     number_of_spills_to_read_for_current_phase += 1;

@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use datafusion_common::Result;
-use datafusion_physical_expr::{LexOrdering, LexRequirement};
+use datafusion_physical_expr::{Distribution, LexOrdering, LexRequirement};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::repartition::RepartitionExec;
@@ -40,6 +40,33 @@ pub fn add_sort_above<T: Clone + Default>(
     sort_requirements: LexRequirement,
     fetch: Option<usize>,
 ) -> PlanContext<T> {
+    add_sort_above_impl(node, sort_requirements, fetch, false)
+}
+
+/// This utility function adds a `SortExec` above an operator according to the
+/// given ordering requirements. If the parent distribution requires a single
+/// input partition, it adds a `SortPreservingMergeExec` above the
+/// partition-preserving sort.
+pub fn add_sort_above_with_distribution<T: Clone + Default>(
+    node: PlanContext<T>,
+    sort_requirements: LexRequirement,
+    fetch: Option<usize>,
+    required_distribution: &Distribution,
+) -> PlanContext<T> {
+    add_sort_above_impl(
+        node,
+        sort_requirements,
+        fetch,
+        matches!(required_distribution, Distribution::SinglePartition),
+    )
+}
+
+fn add_sort_above_impl<T: Clone + Default>(
+    node: PlanContext<T>,
+    sort_requirements: LexRequirement,
+    fetch: Option<usize>,
+    requires_single_partition: bool,
+) -> PlanContext<T> {
     let mut sort_reqs: Vec<_> = sort_requirements.into();
     sort_reqs.retain(|sort_expr| {
         node.plan
@@ -51,11 +78,28 @@ pub fn add_sort_above<T: Clone + Default>(
     let Some(ordering) = LexOrdering::new(sort_exprs) else {
         return node;
     };
-    let mut new_sort = SortExec::new(ordering, Arc::clone(&node.plan)).with_fetch(fetch);
-    if node.plan.output_partitioning().partition_count() > 1 {
+    let input_has_multiple_partitions =
+        node.plan.output_partitioning().partition_count() > 1;
+
+    let mut new_sort =
+        SortExec::new(ordering.clone(), Arc::clone(&node.plan)).with_fetch(fetch);
+    if input_has_multiple_partitions {
         new_sort = new_sort.with_preserve_partitioning(true);
     }
-    PlanContext::new(Arc::new(new_sort), T::default(), vec![node])
+
+    let sort_node = PlanContext::new(Arc::new(new_sort), T::default(), vec![node]);
+    if !(requires_single_partition && input_has_multiple_partitions) {
+        return sort_node;
+    }
+
+    PlanContext::new(
+        Arc::new(
+            SortPreservingMergeExec::new(ordering, Arc::clone(&sort_node.plan))
+                .with_fetch(fetch),
+        ),
+        T::default(),
+        vec![sort_node],
+    )
 }
 
 /// This utility function adds a `SortExec` above an operator according to the

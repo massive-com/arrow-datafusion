@@ -478,13 +478,12 @@ impl ParquetSource {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_reverse_row_groups(mut self, reverse_row_groups: bool) -> Self {
+    pub fn with_reverse_row_groups(mut self, reverse_row_groups: bool) -> Self {
         self.reverse_row_groups = reverse_row_groups;
         self
     }
-    #[cfg(test)]
-    pub(crate) fn reverse_row_groups(&self) -> bool {
+
+    pub fn reverse_row_groups(&self) -> bool {
         self.reverse_row_groups
     }
 }

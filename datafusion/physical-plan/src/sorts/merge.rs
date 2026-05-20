@@ -55,10 +55,8 @@ pub(crate) struct SortPreservingMergeStream<C: CursorValues> {
 
     /// Whether buffered rows should be drained after `done` is set.
     ///
-    /// This is enabled when we stop because the `fetch` limit has been
-    /// reached, allowing partial batches left over after overflow handling to
-    /// be emitted on subsequent polls. It remains disabled for terminal
-    /// errors so the stream does not yield data after returning `Err`.
+    /// This is enabled for fetch termination and disabled for terminal errors,
+    /// so the stream does not yield data after returning `Err`.
     drain_in_progress_on_done: bool,
 
     /// A loser tree that always produces the minimum cursor
@@ -189,6 +187,13 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         }
     }
 
+    fn emit_in_progress_batch(&mut self) -> Result<Option<RecordBatch>> {
+        let rows_before = self.in_progress.len();
+        let result = self.in_progress.build_record_batch();
+        self.produced += rows_before - self.in_progress.len();
+        result
+    }
+
     /// If the stream at the given index is not exhausted, and the last cursor for the
     /// stream is finished, poll the stream for the next RecordBatch and create a new
     /// cursor for the stream from the returned result
@@ -224,13 +229,6 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<RecordBatch>>> {
         if self.done {
-            // When `build_record_batch()` hits an i32 offset overflow (e.g.
-            // combined string offsets exceed 2 GB), it emits a partial batch
-            // and keeps the remaining rows in `self.in_progress.indices`.
-            // Drain those leftover rows before terminating the stream,
-            // otherwise they would be silently dropped.
-            // Repeated overflows are fine — each poll emits another partial
-            // batch until `in_progress` is fully drained.
             if self.drain_in_progress_on_done && !self.in_progress.is_empty() {
                 return Poll::Ready(self.emit_in_progress_batch().transpose());
             }

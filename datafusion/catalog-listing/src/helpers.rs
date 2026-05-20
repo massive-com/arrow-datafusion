@@ -632,7 +632,7 @@ mod tests {
         let partition_cols = vec![("year_month".to_string(), DataType::Utf8)];
         let meta = ObjectMeta {
             location: Path::from("bucket/mytable/year_month=2024-01/data.parquet"),
-            last_modified: chrono::Utc::now(),
+            last_modified: chrono::DateTime::from(std::time::SystemTime::UNIX_EPOCH),
             size: 100,
             e_tag: None,
             version: None,
@@ -651,14 +651,11 @@ mod tests {
 
     #[test]
     fn test_try_into_partitioned_file_root_file_skipped() {
-        // File in root directory (not inside any partition path) should be
-        // skipped — this is the case where a stale file exists from before
-        // hive partitioning was added.
         let table_path = ListingTableUrl::parse("file:///bucket/mytable").unwrap();
         let partition_cols = vec![("year_month".to_string(), DataType::Utf8)];
         let meta = ObjectMeta {
             location: Path::from("bucket/mytable/data.parquet"),
-            last_modified: chrono::Utc::now(),
+            last_modified: chrono::DateTime::from(std::time::SystemTime::UNIX_EPOCH),
             size: 100,
             e_tag: None,
             version: None,
@@ -674,12 +671,11 @@ mod tests {
 
     #[test]
     fn test_try_into_partitioned_file_wrong_partition_name() {
-        // File in a directory that doesn't match the expected partition column
         let table_path = ListingTableUrl::parse("file:///bucket/mytable").unwrap();
         let partition_cols = vec![("year_month".to_string(), DataType::Utf8)];
         let meta = ObjectMeta {
             location: Path::from("bucket/mytable/wrong_col=2024-01/data.parquet"),
-            last_modified: chrono::Utc::now(),
+            last_modified: chrono::DateTime::from(std::time::SystemTime::UNIX_EPOCH),
             size: 100,
             e_tag: None,
             version: None,
@@ -702,7 +698,7 @@ mod tests {
         ];
         let meta = ObjectMeta {
             location: Path::from("bucket/mytable/year=2024/month=01/data.parquet"),
-            last_modified: chrono::Utc::now(),
+            last_modified: chrono::DateTime::from(std::time::SystemTime::UNIX_EPOCH),
             size: 100,
             e_tag: None,
             version: None,
@@ -725,7 +721,6 @@ mod tests {
 
     #[test]
     fn test_try_into_partitioned_file_partial_partition_skipped() {
-        // File has first partition but not second — should be skipped
         let table_path = ListingTableUrl::parse("file:///bucket/mytable").unwrap();
         let partition_cols = vec![
             ("year".to_string(), DataType::Utf8),
@@ -733,7 +728,7 @@ mod tests {
         ];
         let meta = ObjectMeta {
             location: Path::from("bucket/mytable/year=2024/data.parquet"),
-            last_modified: chrono::Utc::now(),
+            last_modified: chrono::DateTime::from(std::time::SystemTime::UNIX_EPOCH),
             size: 100,
             e_tag: None,
             version: None,
@@ -741,9 +736,6 @@ mod tests {
 
         let result =
             try_into_partitioned_file(meta, &partition_cols, &table_path).unwrap();
-        // File has year=2024 but no month= directory — parse_partitions_for_path
-        // returns None because the path component "data.parquet" doesn't match
-        // the expected "month=..." pattern.
         assert!(
             result.is_none(),
             "Files with incomplete partition structure should be skipped"

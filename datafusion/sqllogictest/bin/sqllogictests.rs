@@ -21,7 +21,6 @@ use datafusion::common::utils::get_available_parallelism;
 use datafusion::common::{DataFusionError, Result, exec_datafusion_err, exec_err};
 #[cfg(feature = "substrait")]
 use datafusion_sqllogictest::DataFusionSubstraitRoundTrip;
-use datafusion_sqllogictest::TestFile;
 use datafusion_sqllogictest::{
     CurrentlyExecutingSqlTracker, DataFusion, Filter, TestContext, df_value_validator,
     read_dir_recursive, setup_scratch_dir, should_skip_file, should_skip_record,
@@ -428,6 +427,16 @@ fn is_env_truthy(name: &str) -> bool {
         })
 }
 
+fn parse_timing_top_n(arg: &str) -> std::result::Result<usize, String> {
+    let parsed = arg
+        .parse::<usize>()
+        .map_err(|error| format!("invalid value '{arg}': {error}"))?;
+    if parsed == 0 {
+        return Err("must be >= 1".to_string());
+    }
+    Ok(parsed)
+}
+
 #[cfg(feature = "substrait")]
 async fn run_test_file_substrait_round_trip(
     test_file: TestFile,
@@ -481,7 +490,8 @@ async fn run_test_file_substrait_round_trip(
     _currently_executing_sql_tracker: CurrentlyExecutingSqlTracker,
     _colored_output: bool,
 ) -> Result<()> {
-    exec_err!("Cannot run substrait round-trip: the 'substrait' feature is not enabled")
+    use datafusion::common::plan_err;
+    plan_err!("Can not run substrait round-trip as the substrait feature is not enabled")
 }
 
 async fn run_test_file(

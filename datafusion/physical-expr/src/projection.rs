@@ -21,7 +21,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::PhysicalExpr;
-use crate::expressions::{CastExpr, Column, Literal};
+use crate::expressions::{Column, Literal};
 use crate::scalar_function::ScalarFunctionExpr;
 use crate::utils::collect_columns;
 
@@ -1108,51 +1108,64 @@ impl ProjectionMapping {
             //   p.ticker → get_field(col("details"), "ticker")
             // enabling the optimizer to know that sorting by
             // `details.ticker` is equivalent to sorting by `p.ticker`.
-            if let Some(func_expr) = source_expr.downcast_ref::<ScalarFunctionExpr>() {
+            if let Some(func_expr) =
+                source_expr.as_any().downcast_ref::<ScalarFunctionExpr>()
+            {
                 let literal_args: Vec<Option<ScalarValue>> = func_expr
                     .args()
                     .iter()
-                    .map(|arg| arg.downcast_ref::<Literal>().map(|l| l.value().clone()))
+                    .map(|arg| {
+                        arg.as_any()
+                            .downcast_ref::<Literal>()
+                            .map(|l| l.value().clone())
+                    })
                     .collect();
 
+                #[expect(
+                    clippy::collapsible_if,
+                    reason = "readability: field_mapping and struct type are logically separate checks"
+                )]
                 if let Some(field_mapping) =
                     func_expr.fun().struct_field_mapping(&literal_args)
-                    && let DataType::Struct(struct_fields) = func_expr.return_type()
                 {
-                    for (accessor_args, source_arg_idx) in &field_mapping.fields {
-                        let value_expr = Arc::clone(&func_expr.args()[*source_arg_idx]);
+                    if let DataType::Struct(struct_fields) = func_expr.return_type() {
+                        for (accessor_args, source_arg_idx) in &field_mapping.fields {
+                            let value_expr =
+                                Arc::clone(&func_expr.args()[*source_arg_idx]);
 
-                        // Build accessor args: [target_col, ...field_name_literals]
-                        let mut accessor_fn_args: Vec<Arc<dyn PhysicalExpr>> =
-                            vec![Arc::clone(&target_expr)];
-                        accessor_fn_args.extend(accessor_args.iter().map(|sv| {
-                            Arc::new(Literal::new(sv.clone())) as Arc<dyn PhysicalExpr>
-                        }));
+                            // Build accessor args: [target_col, ...field_name_literals]
+                            let mut accessor_fn_args: Vec<Arc<dyn PhysicalExpr>> =
+                                vec![Arc::clone(&target_expr)];
+                            accessor_fn_args.extend(accessor_args.iter().map(|sv| {
+                                Arc::new(Literal::new(sv.clone()))
+                                    as Arc<dyn PhysicalExpr>
+                            }));
 
-                        // Look up the field's return type from the struct schema
-                        let return_field = accessor_args
-                            .first()
-                            .and_then(|sv| sv.try_as_str().flatten())
-                            .and_then(|field_name| {
-                                struct_fields
-                                    .iter()
-                                    .find(|f| f.name() == field_name)
-                                    .cloned()
-                            });
+                            // Look up the field's return type from the struct schema
+                            let return_field = accessor_args
+                                .first()
+                                .and_then(|sv| sv.try_as_str().flatten())
+                                .and_then(|field_name| {
+                                    struct_fields
+                                        .iter()
+                                        .find(|f| f.name() == field_name)
+                                        .cloned()
+                                });
 
-                        if let Some(return_field) = return_field {
-                            let field_access_expr = Arc::new(ScalarFunctionExpr::new(
-                                field_mapping.field_accessor.name(),
-                                Arc::clone(&field_mapping.field_accessor),
-                                accessor_fn_args,
-                                return_field,
-                                Arc::new(func_expr.config_options().clone()),
-                            ))
-                                as Arc<dyn PhysicalExpr>;
+                            if let Some(return_field) = return_field {
+                                let field_access_expr = Arc::new(ScalarFunctionExpr::new(
+                                    field_mapping.field_accessor.name(),
+                                    Arc::clone(&field_mapping.field_accessor),
+                                    accessor_fn_args,
+                                    return_field,
+                                    Arc::new(func_expr.config_options().clone()),
+                                ))
+                                    as Arc<dyn PhysicalExpr>;
 
-                            map.entry(value_expr)
-                                .or_default()
-                                .push((field_access_expr, expr_idx));
+                                map.entry(value_expr)
+                                    .or_default()
+                                    .push((field_access_expr, expr_idx));
+                            }
                         }
                     }
                 }
@@ -1312,7 +1325,7 @@ pub(crate) mod tests {
             for (target, _) in targets.iter() {
                 // Skip non-Column targets (e.g. struct field decomposition
                 // entries which are ScalarFunctionExpr targets).
-                let Some(column) = target.downcast_ref::<Column>() else {
+                let Some(column) = target.as_any().downcast_ref::<Column>() else {
                     continue;
                 };
                 fields.push(Field::new(column.name(), data_type.clone(), nullable));

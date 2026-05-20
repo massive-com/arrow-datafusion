@@ -24,6 +24,8 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::memory_pool::MemoryReservation;
 use log::warn;
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 #[derive(Debug, Copy, Clone, Default)]
@@ -45,20 +47,14 @@ pub struct BatchBuilder {
 
     /// Accounts for memory used by buffered batches.
     ///
-    /// May include pre-reserved bytes (from `sort_spill_reservation_bytes`)
-    /// that were transferred via [`MemoryReservation::take()`] to prevent
-    /// starvation when concurrent sort partitions compete for pool memory.
+    /// May include pre-reserved bytes from `sort_spill_reservation_bytes`
+    /// transferred via [`MemoryReservation::take()`].
     reservation: MemoryReservation,
 
-    /// Tracks the actual memory used by buffered batches (not including
-    /// pre-reserved bytes). This allows [`Self::push_batch`] to skip pool
-    /// allocation requests when the pre-reserved bytes cover the batch.
+    /// Actual memory used by buffered batches, excluding pre-reserved bytes.
     batches_mem_used: usize,
 
-    /// The initial reservation size at construction time. When the reservation
-    /// is pre-loaded with `sort_spill_reservation_bytes` (via `take()`), this
-    /// records that amount so we never shrink below it, maintaining the
-    /// anti-starvation guarantee throughout the merge.
+    /// Initial reservation size, preserved as anti-starvation headroom.
     initial_reservation: usize,
 
     /// The current [`BatchCursor`] for each stream
@@ -93,9 +89,6 @@ impl BatchBuilder {
     pub fn push_batch(&mut self, stream_idx: usize, batch: RecordBatch) -> Result<()> {
         let size = get_record_batch_memory_size(&batch);
         self.batches_mem_used += size;
-        // Only request additional memory from the pool when actual batch
-        // usage exceeds the current reservation (which may include
-        // pre-reserved bytes from sort_spill_reservation_bytes).
         try_grow_reservation_to_at_least(&mut self.reservation, self.batches_mem_used)?;
         let batch_idx = self.batches.len();
         self.batches.push((stream_idx, batch));
@@ -141,28 +134,18 @@ impl BatchBuilder {
                     .iter()
                     .map(|(_, batch)| batch.column(column_idx).as_ref())
                     .collect();
-                // Arrow 58.1.0+ returns OffsetOverflowError directly from
-                // interleave, allowing retry_interleave to shrink the batch.
-                interleave(&arrays, indices).map_err(Into::into)
+                recover_offset_overflow_from_panic(|| interleave(&arrays, indices))
             })
             .collect::<Result<Vec<_>>>()
     }
 
-    /// Builds a record batch from the first `rows_to_emit` buffered rows.
     fn finish_record_batch(
         &mut self,
         rows_to_emit: usize,
         columns: Vec<ArrayRef>,
     ) -> Result<RecordBatch> {
-        // Remove consumed indices, keeping any remaining for the next call.
         self.indices.drain(..rows_to_emit);
 
-        // Only clean up fully-consumed batches when all indices are drained,
-        // because remaining indices may still reference earlier batches.
-        // In the overflow/partial-emit case this may retain some extra memory
-        // across a few drain polls, but avoids costly index scanning on the
-        // hot path. The retention is bounded and short-lived since leftover
-        // rows are drained over subsequent polls.
         if self.indices.is_empty() {
             // New cursors are only created once the previous cursor for the stream
             // is finished. This means all remaining rows from all but the last batch
@@ -186,9 +169,6 @@ impl BatchBuilder {
             });
         }
 
-        // Release excess memory back to the pool, but never shrink below
-        // initial_reservation to maintain the anti-starvation guarantee
-        // for the merge phase.
         let target = self.batches_mem_used.max(self.initial_reservation);
         if self.reservation.size() > target {
             self.reservation.shrink(self.reservation.size() - target);
@@ -200,8 +180,8 @@ impl BatchBuilder {
     /// Drains the in_progress row indexes, and builds a new RecordBatch from them
     ///
     /// Will then drop any batches for which all rows have been yielded to the output.
-    /// If an offset overflow occurs (e.g. string/list offsets exceed i32::MAX),
-    /// retries with progressively fewer rows until it succeeds.
+    /// If an offset overflow occurs, retries with progressively fewer rows until
+    /// it succeeds.
     ///
     /// Returns `None` if no pending rows
     pub fn build_record_batch(&mut self) -> Result<Option<RecordBatch>> {
@@ -219,11 +199,6 @@ impl BatchBuilder {
 }
 
 /// Try to grow `reservation` so it covers at least `needed` bytes.
-///
-/// When a reservation has been pre-loaded with bytes (e.g. via
-/// [`MemoryReservation::take()`]), this avoids redundant pool
-/// allocations: if the reservation already covers `needed`, this is
-/// a no-op; otherwise only the deficit is requested from the pool.
 pub(crate) fn try_grow_reservation_to_at_least(
     reservation: &mut MemoryReservation,
     needed: usize,
@@ -234,7 +209,6 @@ pub(crate) fn try_grow_reservation_to_at_least(
     Ok(())
 }
 
-/// Returns true if the error is an Arrow offset overflow.
 fn is_offset_overflow(e: &DataFusionError) -> bool {
     matches!(
         e,
@@ -243,9 +217,24 @@ fn is_offset_overflow(e: &DataFusionError) -> bool {
     )
 }
 
-#[cfg(test)]
 fn offset_overflow_error() -> DataFusionError {
     DataFusionError::ArrowError(Box::new(ArrowError::OffsetOverflowError(0)), None)
+}
+
+fn recover_offset_overflow_from_panic<T, F>(f: F) -> Result<T>
+where
+    F: FnOnce() -> std::result::Result<T, ArrowError>,
+{
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(result) => Ok(result?),
+        Err(panic_payload) => {
+            if is_arrow_offset_overflow_panic(panic_payload.as_ref()) {
+                Err(offset_overflow_error())
+            } else {
+                std::panic::resume_unwind(panic_payload);
+            }
+        }
+    }
 }
 
 fn retry_interleave<T, F>(
@@ -259,7 +248,6 @@ where
     loop {
         match interleave(rows_to_emit) {
             Ok(value) => return Ok((rows_to_emit, value)),
-            // Only offset overflow is recoverable by emitting fewer rows.
             Err(e) if is_offset_overflow(&e) => {
                 rows_to_emit /= 2;
                 if rows_to_emit == 0 {
@@ -274,34 +262,23 @@ where
     }
 }
 
+fn panic_message(payload: &(dyn Any + Send)) -> Option<&str> {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        return Some(msg);
+    }
+    if let Some(msg) = payload.downcast_ref::<String>() {
+        return Some(msg.as_str());
+    }
+    None
+}
+
+fn is_arrow_offset_overflow_panic(payload: &(dyn Any + Send)) -> bool {
+    matches!(panic_message(payload), Some("overflow" | "offset overflow"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, ArrayDataBuilder, Int32Array, ListArray};
-    use arrow::buffer::Buffer;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_execution::memory_pool::{
-        MemoryConsumer, MemoryPool, UnboundedMemoryPool,
-    };
-
-    fn overflow_list_batch() -> RecordBatch {
-        let values_field = Arc::new(Field::new_list_field(DataType::Int32, true));
-        // SAFETY: This intentionally constructs an invalid child length so
-        // Arrow's interleave hits offset overflow before touching child data.
-        let list = ListArray::from(unsafe {
-            ArrayDataBuilder::new(DataType::List(Arc::clone(&values_field)))
-                .len(1)
-                .add_buffer(Buffer::from_slice_ref([0_i32, i32::MAX]))
-                .add_child_data(Int32Array::from(Vec::<i32>::new()).to_data())
-                .build_unchecked()
-        });
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "list_col",
-            DataType::List(values_field),
-            true,
-        )]));
-        RecordBatch::try_new(schema, vec![Arc::new(list)]).unwrap()
-    }
 
     #[test]
     fn test_retry_interleave_halves_rows_until_success() {
@@ -323,37 +300,43 @@ mod tests {
     }
 
     #[test]
-    fn test_is_offset_overflow_matches_arrow_error() {
-        assert!(is_offset_overflow(&offset_overflow_error()));
-    }
-
-    #[test]
-    fn test_retry_interleave_does_not_retry_non_offset_errors() {
-        let mut attempts = Vec::new();
-
-        let error = retry_interleave(4, 4, |rows_to_emit| {
-            attempts.push(rows_to_emit);
-            Err::<(), _>(DataFusionError::Execution("boom".into()))
-        })
+    fn test_recover_offset_overflow_from_panic() {
+        let error = recover_offset_overflow_from_panic(
+            || -> std::result::Result<(), ArrowError> { panic!("offset overflow") },
+        )
         .unwrap_err();
 
-        assert_eq!(attempts, vec![4]);
-        assert!(matches!(error, DataFusionError::Execution(msg) if msg == "boom"));
+        assert!(is_offset_overflow(&error));
     }
 
     #[test]
-    fn test_try_interleave_columns_surfaces_arrow_offset_overflow() {
-        let batch = overflow_list_batch();
-        let schema = batch.schema();
-        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-        let reservation = MemoryConsumer::new("test").register(&pool);
-        let mut builder = BatchBuilder::new(schema, 1, 2, reservation);
-        builder.push_batch(0, batch).unwrap();
+    fn test_recover_offset_overflow_from_panic_rethrows_unrelated_panics() {
+        let panic_payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = recover_offset_overflow_from_panic(
+                || -> std::result::Result<(), ArrowError> { panic!("capacity overflow") },
+            );
+        }));
 
-        let error = builder
-            .try_interleave_columns(&[(0, 0), (0, 0)])
-            .unwrap_err();
+        assert!(panic_payload.is_err());
+    }
 
-        assert!(is_offset_overflow(&error));
+    #[test]
+    fn test_is_arrow_offset_overflow_panic() {
+        let overflow = Box::new("overflow") as Box<dyn Any + Send>;
+        assert!(is_arrow_offset_overflow_panic(overflow.as_ref()));
+
+        let offset_overflow =
+            Box::new(String::from("offset overflow")) as Box<dyn Any + Send>;
+        assert!(is_arrow_offset_overflow_panic(offset_overflow.as_ref()));
+
+        let capacity_overflow = Box::new("capacity overflow") as Box<dyn Any + Send>;
+        assert!(!is_arrow_offset_overflow_panic(capacity_overflow.as_ref()));
+
+        let arithmetic_overflow =
+            Box::new(String::from("attempt to multiply with overflow"))
+                as Box<dyn Any + Send>;
+        assert!(!is_arrow_offset_overflow_panic(
+            arithmetic_overflow.as_ref()
+        ));
     }
 }

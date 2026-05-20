@@ -588,15 +588,10 @@ impl LogicalPlan {
                 if raw_exprs.is_empty() {
                     // No expressions to transform — skip expensive clone of
                     // all inputs and reconstruction via with_exprs_and_inputs.
+                    // Critical for nodes like OneOf with many children but
+                    // no expressions (~18% optimizer CPU reduction).
                     Transformed::no(LogicalPlan::Extension(Extension { node }))
                 } else {
-                    // TODO: a more general optimization would be to change
-                    // `UserDefinedLogicalNode::expressions()` to return
-                    // references (`&[Expr]`) instead of cloned `Vec<Expr>`,
-                    // and only clone + rebuild when the transform actually
-                    // modifies an expression. This would avoid the clone +
-                    // `with_exprs_and_inputs` rebuild even for non-empty
-                    // expression lists when the transform is a no-op.
                     let exprs = raw_exprs.map_elements(f)?;
                     let plan = LogicalPlan::Extension(Extension {
                         node: UserDefinedLogicalNode::with_exprs_and_inputs(
