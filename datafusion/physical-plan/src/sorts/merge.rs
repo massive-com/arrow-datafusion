@@ -558,3 +558,95 @@ impl<C: CursorValues + Unpin> RecordBatchStream for SortPreservingMergeStream<C>
         Arc::clone(self.in_progress.schema())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::ExecutionPlanMetricsSet;
+    use crate::sorts::stream::PartitionedStream;
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_execution::memory_pool::{
+        MemoryConsumer, MemoryPool, UnboundedMemoryPool,
+    };
+    use futures::task::noop_waker_ref;
+    use std::cmp::Ordering;
+
+    #[derive(Debug)]
+    struct EmptyPartitionedStream;
+
+    impl PartitionedStream for EmptyPartitionedStream {
+        type Output = Result<(DummyValues, RecordBatch)>;
+
+        fn partitions(&self) -> usize {
+            1
+        }
+
+        fn poll_next(
+            &mut self,
+            _cx: &mut Context<'_>,
+            _stream_idx: usize,
+        ) -> Poll<Option<Self::Output>> {
+            Poll::Ready(None)
+        }
+    }
+
+    #[derive(Debug)]
+    struct DummyValues;
+
+    impl CursorValues for DummyValues {
+        fn len(&self) -> usize {
+            0
+        }
+
+        fn eq(_l: &Self, _l_idx: usize, _r: &Self, _r_idx: usize) -> bool {
+            unreachable!("done-path test should not compare cursors")
+        }
+
+        fn eq_to_previous(_cursor: &Self, _idx: usize) -> bool {
+            unreachable!("done-path test should not compare cursors")
+        }
+
+        fn compare(_l: &Self, _l_idx: usize, _r: &Self, _r_idx: usize) -> Ordering {
+            unreachable!("done-path test should not compare cursors")
+        }
+    }
+
+    #[test]
+    fn test_done_drains_buffered_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let reservation = MemoryConsumer::new("test").register(&pool);
+        let metrics = ExecutionPlanMetricsSet::new();
+
+        let mut stream = SortPreservingMergeStream::<DummyValues>::new(
+            Box::new(EmptyPartitionedStream),
+            Arc::clone(&schema),
+            BaselineMetrics::new(&metrics, 0),
+            16,
+            Some(1),
+            reservation,
+            true,
+        );
+
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        stream.in_progress.push_batch(0, batch).unwrap();
+        stream.in_progress.push_row(0);
+        stream.done = true;
+        stream.drain_in_progress_on_done = true;
+
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        match stream.poll_next_inner(&mut cx) {
+            Poll::Ready(Some(Ok(batch))) => assert_eq!(batch.num_rows(), 1),
+            other => {
+                panic!("expected buffered rows to be drained after done, got {other:?}")
+            }
+        }
+        assert!(stream.in_progress.is_empty());
+        assert!(matches!(stream.poll_next_inner(&mut cx), Poll::Ready(None)));
+    }
+}

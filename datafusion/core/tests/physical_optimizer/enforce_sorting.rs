@@ -23,10 +23,11 @@ use crate::physical_optimizer::test_utils::{
     bounded_window_exec_with_partition, check_integrity, coalesce_partitions_exec,
     create_test_schema, create_test_schema2, create_test_schema3, filter_exec,
     global_limit_exec, hash_join_exec, local_limit_exec, memory_exec, parquet_exec,
-    parquet_exec_with_sort, projection_exec, repartition_exec, sort_exec,
-    sort_exec_with_fetch, sort_expr, sort_expr_options, sort_merge_join_exec,
-    sort_preserving_merge_exec, sort_preserving_merge_exec_with_fetch,
-    spr_repartition_exec, stream_exec_ordered, union_exec,
+    parquet_exec_with_sort, projection_exec, repartition_exec, simple_projection_exec,
+    sort_exec, sort_exec_with_fetch, sort_exec_with_preserve_partitioning, sort_expr,
+    sort_expr_options, sort_merge_join_exec, sort_preserving_merge_exec,
+    sort_preserving_merge_exec_with_fetch, spr_repartition_exec, stream_exec_ordered,
+    union_exec,
 };
 
 use arrow::compute::{SortOptions};
@@ -454,6 +455,102 @@ async fn output_requirement_adds_merge_after_partition_preserving_sort() -> Resu
             DataSourceExec: partitions=1, partition_sizes=[0]
             DataSourceExec: partitions=1, partition_sizes=[0]
     ");
+    Ok(())
+}
+
+/// Regression test: when `OutputRequirementExec(SinglePartition)` wraps a plan
+/// that already contains `SortPreservingMergeExec`, sort pushdown must not add
+/// a second `SortPreservingMergeExec` below the existing one.
+#[test]
+fn test_no_extra_spm_from_output_requirement_single_partition() -> Result<()> {
+    let schema = create_test_schema()?;
+    let sort_exprs: LexOrdering = [sort_expr("nullable_col", &schema)].into();
+    let requirement = [PhysicalSortRequirement::new(
+        col("nullable_col", &schema)?,
+        Some(SortOptions::new(false, true)),
+    )]
+    .into();
+
+    // Plan entering pushdown_sorts:
+    //   OutputRequirementExec (dist=SinglePartition)
+    //     SortPreservingMergeExec [nullable_col@0]
+    //       SortExec [nullable_col@0] (preserve_partitioning=true)
+    //         RepartitionExec (10 partitions)
+    //           DataSource
+    let source = memory_exec(&schema);
+    let repartitioned = repartition_exec(source);
+    let sorted = sort_exec_with_preserve_partitioning(sort_exprs.clone(), repartitioned);
+    let merged = sort_preserving_merge_exec(sort_exprs.clone(), sorted);
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(OutputRequirementExec::new(
+        merged,
+        Some(OrderingRequirements::new(requirement)),
+        Distribution::SinglePartition,
+        None,
+    ));
+
+    let mut sort_pushdown = SortPushDown::new_default(Arc::clone(&plan));
+    assign_initial_requirements(&mut sort_pushdown);
+    let result = pushdown_sorts(sort_pushdown)?;
+
+    // The plan is already optimal; no extra SortPreservingMergeExec should appear.
+    assert_snapshot!(
+        displayable(result.plan.as_ref()).indent(true).to_string(),
+        @r"
+    OutputRequirementExec: order_by=[(nullable_col@0, asc)], dist_by=SinglePartition
+      SortPreservingMergeExec: [nullable_col@0 ASC]
+        SortExec: expr=[nullable_col@0 ASC], preserve_partitioning=[true]
+          RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+            DataSourceExec: partitions=1, partition_sizes=[0]
+    "
+    );
+    Ok(())
+}
+
+/// Positive test: when `OutputRequirementExec` carries `SinglePartition` and
+/// sort pushdown reaches a multi-partition node through a projection, it must
+/// insert both `SortExec(preserve_partitioning=true)` AND
+/// `SortPreservingMergeExec` -- the core behaviour added by commit 45620e982.
+#[test]
+fn test_sort_pushdown_adds_spm_for_single_partition_requirement() -> Result<()> {
+    let schema = create_test_schema()?;
+    let requirement = [PhysicalSortRequirement::new(
+        col("nullable_col", &schema)?,
+        Some(SortOptions::new(false, true)),
+    )]
+    .into();
+
+    // Plan entering pushdown_sorts:
+    //   OutputRequirementExec (dist=SinglePartition, order=[nullable_col@0])
+    //     ProjectionExec (identity)
+    //       RepartitionExec (10 partitions)
+    //         DataSource
+    let source = memory_exec(&schema);
+    let repartitioned = repartition_exec(source);
+    let projected = simple_projection_exec(repartitioned, vec![0, 1]);
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(OutputRequirementExec::new(
+        projected,
+        Some(OrderingRequirements::new(requirement)),
+        Distribution::SinglePartition,
+        None,
+    ));
+
+    let mut sort_pushdown = SortPushDown::new_default(Arc::clone(&plan));
+    assign_initial_requirements(&mut sort_pushdown);
+    let result = pushdown_sorts(sort_pushdown)?;
+
+    // Sort is pushed through the projection; because SinglePartition is
+    // required, add_sort_above_with_distribution wraps it in SPM.
+    assert_snapshot!(
+        displayable(result.plan.as_ref()).indent(true).to_string(),
+        @r"
+    OutputRequirementExec: order_by=[(nullable_col@0, asc)], dist_by=SinglePartition
+      SortPreservingMergeExec: [nullable_col@0 ASC]
+        SortExec: expr=[nullable_col@0 ASC], preserve_partitioning=[true]
+          ProjectionExec: expr=[nullable_col@0 as nullable_col, non_nullable_col@1 as non_nullable_col]
+            RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+              DataSourceExec: partitions=1, partition_sizes=[0]
+    "
+    );
     Ok(())
 }
 
