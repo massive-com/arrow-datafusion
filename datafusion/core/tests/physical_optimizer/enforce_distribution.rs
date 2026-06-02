@@ -54,7 +54,9 @@ use datafusion_physical_expr_common::sort_expr::{
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_optimizer::enforce_distribution::*;
 use datafusion_physical_optimizer::enforce_sorting::EnforceSorting;
-use datafusion_physical_optimizer::output_requirements::OutputRequirements;
+use datafusion_physical_optimizer::output_requirements::{
+    OutputRequirementExec, OutputRequirements,
+};
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
 };
@@ -70,7 +72,8 @@ use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties, displayable,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlanProperties, PlanProperties,
+    displayable,
 };
 use insta::Settings;
 
@@ -3754,7 +3757,8 @@ async fn test_distribute_sort_parquet() -> Result<()> {
     );
 
     let schema = schema();
-    let sort_key = [PhysicalSortExpr::new_default(col("c", &schema)?)].into();
+    let sort_key: LexOrdering =
+        [PhysicalSortExpr::new_default(col("c", &schema)?)].into();
     let physical_plan = sort_exec(sort_key, parquet_exec_with_stats(10000 * 8192));
 
     // prior to optimization, this is the starting plan
@@ -3865,19 +3869,49 @@ fn test_replace_order_preserving_variants_with_fetch() -> Result<()> {
     );
 
     // Apply the function
-    let result = replace_order_preserving_variants(dist_context)?;
+    let result = replace_order_preserving_variants(dist_context, false)?;
 
     // Verify the plan was transformed to CoalescePartitionsExec
     result
+        .0
         .plan
         .downcast_ref::<CoalescePartitionsExec>()
         .expect("Expected CoalescePartitionsExec");
 
     // Verify fetch was preserved
     assert_eq!(
-        result.plan.fetch(),
+        result.0.plan.fetch(),
         Some(5),
         "Fetch value was not preserved after transformation"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn enforce_distribution_preserves_removed_spm_fetch() -> Result<()> {
+    let schema = schema();
+    let sort_key: LexOrdering =
+        [PhysicalSortExpr::new_default(col("c", &schema)?)].into();
+    let input = repartition_exec(parquet_exec_with_sort(schema, vec![sort_key.clone()]));
+    let spm = Arc::new(
+        SortPreservingMergeExec::new(sort_key.clone(), input).with_fetch(Some(2)),
+    ) as Arc<dyn ExecutionPlan>;
+    let plan = Arc::new(OutputRequirementExec::new(
+        spm,
+        Some(OrderingRequirements::from(sort_key)),
+        Distribution::SinglePartition,
+        Some(2),
+    )) as Arc<dyn ExecutionPlan>;
+
+    let mut config = ConfigOptions::new();
+    config.optimizer.prefer_existing_sort = true;
+    let optimized = EnforceDistribution::new().optimize(plan, &config)?;
+    let plan = displayable(optimized.as_ref()).indent(true).to_string();
+
+    assert!(
+        plan.contains("SortPreservingMergeExec: [c@2 ASC], fetch=2"),
+        "expected EnforceDistribution to preserve SortPreservingMergeExec fetch:\n{plan}"
     );
 
     Ok(())
