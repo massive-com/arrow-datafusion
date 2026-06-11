@@ -21796,6 +21796,9 @@ impl serde::Serialize for SortExecNode {
         if self.preserve_partitioning {
             len += 1;
         }
+        if self.dynamic_filter.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.SortExecNode", len)?;
         if let Some(v) = self.input.as_ref() {
             struct_ser.serialize_field("input", v)?;
@@ -21810,6 +21813,9 @@ impl serde::Serialize for SortExecNode {
         }
         if self.preserve_partitioning {
             struct_ser.serialize_field("preservePartitioning", &self.preserve_partitioning)?;
+        }
+        if let Some(v) = self.dynamic_filter.as_ref() {
+            struct_ser.serialize_field("dynamicFilter", v)?;
         }
         struct_ser.end()
     }
@@ -21826,6 +21832,8 @@ impl<'de> serde::Deserialize<'de> for SortExecNode {
             "fetch",
             "preserve_partitioning",
             "preservePartitioning",
+            "dynamic_filter",
+            "dynamicFilter",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -21834,6 +21842,7 @@ impl<'de> serde::Deserialize<'de> for SortExecNode {
             Expr,
             Fetch,
             PreservePartitioning,
+            DynamicFilter,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -21859,6 +21868,7 @@ impl<'de> serde::Deserialize<'de> for SortExecNode {
                             "expr" => Ok(GeneratedField::Expr),
                             "fetch" => Ok(GeneratedField::Fetch),
                             "preservePartitioning" | "preserve_partitioning" => Ok(GeneratedField::PreservePartitioning),
+                            "dynamicFilter" | "dynamic_filter" => Ok(GeneratedField::DynamicFilter),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -21882,6 +21892,7 @@ impl<'de> serde::Deserialize<'de> for SortExecNode {
                 let mut expr__ = None;
                 let mut fetch__ = None;
                 let mut preserve_partitioning__ = None;
+                let mut dynamic_filter__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Input => {
@@ -21910,6 +21921,12 @@ impl<'de> serde::Deserialize<'de> for SortExecNode {
                             }
                             preserve_partitioning__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::DynamicFilter => {
+                            if dynamic_filter__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("dynamicFilter"));
+                            }
+                            dynamic_filter__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(SortExecNode {
@@ -21917,6 +21934,7 @@ impl<'de> serde::Deserialize<'de> for SortExecNode {
                     expr: expr__.unwrap_or_default(),
                     fetch: fetch__.unwrap_or_default(),
                     preserve_partitioning: preserve_partitioning__.unwrap_or_default(),
+                    dynamic_filter: dynamic_filter__,
                 })
             }
         }

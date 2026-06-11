@@ -1950,6 +1950,15 @@ pub struct SortExecNode {
     pub fetch: i64,
     #[prost(bool, tag = "4")]
     pub preserve_partitioning: bool,
+    /// Ported from apache/datafusion#22011 (minimal subset). Carries the
+    /// SortExec's internal `DynamicFilterPhysicalExpr` so the decode side
+    /// can install it via `with_dynamic_filter_expr` instead of letting
+    /// `with_fetch(...).create_filter()` mint a brand-new one. Combined with
+    /// the #21807 PhysicalDynamicFilterNode + dedup-by-expression_id, the
+    /// resulting decoded plan re-shares the Arc<Inner> with the pushed-down
+    /// FileScan predicate (X-2935 walker becomes redundant).
+    #[prost(message, optional, tag = "5")]
+    pub dynamic_filter: ::core::option::Option<PhysicalExprNode>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SortPreservingMergeExecNode {

@@ -3333,3 +3333,77 @@ fn dynamic_filter_roundtrip_without_dedup() -> Result<()> {
     }
     Ok(())
 }
+
+/// Validates the apache/datafusion#22011 minimal port:
+/// `SortExecNode` now carries its internal `DynamicFilterPhysicalExpr` on
+/// the wire, and `try_into_sort_physical_plan` re-installs it via
+/// `with_dynamic_filter_expr` instead of letting `with_fetch(...).create_filter()`
+/// mint a fresh one.
+///
+/// With this in place, the SortExec's filter and any other reference to the
+/// same logical filter (e.g. a FileScan predicate after FilterPushdown)
+/// share the SAME `Arc<DynamicFilterPhysicalExpr>` post-decode via the
+/// `DeduplicatingDeserializer` cache keyed on `expression_id`.
+#[test]
+fn sort_exec_proto_roundtrip_preserves_dyn_filter_arc() -> Result<()> {
+    use datafusion::physical_plan::expressions::Column;
+    use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+    use datafusion_proto::physical_plan::{
+        DeduplicatingDeserializer, DeduplicatingSerializer,
+        DefaultPhysicalExtensionCodec, PhysicalProtoConverterExtension,
+    };
+    use datafusion_proto::protobuf::PhysicalPlanNode;
+    use prost::Message;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let initial: Arc<dyn PhysicalExpr> = lit(true);
+    let children: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("a", 0))];
+    let df = Arc::new(DynamicFilterPhysicalExpr::new(
+        children,
+        Arc::clone(&initial),
+    ));
+    let expected_id = df.inner().expression_id;
+
+    let ordering = LexOrdering::new(vec![PhysicalSortExpr {
+        expr: Arc::new(Column::new("a", 0)),
+        options: SortOptions {
+            descending: false,
+            nulls_first: false,
+        },
+    }])
+    .unwrap();
+    let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+    let sort = Arc::new(
+        SortExec::new(ordering, input)
+            .with_fetch(Some(10))
+            .with_dynamic_filter_expr(Arc::clone(&df))?,
+    ) as Arc<dyn ExecutionPlan>;
+
+    let codec = DefaultPhysicalExtensionCodec {};
+    let serializer = DeduplicatingSerializer::new();
+    let proto = serializer.execution_plan_to_proto(&sort, &codec)?;
+    let buf = proto.encode_to_vec();
+    let decoded_proto = PhysicalPlanNode::decode(buf.as_slice()).map_err(|e| {
+        datafusion_common::DataFusionError::Internal(format!("decode failed: {e}"))
+    })?;
+
+    let ctx = SessionContext::new().task_ctx();
+    let deserializer = DeduplicatingDeserializer::new();
+    let decoded = deserializer.proto_to_execution_plan(&ctx, &codec, &decoded_proto)?;
+
+    let decoded_sort = decoded
+        .as_any()
+        .downcast_ref::<SortExec>()
+        .expect("decoded plan must be SortExec");
+    let decoded_df = decoded_sort
+        .dynamic_filter_expr()
+        .expect("decoded SortExec must have a dynamic filter installed via with_dynamic_filter_expr");
+
+    assert_eq!(
+        decoded_df.inner().expression_id,
+        expected_id,
+        "SortExec proto must carry expression_id end-to-end so the decoder \
+         can re-share Arc<Inner> with the FileScan predicate via the dedup cache",
+    );
+    Ok(())
+}
