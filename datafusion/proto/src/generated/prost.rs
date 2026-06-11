@@ -1294,7 +1294,7 @@ pub struct PhysicalExprNode {
     pub expr_id: ::core::option::Option<u64>,
     #[prost(
         oneof = "physical_expr_node::ExprType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 23"
     )]
     pub expr_type: ::core::option::Option<physical_expr_node::ExprType>,
 }
@@ -1347,7 +1347,37 @@ pub mod physical_expr_node {
         UnknownColumn(super::UnknownColumn),
         #[prost(message, tag = "21")]
         HashExpr(super::PhysicalHashExprNode),
+        /// Ported from apache/datafusion#21807 (minimal subset). Allows a
+        /// DynamicFilterPhysicalExpr to roundtrip through proto with its wrapper
+        /// intact, so the receiver (combined with DeduplicatingDeserializer)
+        /// can rebuild a shared Arc<Inner> across e.g. SortExec.filter and the
+        /// FileScan predicate pushed down from it.
+        ///
+        /// Field 22 is intentionally skipped to match upstream's field number
+        /// for a future scalar_subquery variant atlas doesn't need yet.
+        #[prost(message, tag = "23")]
+        DynamicFilter(::prost::alloc::boxed::Box<super::PhysicalDynamicFilterNode>),
     }
+}
+/// Ported from apache/datafusion#21807. See `dynamic_filter = 23` above.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PhysicalDynamicFilterNode {
+    #[prost(message, repeated, tag = "1")]
+    pub children: ::prost::alloc::vec::Vec<PhysicalExprNode>,
+    #[prost(message, repeated, tag = "2")]
+    pub remapped_children: ::prost::alloc::vec::Vec<PhysicalExprNode>,
+    #[prost(uint64, tag = "3")]
+    pub generation: u64,
+    #[prost(message, optional, boxed, tag = "4")]
+    pub inner_expr: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalExprNode>>,
+    #[prost(bool, tag = "5")]
+    pub is_complete: bool,
+    /// Stable identity of this dynamic filter. References with the same id
+    /// MUST deserialize to the same Arc<DynamicFilterPhysicalExpr> so heap-max
+    /// updates propagate from SortExec to the FileScan predicate it was
+    /// pushed down to.
+    #[prost(uint64, tag = "6")]
+    pub expression_id: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalScalarUdfNode {

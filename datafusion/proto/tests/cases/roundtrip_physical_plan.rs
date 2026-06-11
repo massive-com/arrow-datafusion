@@ -3167,3 +3167,97 @@ fn roundtrip_lead_with_default_value() -> Result<()> {
         true,
     )?))
 }
+
+/// Validates the apache/datafusion#21807 minimal port: a
+/// `DynamicFilterPhysicalExpr` survives proto roundtrip (the wrapper is no
+/// longer snapshotted away), and the existing `DeduplicatingSerializer` +
+/// `DeduplicatingDeserializer` pair share a single `Arc` for two refs of
+/// the same logical filter. This is what lets atlas drop the post-decode
+/// walker (X-2935).
+#[test]
+fn dynamic_filter_dedup_with_deduplicating_codec() -> Result<()> {
+    use datafusion::physical_plan::expressions::Column;
+    use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+    use datafusion_proto::physical_plan::{
+        DeduplicatingDeserializer, DeduplicatingSerializer,
+        PhysicalProtoConverterExtension,
+    };
+
+    let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
+    let initial: Arc<dyn PhysicalExpr> = lit(true);
+    let children: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("a", 0))];
+    let df = Arc::new(DynamicFilterPhysicalExpr::new(children, Arc::clone(&initial)));
+    let id_before = df.inner().expression_id;
+
+    let codec = DefaultPhysicalExtensionCodec {};
+    let serializer = DeduplicatingSerializer::new();
+    let proto1 =
+        serializer.physical_expr_to_proto(&(df.clone() as Arc<dyn PhysicalExpr>), &codec)?;
+    let proto2 =
+        serializer.physical_expr_to_proto(&(df.clone() as Arc<dyn PhysicalExpr>), &codec)?;
+
+    assert_eq!(
+        proto1.expr_id, proto2.expr_id,
+        "two refs to the same Arc must get the same expr_id"
+    );
+
+    let ctx = SessionContext::new().task_ctx();
+    let deserializer = DeduplicatingDeserializer::new();
+    let d1 = deserializer.proto_to_physical_expr(&proto1, &ctx, &schema, &codec)?;
+    let d2 = deserializer.proto_to_physical_expr(&proto2, &ctx, &schema, &codec)?;
+
+    assert!(
+        Arc::ptr_eq(&d1, &d2),
+        "DeduplicatingDeserializer must return the same Arc for two refs with the same expr_id"
+    );
+
+    let d1_df = d1
+        .as_any()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .expect("decoded expr must be DynamicFilterPhysicalExpr; snapshot path is bypassed");
+    assert_eq!(
+        d1_df.inner().expression_id,
+        id_before,
+        "expression_id must survive proto roundtrip"
+    );
+
+    Ok(())
+}
+
+/// Without the deduplicating codec, two decodes still both reconstruct the
+/// wrapper (no snapshotting) but get distinct Arcs. Guards the invariant
+/// that the wire format itself is dedup-agnostic; dedup is the codec's
+/// job, not the proto layer's.
+#[test]
+fn dynamic_filter_roundtrip_without_dedup() -> Result<()> {
+    use datafusion::physical_plan::expressions::Column;
+    use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+    use datafusion_proto::physical_plan::from_proto::parse_physical_expr;
+    use datafusion_proto::physical_plan::to_proto::serialize_physical_expr;
+
+    let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
+    let initial: Arc<dyn PhysicalExpr> = lit(true);
+    let children: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("a", 0))];
+    let df = Arc::new(DynamicFilterPhysicalExpr::new(children, Arc::clone(&initial)));
+    let id_before = df.inner().expression_id;
+
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto = serialize_physical_expr(&(df.clone() as Arc<dyn PhysicalExpr>), &codec)?;
+    let ctx = SessionContext::new().task_ctx();
+
+    let d1 = parse_physical_expr(&proto, &ctx, &schema, &codec)?;
+    let d2 = parse_physical_expr(&proto, &ctx, &schema, &codec)?;
+
+    // Default codec produces distinct Arcs, but each is still a
+    // DynamicFilterPhysicalExpr (the wrapper survived).
+    assert!(!Arc::ptr_eq(&d1, &d2));
+    for d in [&d1, &d2] {
+        let inner = d
+            .as_any()
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .expect("decoded expr must be DynamicFilterPhysicalExpr")
+            .inner();
+        assert_eq!(inner.expression_id, id_before);
+    }
+    Ok(())
+}

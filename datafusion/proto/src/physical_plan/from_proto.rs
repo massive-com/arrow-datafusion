@@ -38,6 +38,9 @@ use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{FunctionRegistry, TaskContext};
 use datafusion_expr::WindowFunctionDefinition;
 use datafusion_expr::dml::InsertOp;
+use datafusion_physical_expr::expressions::{
+    DynamicFilterInner, DynamicFilterPhysicalExpr,
+};
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
 use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, ScalarFunctionExpr};
 use datafusion_physical_plan::expressions::{
@@ -504,6 +507,62 @@ pub fn parse_physical_expr_with_converter(
                 })
                 .collect::<Result<_>>()?;
             codec.try_decode_expr(extension.expr.as_slice(), &inputs)? as _
+        }
+        ExprType::DynamicFilter(df_proto) => {
+            // Reconstruct the DynamicFilterPhysicalExpr wrapper. When this
+            // path is reached through a `DeduplicatingDeserializer`,
+            // identical expression_id references in the same plan share
+            // the resulting Arc<Inner> via the deserializer's cache, so
+            // SortExec heap-max updates propagate to the FileScan predicate
+            // it was pushed down to.
+            //
+            // Ported from upstream apache/datafusion#21807 (minimal subset).
+            let inner_expr = match df_proto.inner_expr.as_deref() {
+                Some(p) => proto_converter
+                    .proto_to_physical_expr(p, ctx, input_schema, codec)?,
+                None => {
+                    return Err(proto_error(
+                        "PhysicalDynamicFilterNode missing inner_expr",
+                    ));
+                }
+            };
+            let children = df_proto
+                .children
+                .iter()
+                .map(|c| {
+                    proto_converter
+                        .proto_to_physical_expr(c, ctx, input_schema, codec)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let remapped_children = if df_proto.remapped_children.is_empty() {
+                None
+            } else {
+                Some(
+                    df_proto
+                        .remapped_children
+                        .iter()
+                        .map(|c| {
+                            proto_converter.proto_to_physical_expr(
+                                c,
+                                ctx,
+                                input_schema,
+                                codec,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            };
+            let inner = DynamicFilterInner {
+                expression_id: df_proto.expression_id,
+                generation: df_proto.generation,
+                expr: inner_expr,
+                is_complete: df_proto.is_complete,
+            };
+            Arc::new(DynamicFilterPhysicalExpr::from_parts(
+                children,
+                remapped_children,
+                inner,
+            ))
         }
     };
 

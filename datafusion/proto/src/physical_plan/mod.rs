@@ -3821,18 +3821,29 @@ impl PhysicalProtoConverterExtension for DefaultPhysicalProtoConverter {
     }
 }
 
-/// Internal serializer that adds expr_id to expressions.
-/// Created fresh for each serialization operation.
-struct DeduplicatingSerializer {
+/// Serializer that adds an Arc-identity-derived expr_id to every emitted
+/// `PhysicalExprNode`. Created fresh for each serialization operation.
+///
+/// Made `pub` so atlas's coordinator-side codec can opt into Arc-identity
+/// dedup. Combined with the apache/datafusion#21807 minimal port that
+/// keeps `DynamicFilterPhysicalExpr` alive across the wire, this is what
+/// lets atlas retire the post-deserialize walker (X-2935).
+pub struct DeduplicatingSerializer {
     /// Random salt combined with pointer addresses and process ID to create globally unique expr_ids.
     session_id: u64,
 }
 
 impl DeduplicatingSerializer {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             session_id: rand::random(),
         }
+    }
+}
+
+impl Default for DeduplicatingSerializer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -3895,12 +3906,22 @@ impl PhysicalProtoConverterExtension for DeduplicatingSerializer {
     }
 }
 
-/// Internal deserializer that caches expressions by expr_id.
-/// Created fresh for each deserialization operation.
+/// Deserializer that caches expressions by `expr_id` so multiple references
+/// in a plan reconstruct to the same `Arc`. Created fresh for each
+/// deserialization operation.
+///
+/// Made `pub` for atlas's data-server-side codec; see
+/// [`DeduplicatingSerializer`].
 #[derive(Default)]
-struct DeduplicatingDeserializer {
+pub struct DeduplicatingDeserializer {
     /// Cache mapping expr_id to deserialized expressions.
     cache: RefCell<HashMap<u64, Arc<dyn PhysicalExpr>>>,
+}
+
+impl DeduplicatingDeserializer {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
