@@ -3892,13 +3892,35 @@ impl PhysicalProtoConverterExtension for DeduplicatingSerializer {
     ) -> Result<protobuf::PhysicalExprNode> {
         let mut proto = serialize_physical_expr_with_converter(expr, codec, self)?;
 
-        // Hash session_id, pointer address, and process ID together to create expr_id.
-        // - session_id: random per serializer, prevents collisions when merging serializations
-        // - ptr: unique address per Arc within a process
-        // - pid: prevents collisions if serializer is shared across processes
+        // Pick the dedup identity for this expression.
+        //
+        // 1. If the expression reports a stable `expression_id()` (currently
+        //    `DynamicFilterPhysicalExpr` does), use that. This is preserved
+        //    across `with_new_children`, so two outer Arcs that share the
+        //    same `Inner` (e.g. SortExec.filter and the FileScan predicate
+        //    that `FilterPushdown` clones from it) still hash to the same
+        //    expr_id and reconstruct to one Arc on decode.
+        //    Mirrors upstream apache/datafusion#21807 behavior.
+        // 2. Otherwise fall back to `Arc::as_ptr` for plain expressions
+        //    where Arc identity is the only sharing signal we have.
+        //
+        // session_id + pid are mixed in either way to avoid collisions if
+        // serializations from different processes are concatenated.
         let mut hasher = DefaultHasher::new();
         self.session_id.hash(&mut hasher);
-        (Arc::as_ptr(expr) as *const () as u64).hash(&mut hasher);
+        match expr.expression_id() {
+            Some(eid) => {
+                // Tag the identity space so a 0 expression_id can't collide
+                // with the 0 address fallback. Tag value is arbitrary, just
+                // must differ between the two branches.
+                0u8.hash(&mut hasher);
+                eid.hash(&mut hasher);
+            }
+            None => {
+                1u8.hash(&mut hasher);
+                (Arc::as_ptr(expr) as *const () as u64).hash(&mut hasher);
+            }
+        }
         std::process::id().hash(&mut hasher);
         proto.expr_id = Some(hasher.finish());
 

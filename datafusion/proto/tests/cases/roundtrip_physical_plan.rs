@@ -3224,6 +3224,78 @@ fn dynamic_filter_dedup_with_deduplicating_codec() -> Result<()> {
     Ok(())
 }
 
+/// Two distinct outer Arcs that share the same `Inner` (e.g. via
+/// `with_new_children`) must still dedup to the same decoded Arc, because
+/// `DeduplicatingSerializer` now hashes on `expression_id` (which is
+/// preserved across `with_new_children`) rather than `Arc::as_ptr`.
+///
+/// This is the case `FilterPushdown` produces: it clones the SortExec's
+/// dyn filter and pushes it down to the FileScan; the FileScan's outer
+/// Arc may differ from the SortExec's, but they share the same Inner.
+#[test]
+fn dynamic_filter_dedup_distinct_outer_arcs_same_inner() -> Result<()> {
+    use datafusion::physical_plan::expressions::Column;
+    use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+    use datafusion_proto::physical_plan::{
+        DeduplicatingDeserializer, DeduplicatingSerializer,
+        PhysicalProtoConverterExtension,
+    };
+
+    let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
+    let initial: Arc<dyn PhysicalExpr> = lit(true);
+    let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+    let df_arc1: Arc<dyn PhysicalExpr> = Arc::new(
+        DynamicFilterPhysicalExpr::new(vec![Arc::clone(&col_a)], Arc::clone(&initial)),
+    );
+    let expected_id = df_arc1
+        .as_any()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .unwrap()
+        .inner()
+        .expression_id;
+
+    // Build a second outer Arc that shares df_arc1's Inner via with_new_children.
+    // This mimics what FilterPushdown does when pushing a dyn filter through a
+    // ProjectionExec: it preserves the inner state Arc, only the outer wrapper
+    // is new.
+    let df_arc2 = Arc::clone(&df_arc1).with_new_children(vec![col_a])?;
+    assert!(
+        !Arc::ptr_eq(&df_arc1, &df_arc2),
+        "with_new_children must yield a distinct outer Arc; otherwise this test is trivial"
+    );
+    assert_eq!(
+        df_arc2
+            .as_any()
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .unwrap()
+            .inner()
+            .expression_id,
+        expected_id,
+        "expression_id must be preserved across with_new_children",
+    );
+
+    let codec = DefaultPhysicalExtensionCodec {};
+    let serializer = DeduplicatingSerializer::new();
+    let proto1 = serializer.physical_expr_to_proto(&df_arc1, &codec)?;
+    let proto2 = serializer.physical_expr_to_proto(&df_arc2, &codec)?;
+    assert_eq!(
+        proto1.expr_id, proto2.expr_id,
+        "DeduplicatingSerializer must hash on expression_id, NOT Arc::as_ptr, \
+         so two outer Arcs sharing the same Inner get the same wire expr_id",
+    );
+
+    let ctx = SessionContext::new().task_ctx();
+    let deserializer = DeduplicatingDeserializer::new();
+    let d1 = deserializer.proto_to_physical_expr(&proto1, &ctx, &schema, &codec)?;
+    let d2 = deserializer.proto_to_physical_expr(&proto2, &ctx, &schema, &codec)?;
+    assert!(
+        Arc::ptr_eq(&d1, &d2),
+        "Distinct-outer same-Inner refs must reconstruct to one Arc"
+    );
+
+    Ok(())
+}
+
 /// Without the deduplicating codec, two decodes still both reconstruct the
 /// wrapper (no snapshotting) but get distinct Arcs. Guards the invariant
 /// that the wire format itself is dedup-agnostic; dedup is the codec's
