@@ -576,7 +576,12 @@ pub fn serialize_physical_expr_with_converter(
         })
     } else {
         let mut buf: Vec<u8> = vec![];
-        match codec.try_encode_expr(&value, &mut buf) {
+        // Use the converter-aware encode entry point so extension codecs
+        // that embed nested `PhysicalExprNode` fields can thread the
+        // active `proto_converter` (e.g. `DeduplicatingSerializer`) into
+        // their own serialization of those nested expressions, preserving
+        // Arc-identity dedup end-to-end.
+        match codec.try_encode_expr(&value, &mut buf, proto_converter) {
             Ok(_) => {
                 let inputs: Vec<protobuf::PhysicalExprNode> = value
                     .children()

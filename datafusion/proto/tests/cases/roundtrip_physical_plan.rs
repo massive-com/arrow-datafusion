@@ -1141,6 +1141,7 @@ fn roundtrip_parquet_exec_with_custom_predicate_expr() -> Result<()> {
             _buf: &[u8],
             _inputs: &[Arc<dyn ExecutionPlan>],
             _ctx: &TaskContext,
+            _proto_converter: &dyn PhysicalProtoConverterExtension,
         ) -> Result<Arc<dyn ExecutionPlan>> {
             unreachable!()
         }
@@ -1149,6 +1150,7 @@ fn roundtrip_parquet_exec_with_custom_predicate_expr() -> Result<()> {
             &self,
             _node: Arc<dyn ExecutionPlan>,
             _buf: &mut Vec<u8>,
+            _proto_converter: &dyn PhysicalProtoConverterExtension,
         ) -> Result<()> {
             unreachable!()
         }
@@ -1157,6 +1159,7 @@ fn roundtrip_parquet_exec_with_custom_predicate_expr() -> Result<()> {
             &self,
             buf: &[u8],
             inputs: &[Arc<dyn PhysicalExpr>],
+            _proto_converter: &dyn PhysicalProtoConverterExtension,
         ) -> Result<Arc<dyn PhysicalExpr>> {
             if buf == "CustomPredicateExpr".as_bytes() {
                 Ok(Arc::new(CustomPredicateExpr {
@@ -1171,6 +1174,7 @@ fn roundtrip_parquet_exec_with_custom_predicate_expr() -> Result<()> {
             &self,
             node: &Arc<dyn PhysicalExpr>,
             buf: &mut Vec<u8>,
+            _proto_converter: &dyn PhysicalProtoConverterExtension,
         ) -> Result<()> {
             if node
                 .as_any()
@@ -1254,6 +1258,7 @@ impl PhysicalExtensionCodec for UDFExtensionCodec {
         _buf: &[u8],
         _inputs: &[Arc<dyn ExecutionPlan>],
         _ctx: &TaskContext,
+        _proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         not_impl_err!("No extension codec provided")
     }
@@ -1262,6 +1267,7 @@ impl PhysicalExtensionCodec for UDFExtensionCodec {
         &self,
         _node: Arc<dyn ExecutionPlan>,
         _buf: &mut Vec<u8>,
+        _proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
         not_impl_err!("No extension codec provided")
     }
@@ -3186,15 +3192,18 @@ fn dynamic_filter_dedup_with_deduplicating_codec() -> Result<()> {
     let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
     let initial: Arc<dyn PhysicalExpr> = lit(true);
     let children: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("a", 0))];
-    let df = Arc::new(DynamicFilterPhysicalExpr::new(children, Arc::clone(&initial)));
+    let df = Arc::new(DynamicFilterPhysicalExpr::new(
+        children,
+        Arc::clone(&initial),
+    ));
     let id_before = df.inner().expression_id;
 
     let codec = DefaultPhysicalExtensionCodec {};
     let serializer = DeduplicatingSerializer::new();
-    let proto1 =
-        serializer.physical_expr_to_proto(&(df.clone() as Arc<dyn PhysicalExpr>), &codec)?;
-    let proto2 =
-        serializer.physical_expr_to_proto(&(df.clone() as Arc<dyn PhysicalExpr>), &codec)?;
+    let proto1 = serializer
+        .physical_expr_to_proto(&(df.clone() as Arc<dyn PhysicalExpr>), &codec)?;
+    let proto2 = serializer
+        .physical_expr_to_proto(&(df.clone() as Arc<dyn PhysicalExpr>), &codec)?;
 
     assert_eq!(
         proto1.expr_id, proto2.expr_id,
@@ -3214,7 +3223,9 @@ fn dynamic_filter_dedup_with_deduplicating_codec() -> Result<()> {
     let d1_df = d1
         .as_any()
         .downcast_ref::<DynamicFilterPhysicalExpr>()
-        .expect("decoded expr must be DynamicFilterPhysicalExpr; snapshot path is bypassed");
+        .expect(
+            "decoded expr must be DynamicFilterPhysicalExpr; snapshot path is bypassed",
+        );
     assert_eq!(
         d1_df.inner().expression_id,
         id_before,
@@ -3244,9 +3255,10 @@ fn dynamic_filter_dedup_distinct_outer_arcs_same_inner() -> Result<()> {
     let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
     let initial: Arc<dyn PhysicalExpr> = lit(true);
     let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
-    let df_arc1: Arc<dyn PhysicalExpr> = Arc::new(
-        DynamicFilterPhysicalExpr::new(vec![Arc::clone(&col_a)], Arc::clone(&initial)),
-    );
+    let df_arc1: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![Arc::clone(&col_a)],
+        Arc::clone(&initial),
+    ));
     let expected_id = df_arc1
         .as_any()
         .downcast_ref::<DynamicFilterPhysicalExpr>()
@@ -3310,7 +3322,10 @@ fn dynamic_filter_roundtrip_without_dedup() -> Result<()> {
     let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
     let initial: Arc<dyn PhysicalExpr> = lit(true);
     let children: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("a", 0))];
-    let df = Arc::new(DynamicFilterPhysicalExpr::new(children, Arc::clone(&initial)));
+    let df = Arc::new(DynamicFilterPhysicalExpr::new(
+        children,
+        Arc::clone(&initial),
+    ));
     let id_before = df.inner().expression_id;
 
     let codec = DefaultPhysicalExtensionCodec {};

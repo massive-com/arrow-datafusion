@@ -506,7 +506,12 @@ pub fn parse_physical_expr_with_converter(
                     proto_converter.proto_to_physical_expr(e, ctx, input_schema, codec)
                 })
                 .collect::<Result<_>>()?;
-            codec.try_decode_expr(extension.expr.as_slice(), &inputs)? as _
+            // Use the converter-aware decode entry point so extension codecs
+            // that embed nested `PhysicalExprNode` fields can thread the
+            // active `proto_converter` into their own parsing of those
+            // nested expressions, sharing the dedup cache.
+            codec.try_decode_expr(extension.expr.as_slice(), &inputs, proto_converter)?
+                as _
         }
         ExprType::DynamicFilter(df_proto) => {
             // Reconstruct the DynamicFilterPhysicalExpr wrapper. When this
@@ -518,8 +523,9 @@ pub fn parse_physical_expr_with_converter(
             //
             // Ported from upstream apache/datafusion#21807 (minimal subset).
             let inner_expr = match df_proto.inner_expr.as_deref() {
-                Some(p) => proto_converter
-                    .proto_to_physical_expr(p, ctx, input_schema, codec)?,
+                Some(p) => {
+                    proto_converter.proto_to_physical_expr(p, ctx, input_schema, codec)?
+                }
                 None => {
                     return Err(proto_error(
                         "PhysicalDynamicFilterNode missing inner_expr",
@@ -530,8 +536,7 @@ pub fn parse_physical_expr_with_converter(
                 .children
                 .iter()
                 .map(|c| {
-                    proto_converter
-                        .proto_to_physical_expr(c, ctx, input_schema, codec)
+                    proto_converter.proto_to_physical_expr(c, ctx, input_schema, codec)
                 })
                 .collect::<Result<Vec<_>>>()?;
             let remapped_children = if df_proto.remapped_children.is_empty() {
