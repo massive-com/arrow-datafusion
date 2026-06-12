@@ -16244,6 +16244,194 @@ impl<'de> serde::Deserialize<'de> for PhysicalDateTimeIntervalExprNode {
         deserializer.deserialize_struct("datafusion.PhysicalDateTimeIntervalExprNode", FIELDS, GeneratedVisitor)
     }
 }
+impl serde::Serialize for PhysicalDynamicFilterNode {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.children.is_empty() {
+            len += 1;
+        }
+        if !self.remapped_children.is_empty() {
+            len += 1;
+        }
+        if self.generation != 0 {
+            len += 1;
+        }
+        if self.inner_expr.is_some() {
+            len += 1;
+        }
+        if self.is_complete {
+            len += 1;
+        }
+        if self.expression_id != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion.PhysicalDynamicFilterNode", len)?;
+        if !self.children.is_empty() {
+            struct_ser.serialize_field("children", &self.children)?;
+        }
+        if !self.remapped_children.is_empty() {
+            struct_ser.serialize_field("remappedChildren", &self.remapped_children)?;
+        }
+        if self.generation != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("generation", ToString::to_string(&self.generation).as_str())?;
+        }
+        if let Some(v) = self.inner_expr.as_ref() {
+            struct_ser.serialize_field("innerExpr", v)?;
+        }
+        if self.is_complete {
+            struct_ser.serialize_field("isComplete", &self.is_complete)?;
+        }
+        if self.expression_id != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("expressionId", ToString::to_string(&self.expression_id).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "children",
+            "remapped_children",
+            "remappedChildren",
+            "generation",
+            "inner_expr",
+            "innerExpr",
+            "is_complete",
+            "isComplete",
+            "expression_id",
+            "expressionId",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Children,
+            RemappedChildren,
+            Generation,
+            InnerExpr,
+            IsComplete,
+            ExpressionId,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "children" => Ok(GeneratedField::Children),
+                            "remappedChildren" | "remapped_children" => Ok(GeneratedField::RemappedChildren),
+                            "generation" => Ok(GeneratedField::Generation),
+                            "innerExpr" | "inner_expr" => Ok(GeneratedField::InnerExpr),
+                            "isComplete" | "is_complete" => Ok(GeneratedField::IsComplete),
+                            "expressionId" | "expression_id" => Ok(GeneratedField::ExpressionId),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = PhysicalDynamicFilterNode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion.PhysicalDynamicFilterNode")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<PhysicalDynamicFilterNode, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut children__ = None;
+                let mut remapped_children__ = None;
+                let mut generation__ = None;
+                let mut inner_expr__ = None;
+                let mut is_complete__ = None;
+                let mut expression_id__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Children => {
+                            if children__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("children"));
+                            }
+                            children__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::RemappedChildren => {
+                            if remapped_children__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("remappedChildren"));
+                            }
+                            remapped_children__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::Generation => {
+                            if generation__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("generation"));
+                            }
+                            generation__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::InnerExpr => {
+                            if inner_expr__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("innerExpr"));
+                            }
+                            inner_expr__ = map_.next_value()?;
+                        }
+                        GeneratedField::IsComplete => {
+                            if is_complete__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("isComplete"));
+                            }
+                            is_complete__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::ExpressionId => {
+                            if expression_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("expressionId"));
+                            }
+                            expression_id__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(PhysicalDynamicFilterNode {
+                    children: children__.unwrap_or_default(),
+                    remapped_children: remapped_children__.unwrap_or_default(),
+                    generation: generation__.unwrap_or_default(),
+                    inner_expr: inner_expr__,
+                    is_complete: is_complete__.unwrap_or_default(),
+                    expression_id: expression_id__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion.PhysicalDynamicFilterNode", FIELDS, GeneratedVisitor)
+    }
+}
 impl serde::Serialize for PhysicalExprNode {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -16323,6 +16511,9 @@ impl serde::Serialize for PhysicalExprNode {
                 physical_expr_node::ExprType::HashExpr(v) => {
                     struct_ser.serialize_field("hashExpr", v)?;
                 }
+                physical_expr_node::ExprType::DynamicFilter(v) => {
+                    struct_ser.serialize_field("dynamicFilter", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -16369,6 +16560,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
             "unknownColumn",
             "hash_expr",
             "hashExpr",
+            "dynamic_filter",
+            "dynamicFilter",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -16393,6 +16586,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
             Extension,
             UnknownColumn,
             HashExpr,
+            DynamicFilter,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -16434,6 +16628,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
                             "extension" => Ok(GeneratedField::Extension),
                             "unknownColumn" | "unknown_column" => Ok(GeneratedField::UnknownColumn),
                             "hashExpr" | "hash_expr" => Ok(GeneratedField::HashExpr),
+                            "dynamicFilter" | "dynamic_filter" => Ok(GeneratedField::DynamicFilter),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -16596,6 +16791,13 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
                                 return Err(serde::de::Error::duplicate_field("hashExpr"));
                             }
                             expr_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_expr_node::ExprType::HashExpr)
+;
+                        }
+                        GeneratedField::DynamicFilter => {
+                            if expr_type__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("dynamicFilter"));
+                            }
+                            expr_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_expr_node::ExprType::DynamicFilter)
 ;
                         }
                     }
@@ -21594,6 +21796,9 @@ impl serde::Serialize for SortExecNode {
         if self.preserve_partitioning {
             len += 1;
         }
+        if self.dynamic_filter.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.SortExecNode", len)?;
         if let Some(v) = self.input.as_ref() {
             struct_ser.serialize_field("input", v)?;
@@ -21608,6 +21813,9 @@ impl serde::Serialize for SortExecNode {
         }
         if self.preserve_partitioning {
             struct_ser.serialize_field("preservePartitioning", &self.preserve_partitioning)?;
+        }
+        if let Some(v) = self.dynamic_filter.as_ref() {
+            struct_ser.serialize_field("dynamicFilter", v)?;
         }
         struct_ser.end()
     }
@@ -21624,6 +21832,8 @@ impl<'de> serde::Deserialize<'de> for SortExecNode {
             "fetch",
             "preserve_partitioning",
             "preservePartitioning",
+            "dynamic_filter",
+            "dynamicFilter",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -21632,6 +21842,7 @@ impl<'de> serde::Deserialize<'de> for SortExecNode {
             Expr,
             Fetch,
             PreservePartitioning,
+            DynamicFilter,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -21657,6 +21868,7 @@ impl<'de> serde::Deserialize<'de> for SortExecNode {
                             "expr" => Ok(GeneratedField::Expr),
                             "fetch" => Ok(GeneratedField::Fetch),
                             "preservePartitioning" | "preserve_partitioning" => Ok(GeneratedField::PreservePartitioning),
+                            "dynamicFilter" | "dynamic_filter" => Ok(GeneratedField::DynamicFilter),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -21680,6 +21892,7 @@ impl<'de> serde::Deserialize<'de> for SortExecNode {
                 let mut expr__ = None;
                 let mut fetch__ = None;
                 let mut preserve_partitioning__ = None;
+                let mut dynamic_filter__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Input => {
@@ -21708,6 +21921,12 @@ impl<'de> serde::Deserialize<'de> for SortExecNode {
                             }
                             preserve_partitioning__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::DynamicFilter => {
+                            if dynamic_filter__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("dynamicFilter"));
+                            }
+                            dynamic_filter__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(SortExecNode {
@@ -21715,6 +21934,7 @@ impl<'de> serde::Deserialize<'de> for SortExecNode {
                     expr: expr__.unwrap_or_default(),
                     fetch: fetch__.unwrap_or_default(),
                     preserve_partitioning: preserve_partitioning__.unwrap_or_default(),
+                    dynamic_filter: dynamic_filter__,
                 })
             }
         }

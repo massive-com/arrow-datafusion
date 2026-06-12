@@ -441,6 +441,24 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
     fn placement(&self) -> ExpressionPlacement {
         ExpressionPlacement::KeepInPlace
     }
+
+    /// Stable, globally-unique identifier for this [`PhysicalExpr`], if any.
+    ///
+    /// Connected expressions (e.g. `DynamicFilterPhysicalExpr`s where two
+    /// outer Arc instances share the same mutable inner state via
+    /// [`PhysicalExpr::with_new_children`]) must report the same id. Proto
+    /// (de)serialization uses this to dedupe across the wire so the
+    /// reconstructed plan keeps `Arc<Inner>` shared.
+    ///
+    /// Default is `None`: no identity worth preserving across a
+    /// serialization boundary.
+    ///
+    /// Ported from upstream apache/datafusion#21807 to make
+    /// `DynamicFilterPhysicalExpr` dedup robust to pushdown rewriting on
+    /// branch-53.
+    fn expression_id(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[deprecated(

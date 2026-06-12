@@ -141,8 +141,16 @@ unsafe extern "C" fn try_decode_fn_wrapper(
         .collect::<Result<Vec<_>>>();
     let inputs = rresult_return!(inputs);
 
-    let plan =
-        rresult_return!(codec.try_decode(buf.as_ref(), &inputs, task_ctx.as_ref()));
+    // FFI boundary doesn't propagate the active PhysicalProtoConverterExtension,
+    // so dedup of nested expressions stops here (matches pre-#21807 behavior).
+    let proto_converter =
+        datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {};
+    let plan = rresult_return!(codec.try_decode(
+        buf.as_ref(),
+        &inputs,
+        task_ctx.as_ref(),
+        &proto_converter,
+    ));
 
     RResult::ROk(FFI_ExecutionPlan::new(plan, None))
 }
@@ -156,7 +164,11 @@ unsafe extern "C" fn try_encode_fn_wrapper(
     let plan: Arc<dyn ExecutionPlan> = rresult_return!((&node).try_into());
 
     let mut bytes = Vec::new();
-    rresult_return!(codec.try_encode(plan, &mut bytes));
+    // FFI boundary doesn't propagate the active PhysicalProtoConverterExtension,
+    // so dedup of nested expressions stops here (matches pre-#21807 behavior).
+    let proto_converter =
+        datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {};
+    rresult_return!(codec.try_encode(plan, &mut bytes, &proto_converter));
 
     RResult::ROk(bytes.into())
 }
@@ -327,6 +339,7 @@ impl PhysicalExtensionCodec for ForeignPhysicalExtensionCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         _ctx: &TaskContext,
+        _proto_converter: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let inputs = inputs
             .iter()
@@ -340,7 +353,12 @@ impl PhysicalExtensionCodec for ForeignPhysicalExtensionCodec {
         Ok(plan)
     }
 
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        _proto_converter: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
+    ) -> Result<()> {
         let plan = FFI_ExecutionPlan::new(node, None);
         let bytes = df_result!(unsafe { (self.0.try_encode)(&self.0, plan) })?;
 
@@ -441,6 +459,7 @@ pub(crate) mod tests {
             buf: &[u8],
             _inputs: &[Arc<dyn ExecutionPlan>],
             _ctx: &TaskContext,
+            _proto_converter: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
         ) -> Result<Arc<dyn ExecutionPlan>> {
             if buf[0] != Self::MAGIC_NUMBER {
                 return exec_err!(
@@ -459,6 +478,7 @@ pub(crate) mod tests {
             &self,
             node: Arc<dyn ExecutionPlan>,
             buf: &mut Vec<u8>,
+            _proto_converter: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
         ) -> Result<()> {
             buf.push(Self::MAGIC_NUMBER);
 
@@ -579,10 +599,16 @@ pub(crate) mod tests {
         let exec = create_test_exec();
         let input_execs = [create_test_exec()];
         let mut bytes = Vec::new();
-        foreign_codec.try_encode(Arc::clone(&exec), &mut bytes)?;
+        let proto_converter =
+            datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {};
+        foreign_codec.try_encode(Arc::clone(&exec), &mut bytes, &proto_converter)?;
 
-        let returned_exec =
-            foreign_codec.try_decode(&bytes, &input_execs, ctx.task_ctx().as_ref())?;
+        let returned_exec = foreign_codec.try_decode(
+            &bytes,
+            &input_execs,
+            ctx.task_ctx().as_ref(),
+            &proto_converter,
+        )?;
 
         assert!(returned_exec.as_any().is::<EmptyExec>());
 

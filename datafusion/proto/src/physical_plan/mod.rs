@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -56,6 +57,8 @@ use datafusion_functions_table::generate_series::{
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::async_scalar_function::AsyncFuncExpr;
+use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{LexOrdering, LexRequirement, PhysicalExprRef};
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, LimitOptions, PhysicalGroupBy,
@@ -569,7 +572,7 @@ impl protobuf::PhysicalPlanNode {
         }
 
         let mut buf: Vec<u8> = vec![];
-        match codec.try_encode(Arc::clone(&plan_clone), &mut buf) {
+        match codec.try_encode(Arc::clone(&plan_clone), &mut buf, proto_converter) {
             Ok(_) => {
                 let inputs: Vec<protobuf::PhysicalPlanNode> = plan_clone
                     .children()
@@ -1668,6 +1671,52 @@ impl protobuf::PhysicalPlanNode {
             .with_fetch(fetch)
             .with_preserve_partitioning(sort.preserve_partitioning);
 
+        // If the encoder carried the SortExec's internal dynamic filter,
+        // install it via `with_dynamic_filter_expr` to replace the fresh
+        // one minted by `with_fetch(...).create_filter()`. This is what
+        // makes the SortExec's filter Arc re-share its `Inner` with the
+        // pushed-down FileScan predicate on the decode side (via the
+        // `DeduplicatingDeserializer` cache keyed on `expression_id`).
+        //
+        // Ported from apache/datafusion#22011 (minimal subset).
+        let new_sort = if let Some(dynamic_filter_proto) = &sort.dynamic_filter {
+            let dynamic_filter_expr = proto_converter.proto_to_physical_expr(
+                dynamic_filter_proto,
+                ctx,
+                new_sort.input().schema().as_ref(),
+                codec,
+            )?;
+            // After the #21807 port the decoded expression IS a
+            // `DynamicFilterPhysicalExpr` (since serialize skips snapshot
+            // for this type), so the downcast succeeds and Arc identity
+            // is preserved across the call.
+            let df = match (Arc::clone(&dynamic_filter_expr)
+                as Arc<dyn Any + Send + Sync>)
+                .downcast::<DynamicFilterPhysicalExpr>()
+            {
+                Ok(df) => df,
+                Err(_) => {
+                    // Legacy fallback: an encoder that snapshotted the
+                    // wrapper away leaves us with a raw expression. Wrap
+                    // it in a fresh DynamicFilterPhysicalExpr so the
+                    // SortExec can still install it -- Arc sharing won't
+                    // be preserved in this branch, matching pre-#21807
+                    // behavior.
+                    let children = collect_columns(&dynamic_filter_expr)
+                        .into_iter()
+                        .map(|c| Arc::new(c) as Arc<dyn PhysicalExpr>)
+                        .collect::<Vec<_>>();
+                    Arc::new(DynamicFilterPhysicalExpr::new(
+                        children,
+                        dynamic_filter_expr,
+                    ))
+                }
+            };
+            new_sort.with_dynamic_filter_expr(df)?
+        } else {
+            new_sort
+        };
+
         Ok(Arc::new(new_sort))
     }
 
@@ -1739,7 +1788,8 @@ impl protobuf::PhysicalPlanNode {
             .map(|i| proto_converter.proto_to_execution_plan(ctx, codec, i))
             .collect::<Result<_>>()?;
 
-        let extension_node = codec.try_decode(extension.node.as_slice(), &inputs, ctx)?;
+        let extension_node =
+            codec.try_decode(extension.node.as_slice(), &inputs, ctx, proto_converter)?;
 
         Ok(extension_node)
     }
@@ -3084,6 +3134,21 @@ impl protobuf::PhysicalPlanNode {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        // Carry the SortExec's internal TopK dynamic filter so the decoder
+        // can re-install it via `with_dynamic_filter_expr` instead of letting
+        // `with_fetch(...).create_filter()` mint a brand-new one. Combined
+        // with the #21807 dedup-by-expression_id machinery, this is what
+        // re-shares `Arc<Inner>` with the pushed-down FileScan predicate
+        // across the proto roundtrip (X-2935).
+        //
+        // Ported from apache/datafusion#22011 (minimal subset).
+        let dynamic_filter = exec
+            .dynamic_filter_expr()
+            .map(|df| {
+                let df_expr: Arc<dyn PhysicalExpr> = df as Arc<dyn PhysicalExpr>;
+                proto_converter.physical_expr_to_proto(&df_expr, codec)
+            })
+            .transpose()?;
         Ok(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::Sort(Box::new(
                 protobuf::SortExecNode {
@@ -3094,6 +3159,7 @@ impl protobuf::PhysicalPlanNode {
                         _ => -1,
                     },
                     preserve_partitioning: exec.preserve_partitioning(),
+                    dynamic_filter,
                 },
             ))),
         })
@@ -3653,14 +3719,33 @@ pub trait AsExecutionPlan: Debug + Send + Sync + Clone {
 }
 
 pub trait PhysicalExtensionCodec: Debug + Send + Sync {
+    /// Decode an extension execution plan.
+    ///
+    /// `proto_converter` is the active conversion strategy (e.g.
+    /// `DeduplicatingDeserializer`). Codecs whose custom proto embeds
+    /// nested `PhysicalExprNode` fields (e.g. a predicate on a custom
+    /// file source) should route those through
+    /// `proto_converter.proto_to_physical_expr` so the dedup cache
+    /// extends across the extension boundary.
+    ///
+    /// Mirrors the upstream apache/datafusion pattern (#22920).
     fn try_decode(
         &self,
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>>;
 
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()>;
+    /// Encode an extension execution plan.
+    ///
+    /// See [`Self::try_decode`] for the role of `proto_converter`.
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<()>;
 
     fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> Result<Arc<ScalarUDF>> {
         not_impl_err!("PhysicalExtensionCodec is not provided for scalar function {name}")
@@ -3670,18 +3755,26 @@ pub trait PhysicalExtensionCodec: Debug + Send + Sync {
         Ok(())
     }
 
+    /// Decode an extension expression.
+    ///
+    /// See [`Self::try_decode`] for the role of `proto_converter`.
     fn try_decode_expr(
         &self,
         _buf: &[u8],
         _inputs: &[Arc<dyn PhysicalExpr>],
+        _proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         not_impl_err!("PhysicalExtensionCodec is not provided")
     }
 
+    /// Encode an extension expression.
+    ///
+    /// See [`Self::try_decode`] for the role of `proto_converter`.
     fn try_encode_expr(
         &self,
         _node: &Arc<dyn PhysicalExpr>,
         _buf: &mut Vec<u8>,
+        _proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
         not_impl_err!("PhysicalExtensionCodec is not provided")
     }
@@ -3714,6 +3807,7 @@ impl PhysicalExtensionCodec for DefaultPhysicalExtensionCodec {
         _buf: &[u8],
         _inputs: &[Arc<dyn ExecutionPlan>],
         _ctx: &TaskContext,
+        _proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         not_impl_err!("PhysicalExtensionCodec is not provided")
     }
@@ -3722,6 +3816,7 @@ impl PhysicalExtensionCodec for DefaultPhysicalExtensionCodec {
         &self,
         _node: Arc<dyn ExecutionPlan>,
         _buf: &mut Vec<u8>,
+        _proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
         not_impl_err!("PhysicalExtensionCodec is not provided")
     }
@@ -3821,18 +3916,29 @@ impl PhysicalProtoConverterExtension for DefaultPhysicalProtoConverter {
     }
 }
 
-/// Internal serializer that adds expr_id to expressions.
-/// Created fresh for each serialization operation.
-struct DeduplicatingSerializer {
+/// Serializer that adds an Arc-identity-derived expr_id to every emitted
+/// `PhysicalExprNode`. Created fresh for each serialization operation.
+///
+/// Made `pub` so atlas's coordinator-side codec can opt into Arc-identity
+/// dedup. Combined with the apache/datafusion#21807 minimal port that
+/// keeps `DynamicFilterPhysicalExpr` alive across the wire, this is what
+/// lets atlas retire the post-deserialize walker (X-2935).
+pub struct DeduplicatingSerializer {
     /// Random salt combined with pointer addresses and process ID to create globally unique expr_ids.
     session_id: u64,
 }
 
 impl DeduplicatingSerializer {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             session_id: rand::random(),
         }
+    }
+}
+
+impl Default for DeduplicatingSerializer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -3881,13 +3987,35 @@ impl PhysicalProtoConverterExtension for DeduplicatingSerializer {
     ) -> Result<protobuf::PhysicalExprNode> {
         let mut proto = serialize_physical_expr_with_converter(expr, codec, self)?;
 
-        // Hash session_id, pointer address, and process ID together to create expr_id.
-        // - session_id: random per serializer, prevents collisions when merging serializations
-        // - ptr: unique address per Arc within a process
-        // - pid: prevents collisions if serializer is shared across processes
+        // Pick the dedup identity for this expression.
+        //
+        // 1. If the expression reports a stable `expression_id()` (currently
+        //    `DynamicFilterPhysicalExpr` does), use that. This is preserved
+        //    across `with_new_children`, so two outer Arcs that share the
+        //    same `Inner` (e.g. SortExec.filter and the FileScan predicate
+        //    that `FilterPushdown` clones from it) still hash to the same
+        //    expr_id and reconstruct to one Arc on decode.
+        //    Mirrors upstream apache/datafusion#21807 behavior.
+        // 2. Otherwise fall back to `Arc::as_ptr` for plain expressions
+        //    where Arc identity is the only sharing signal we have.
+        //
+        // session_id + pid are mixed in either way to avoid collisions if
+        // serializations from different processes are concatenated.
         let mut hasher = DefaultHasher::new();
         self.session_id.hash(&mut hasher);
-        (Arc::as_ptr(expr) as *const () as u64).hash(&mut hasher);
+        match expr.expression_id() {
+            Some(eid) => {
+                // Tag the identity space so a 0 expression_id can't collide
+                // with the 0 address fallback. Tag value is arbitrary, just
+                // must differ between the two branches.
+                0u8.hash(&mut hasher);
+                eid.hash(&mut hasher);
+            }
+            None => {
+                1u8.hash(&mut hasher);
+                (Arc::as_ptr(expr) as *const () as u64).hash(&mut hasher);
+            }
+        }
         std::process::id().hash(&mut hasher);
         proto.expr_id = Some(hasher.finish());
 
@@ -3895,12 +4023,22 @@ impl PhysicalProtoConverterExtension for DeduplicatingSerializer {
     }
 }
 
-/// Internal deserializer that caches expressions by expr_id.
-/// Created fresh for each deserialization operation.
+/// Deserializer that caches expressions by `expr_id` so multiple references
+/// in a plan reconstruct to the same `Arc`. Created fresh for each
+/// deserialization operation.
+///
+/// Made `pub` for atlas's data-server-side codec; see
+/// [`DeduplicatingSerializer`].
 #[derive(Default)]
-struct DeduplicatingDeserializer {
+pub struct DeduplicatingDeserializer {
     /// Cache mapping expr_id to deserialized expressions.
     cache: RefCell<HashMap<u64, Arc<dyn PhysicalExpr>>>,
+}
+
+impl DeduplicatingDeserializer {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
@@ -4106,12 +4244,22 @@ impl PhysicalExtensionCodec for ComposedPhysicalExtensionCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.decode_protobuf(buf, |codec, data| codec.try_decode(data, inputs, ctx))
+        self.decode_protobuf(buf, |codec, data| {
+            codec.try_decode(data, inputs, ctx, proto_converter)
+        })
     }
 
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
-        self.encode_protobuf(buf, |codec, data| codec.try_encode(Arc::clone(&node), data))
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<()> {
+        self.encode_protobuf(buf, |codec, data| {
+            codec.try_encode(Arc::clone(&node), data, proto_converter)
+        })
     }
 
     fn try_decode_udf(&self, name: &str, buf: &[u8]) -> Result<Arc<ScalarUDF>> {

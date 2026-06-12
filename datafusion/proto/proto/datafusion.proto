@@ -897,7 +897,31 @@ message PhysicalExprNode {
     UnknownColumn unknown_column = 20;
 
     PhysicalHashExprNode hash_expr = 21;
+
+    // Ported from apache/datafusion#21807 (minimal subset). Allows a
+    // DynamicFilterPhysicalExpr to roundtrip through proto with its wrapper
+    // intact, so the receiver (combined with DeduplicatingDeserializer)
+    // can rebuild a shared `Arc<Inner>` across e.g. SortExec.filter and the
+    // FileScan predicate pushed down from it.
+    //
+    // Field 22 is intentionally skipped to match upstream's field number
+    // for a future scalar_subquery variant atlas doesn't need yet.
+    PhysicalDynamicFilterNode dynamic_filter = 23;
   }
+}
+
+// Ported from apache/datafusion#21807. See `dynamic_filter = 23` above.
+message PhysicalDynamicFilterNode {
+  repeated PhysicalExprNode children = 1;
+  repeated PhysicalExprNode remapped_children = 2;
+  uint64 generation = 3;
+  PhysicalExprNode inner_expr = 4;
+  bool is_complete = 5;
+  // Stable identity of this dynamic filter. References with the same id
+  // MUST deserialize to the same `Arc<DynamicFilterPhysicalExpr>` so heap-max
+  // updates propagate from SortExec to the FileScan predicate it was
+  // pushed down to.
+  uint64 expression_id = 6;
 }
 
 message PhysicalScalarUdfNode {
@@ -1289,6 +1313,15 @@ message SortExecNode {
   // Maximum number of highest/lowest rows to fetch; negative means no limit
   int64 fetch = 3;
   bool preserve_partitioning = 4;
+
+  // Ported from apache/datafusion#22011 (minimal subset). Carries the
+  // SortExec's internal `DynamicFilterPhysicalExpr` so the decode side
+  // can install it via `with_dynamic_filter_expr` instead of letting
+  // `with_fetch(...).create_filter()` mint a brand-new one. Combined with
+  // the #21807 PhysicalDynamicFilterNode + dedup-by-expression_id, the
+  // resulting decoded plan re-shares the `Arc<Inner>` with the pushed-down
+  // FileScan predicate (X-2935 walker becomes redundant).
+  PhysicalExprNode dynamic_filter = 5;
 }
 
 message SortPreservingMergeExecNode {

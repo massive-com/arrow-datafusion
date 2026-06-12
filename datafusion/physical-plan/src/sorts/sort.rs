@@ -1036,6 +1036,33 @@ impl SortExec {
         self.fetch
     }
 
+    /// Returns the dynamic filter expression for this sort (TopK), if set.
+    ///
+    /// Used by `datafusion-proto` to roundtrip the SortExec's internal
+    /// `DynamicFilterPhysicalExpr` so the decode side can re-share its
+    /// `Arc<Inner>` with the pushed-down FileScan predicate
+    /// (apache/datafusion#22011 minimal port for branch-53).
+    pub fn dynamic_filter_expr(&self) -> Option<Arc<DynamicFilterPhysicalExpr>> {
+        self.filter.as_ref().map(|f| f.read().expr())
+    }
+
+    /// Install a `DynamicFilterPhysicalExpr` as this sort's TopK dyn filter,
+    /// validating that its children reference columns in the input schema.
+    ///
+    /// Used by proto deserialization to restore Arc identity across the wire;
+    /// see [`SortExec::dynamic_filter_expr`].
+    pub fn with_dynamic_filter_expr(
+        mut self,
+        filter: Arc<DynamicFilterPhysicalExpr>,
+    ) -> Result<Self> {
+        let input_schema = self.input.schema();
+        for child in filter.children() {
+            child.data_type(&input_schema)?;
+        }
+        self.filter = Some(Arc::new(RwLock::new(TopKDynamicFilters::new(filter))));
+        Ok(self)
+    }
+
     fn output_partitioning_helper(
         input: &Arc<dyn ExecutionPlan>,
         preserve_partitioning: bool,
