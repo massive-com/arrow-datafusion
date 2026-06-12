@@ -1338,7 +1338,7 @@ pub struct PhysicalExprNode {
     pub expr_id: ::core::option::Option<u64>,
     #[prost(
         oneof = "physical_expr_node::ExprType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 23"
     )]
     pub expr_type: ::core::option::Option<physical_expr_node::ExprType>,
 }
@@ -1391,11 +1391,37 @@ pub mod physical_expr_node {
         UnknownColumn(super::UnknownColumn),
         #[prost(message, tag = "21")]
         HashExpr(super::PhysicalHashExprNode),
-        #[prost(message, tag = "22")]
-        ScalarSubquery(super::PhysicalScalarSubqueryExprNode),
+        /// Ported from apache/datafusion#21807 (minimal subset). Allows a
+        /// DynamicFilterPhysicalExpr to roundtrip through proto with its wrapper
+        /// intact, so the receiver (combined with DeduplicatingDeserializer)
+        /// can rebuild a shared `Arc<Inner>` across e.g. SortExec.filter and the
+        /// FileScan predicate pushed down from it.
+        ///
+        /// Field 22 is intentionally skipped to match upstream's field number
+        /// for a future scalar_subquery variant atlas doesn't need yet.
         #[prost(message, tag = "23")]
         DynamicFilter(::prost::alloc::boxed::Box<super::PhysicalDynamicFilterNode>),
     }
+}
+/// Ported from apache/datafusion#21807. See `dynamic_filter = 23` above.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PhysicalDynamicFilterNode {
+    #[prost(message, repeated, tag = "1")]
+    pub children: ::prost::alloc::vec::Vec<PhysicalExprNode>,
+    #[prost(message, repeated, tag = "2")]
+    pub remapped_children: ::prost::alloc::vec::Vec<PhysicalExprNode>,
+    #[prost(uint64, tag = "3")]
+    pub generation: u64,
+    #[prost(message, optional, boxed, tag = "4")]
+    pub inner_expr: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalExprNode>>,
+    #[prost(bool, tag = "5")]
+    pub is_complete: bool,
+    /// Stable identity of this dynamic filter. References with the same id
+    /// MUST deserialize to the same `Arc<DynamicFilterPhysicalExpr>` so heap-max
+    /// updates propagate from SortExec to the FileScan predicate it was
+    /// pushed down to.
+    #[prost(uint64, tag = "6")]
+    pub expression_id: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalDynamicFilterNode {
@@ -1991,7 +2017,13 @@ pub struct SortExecNode {
     pub fetch: i64,
     #[prost(bool, tag = "4")]
     pub preserve_partitioning: bool,
-    /// Optional dynamic filter expression for TopK pushdown.
+    /// Ported from apache/datafusion#22011 (minimal subset). Carries the
+    /// SortExec's internal `DynamicFilterPhysicalExpr` so the decode side
+    /// can install it via `with_dynamic_filter_expr` instead of letting
+    /// `with_fetch(...).create_filter()` mint a brand-new one. Combined with
+    /// the #21807 PhysicalDynamicFilterNode + dedup-by-expression_id, the
+    /// resulting decoded plan re-shares the `Arc<Inner>` with the pushed-down
+    /// FileScan predicate (X-2935 walker becomes redundant).
     #[prost(message, optional, tag = "5")]
     pub dynamic_filter: ::core::option::Option<PhysicalExprNode>,
 }

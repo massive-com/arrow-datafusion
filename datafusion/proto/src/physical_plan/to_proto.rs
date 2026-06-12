@@ -32,7 +32,7 @@ use datafusion_datasource_json::file_format::JsonSink;
 use datafusion_datasource_parquet::file_format::ParquetSink;
 use datafusion_expr::WindowFrame;
 use datafusion_physical_expr::ScalarFunctionExpr;
-use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
+use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_expr::window::{SlidingAggregateWindowExpr, StandardWindowExpr};
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 use datafusion_physical_plan::expressions::{
@@ -259,13 +259,81 @@ pub fn serialize_physical_expr(
 /// serialization of udfs requiring specialized serialization (see [`PhysicalExtensionCodec::try_encode_udf`]).
 /// A [`PhysicalProtoConverterExtension`] can be provided to handle the
 /// conversion process (see [`PhysicalProtoConverterExtension::physical_expr_to_proto`]).
+/// Serialize a `DynamicFilterPhysicalExpr` as a `PhysicalDynamicFilterNode`
+/// without snapshotting it away. Children are routed through `proto_converter`
+/// so a `DeduplicatingSerializer` wrapping this call captures Arc identity
+/// for nested expressions too.
+///
+/// Ported from upstream apache/datafusion#21807 (minimal subset).
+fn serialize_dynamic_filter(
+    value: &Arc<dyn PhysicalExpr>,
+    codec: &dyn PhysicalExtensionCodec,
+    proto_converter: &dyn PhysicalProtoConverterExtension,
+) -> Result<protobuf::PhysicalExprNode> {
+    let df = value
+        .as_any()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .expect("caller already checked downcast");
+
+    let children = df
+        .original_children()
+        .iter()
+        .map(|child| proto_converter.physical_expr_to_proto(child, codec))
+        .collect::<Result<Vec<_>>>()?;
+    let remapped_children = if let Some(remapped) = df.remapped_children() {
+        remapped
+            .iter()
+            .map(|child| proto_converter.physical_expr_to_proto(child, codec))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        vec![]
+    };
+    // Atomic snapshot of inner state; carry the raw expr (not its snapshot)
+    // so the receiver gets the same logical filter we hold.
+    let inner = df.inner();
+    let inner_expr =
+        Box::new(proto_converter.physical_expr_to_proto(&inner.expr, codec)?);
+
+    Ok(protobuf::PhysicalExprNode {
+        expr_id: None,
+        expr_type: Some(protobuf::physical_expr_node::ExprType::DynamicFilter(
+            Box::new(protobuf::PhysicalDynamicFilterNode {
+                children,
+                remapped_children,
+                generation: inner.generation,
+                inner_expr: Some(inner_expr),
+                is_complete: inner.is_complete,
+                expression_id: inner.expression_id,
+            }),
+        )),
+    })
+}
+
 pub fn serialize_physical_expr_with_converter(
     value: &Arc<dyn PhysicalExpr>,
     codec: &dyn PhysicalExtensionCodec,
     proto_converter: &dyn PhysicalProtoConverterExtension,
 ) -> Result<protobuf::PhysicalExprNode> {
-    let expr = value.as_ref();
-    let expr_id = value.expression_id();
+    // Special case ported from upstream apache/datafusion#21807: a
+    // DynamicFilterPhysicalExpr must NOT be snapshotted before
+    // serialization. Snapshotting collapses it to its current inner
+    // expression (typically lit(true) before TopK fills its heap) and
+    // discards the wrapper. Without the wrapper the receiver can't
+    // reconstruct shared Arc<Inner> identity across SortExec.filter and
+    // the FileScan predicate it was pushed down into.
+    if value
+        .as_any()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .is_some()
+    {
+        return serialize_dynamic_filter(value, codec, proto_converter);
+    }
+
+    // Snapshot the expr in case it has dynamic predicate state so
+    // it can be serialized
+    let value = snapshot_physical_expr(Arc::clone(value))?;
+    let expr = value.as_any();
+
     // HashTableLookupExpr is used for dynamic filter pushdown in hash joins.
     // It contains an Arc<dyn JoinHashMapType> (the build-side hash table) which
     // cannot be serialized - the hash table is a runtime structure built during
@@ -577,7 +645,12 @@ pub fn serialize_physical_expr_with_converter(
         })
     } else {
         let mut buf: Vec<u8> = vec![];
-        match codec.try_encode_expr(value, &mut buf) {
+        // Use the converter-aware encode entry point so extension codecs
+        // that embed nested `PhysicalExprNode` fields can thread the
+        // active `proto_converter` (e.g. `DeduplicatingSerializer`) into
+        // their own serialization of those nested expressions, preserving
+        // Arc-identity dedup end-to-end.
+        match codec.try_encode_expr(&value, &mut buf, proto_converter) {
             Ok(_) => {
                 let inputs: Vec<protobuf::PhysicalExprNode> = value
                     .children()

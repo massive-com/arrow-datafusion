@@ -16798,6 +16798,9 @@ impl serde::Serialize for PhysicalDynamicFilterNode {
         if self.is_complete {
             len += 1;
         }
+        if self.expression_id != 0 {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.PhysicalDynamicFilterNode", len)?;
         if !self.children.is_empty() {
             struct_ser.serialize_field("children", &self.children)?;
@@ -16815,6 +16818,11 @@ impl serde::Serialize for PhysicalDynamicFilterNode {
         }
         if self.is_complete {
             struct_ser.serialize_field("isComplete", &self.is_complete)?;
+        }
+        if self.expression_id != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("expressionId", ToString::to_string(&self.expression_id).as_str())?;
         }
         struct_ser.end()
     }
@@ -16834,6 +16842,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
             "innerExpr",
             "is_complete",
             "isComplete",
+            "expression_id",
+            "expressionId",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -16843,6 +16853,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
             Generation,
             InnerExpr,
             IsComplete,
+            ExpressionId,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -16869,6 +16880,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
                             "generation" => Ok(GeneratedField::Generation),
                             "innerExpr" | "inner_expr" => Ok(GeneratedField::InnerExpr),
                             "isComplete" | "is_complete" => Ok(GeneratedField::IsComplete),
+                            "expressionId" | "expression_id" => Ok(GeneratedField::ExpressionId),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -16893,6 +16905,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
                 let mut generation__ = None;
                 let mut inner_expr__ = None;
                 let mut is_complete__ = None;
+                let mut expression_id__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Children => {
@@ -16927,6 +16940,14 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
                             }
                             is_complete__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::ExpressionId => {
+                            if expression_id__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("expressionId"));
+                            }
+                            expression_id__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                     }
                 }
                 Ok(PhysicalDynamicFilterNode {
@@ -16935,6 +16956,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalDynamicFilterNode {
                     generation: generation__.unwrap_or_default(),
                     inner_expr: inner_expr__,
                     is_complete: is_complete__.unwrap_or_default(),
+                    expression_id: expression_id__.unwrap_or_default(),
                 })
             }
         }
@@ -17020,9 +17042,6 @@ impl serde::Serialize for PhysicalExprNode {
                 physical_expr_node::ExprType::HashExpr(v) => {
                     struct_ser.serialize_field("hashExpr", v)?;
                 }
-                physical_expr_node::ExprType::ScalarSubquery(v) => {
-                    struct_ser.serialize_field("scalarSubquery", v)?;
-                }
                 physical_expr_node::ExprType::DynamicFilter(v) => {
                     struct_ser.serialize_field("dynamicFilter", v)?;
                 }
@@ -17072,8 +17091,6 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
             "unknownColumn",
             "hash_expr",
             "hashExpr",
-            "scalar_subquery",
-            "scalarSubquery",
             "dynamic_filter",
             "dynamicFilter",
         ];
@@ -17100,7 +17117,6 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
             Extension,
             UnknownColumn,
             HashExpr,
-            ScalarSubquery,
             DynamicFilter,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
@@ -17143,7 +17159,6 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
                             "extension" => Ok(GeneratedField::Extension),
                             "unknownColumn" | "unknown_column" => Ok(GeneratedField::UnknownColumn),
                             "hashExpr" | "hash_expr" => Ok(GeneratedField::HashExpr),
-                            "scalarSubquery" | "scalar_subquery" => Ok(GeneratedField::ScalarSubquery),
                             "dynamicFilter" | "dynamic_filter" => Ok(GeneratedField::DynamicFilter),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
@@ -17307,13 +17322,6 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
                                 return Err(serde::de::Error::duplicate_field("hashExpr"));
                             }
                             expr_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_expr_node::ExprType::HashExpr)
-;
-                        }
-                        GeneratedField::ScalarSubquery => {
-                            if expr_type__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("scalarSubquery"));
-                            }
-                            expr_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_expr_node::ExprType::ScalarSubquery)
 ;
                         }
                         GeneratedField::DynamicFilter => {

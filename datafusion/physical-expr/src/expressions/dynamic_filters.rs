@@ -17,7 +17,7 @@
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{fmt::Display, hash::Hash, sync::Arc};
+use std::{any::Any, fmt::Display, hash::Hash, sync::Arc};
 use tokio::sync::watch;
 
 use crate::PhysicalExpr;
@@ -79,25 +79,42 @@ pub struct DynamicFilterPhysicalExpr {
 
 /// Atomic internal state of a [`DynamicFilterPhysicalExpr`].
 ///
-/// `expression_id` lives here because it identifies the actual filter expression `expr`.
-/// Derived `DynamicFilterPhysicalExpr`s (e.g. via [`PhysicalExpr::with_new_children`]) are
-/// the same logical filter and must report the same `expression_id`.
+/// `expression_id` identifies the actual filter expression. Derived
+/// `DynamicFilterPhysicalExpr`s (e.g. via [`PhysicalExpr::with_new_children`])
+/// are the same logical filter and must report the same id. Proto
+/// (de)serialization uses this id to dedupe references on the wire so the
+/// reconstructed plan keeps `Arc<Inner>` shared between e.g. SortExec.filter
+/// and the FileScan predicate it was pushed down to.
 ///
-/// **Warning:** exposed publicly solely so that proto (de)serialization in
-/// `datafusion-proto` can read and rebuild this state. Do not treat this type
-/// or its layout as a stable API.
-#[derive(Clone, Debug)]
+/// **Warning:** exposed publicly only so that `datafusion-proto` can read
+/// and rebuild this state. Not a stable API.
+///
+/// Ported from upstream apache/datafusion#21807 (minimal subset) so
+/// branch-53 can drop the atlas-side post-deserialize walker.
+#[derive(Clone)]
 pub struct Inner {
-    /// A unique identifier for the expression.
+    /// Stable id, preserved across `update()` and `with_new_children`.
     pub expression_id: u64,
-    /// A counter that gets incremented every time the expression is updated so that we can track changes cheaply.
-    /// This is used for [`PhysicalExpr::snapshot_generation`] to have a cheap check for changes.
+    /// Incremented on every `update()` so that [`PhysicalExpr::snapshot_generation`]
+    /// is a cheap "did anything change?" probe.
     pub generation: u64,
     pub expr: Arc<dyn PhysicalExpr>,
-    /// Flag for quick synchronous check if filter is complete.
-    /// This is redundant with the watch channel state, but allows us to return immediately
-    /// from `wait_complete()` without subscribing if already complete.
+    /// Synchronous check for completion; redundant with the watch channel
+    /// but lets `wait_complete()` return without subscribing.
     pub is_complete: bool,
+}
+
+// Exclude `expression_id` from Debug so existing roundtrip Debug comparisons
+// in tests still pass even when only some plan-node decoders carry the
+// dynamic filter through proto.
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("generation", &self.generation)
+            .field("expr", &self.expr)
+            .field("is_complete", &self.is_complete)
+            .finish()
+    }
 }
 
 impl Inner {
@@ -117,6 +134,26 @@ impl Inner {
         &self.expr
     }
 }
+
+/// An atomic counter used to generate monotonic u64 ids for
+/// `DynamicFilterPhysicalExpr` instances.
+struct ExpressionIdAtomicCounter {
+    inner: AtomicU64,
+}
+
+impl ExpressionIdAtomicCounter {
+    const fn new() -> Self {
+        Self {
+            inner: AtomicU64::new(0),
+        }
+    }
+
+    fn next(&self) -> u64 {
+        self.inner.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+static EXPR_ID_SOURCE: ExpressionIdAtomicCounter = ExpressionIdAtomicCounter::new();
 
 impl Hash for DynamicFilterPhysicalExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -256,7 +293,9 @@ impl DynamicFilterPhysicalExpr {
         let mut current = self.inner.write();
         let new_generation = current.generation + 1;
         *current = Inner {
-            // Preserve the expression id across updates.
+            // Preserve the expression id across updates so all references
+            // (e.g. SortExec.filter + a pushed-down FileScan predicate)
+            // continue to identify the same logical filter.
             expression_id: current.expression_id,
             generation: new_generation,
             expr: new_expr,
@@ -379,8 +418,18 @@ impl DynamicFilterPhysicalExpr {
         self.remapped_children.as_deref()
     }
 
+    /// Clone the atomically-captured `Inner` state.
+    ///
+    /// **Warning:** intended only for `datafusion-proto` (de)serialization.
+    /// Not a stable API.
+    pub fn inner(&self) -> Inner {
+        self.inner.read().clone()
+    }
+
     /// Rebuild a `DynamicFilterPhysicalExpr` from its stored parts. Used by
-    /// proto deserialization.
+    /// proto deserialization to reconstruct the filter; when paired with the
+    /// existing `DeduplicatingDeserializer` it restores shared `Arc<Inner>`
+    /// identity across all references in the decoded plan.
     ///
     /// **Warning:** intended only for `datafusion-proto` (de)serialization.
     /// Not a stable API.
@@ -408,14 +457,6 @@ impl DynamicFilterPhysicalExpr {
             data_type: Arc::new(RwLock::new(None)),
             nullable: Arc::new(RwLock::new(None)),
         }
-    }
-
-    /// Return a clone of the atomically-captured `Inner` state.
-    ///
-    /// **Warning:** intended only for `datafusion-proto` (de)serialization.
-    /// Not a stable API.
-    pub fn inner(&self) -> Inner {
-        self.inner.read().clone()
     }
 }
 
