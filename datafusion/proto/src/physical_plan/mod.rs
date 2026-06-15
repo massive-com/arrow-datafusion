@@ -4253,29 +4253,48 @@ impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
     where
         Self: Sized,
     {
-        // `expr_id` is the generic identity slot on `PhysicalExprNode`.
-        // The default serializer populates it from `PhysicalExpr::expression_id`.
-        // A missing id means this expression type doesn't participate in deduping.
-        let Some(id) = proto.expr_id else {
-            return parse_physical_expr_with_converter(proto, input_schema, ctx, self);
+        let Some(expr_id) = proto.expr_id else {
+            return parse_physical_expr_with_converter(
+                proto,
+                ctx,
+                input_schema,
+                codec,
+                self,
+            );
         };
 
-        let parsed = parse_physical_expr_with_converter(proto, input_schema, ctx, self)?;
+        // Always parse the proto body first. The cache hit path below uses
+        // `parsed.children()` (which carry this occurrence's column refs as
+        // they appeared in the proto -- e.g. file-schema indices after
+        // FilterPushdown rewrote them), so we can't short-circuit before
+        // parsing.
+        let parsed =
+            parse_physical_expr_with_converter(proto, ctx, input_schema, codec, self)?;
 
         let mut cache = self.cache.borrow_mut();
-        if let Some(cached) = cache.get(&id) {
-            // Since expressions may manage their own internal state when deriving
-            // expressions via `with_new_children`, we use `with_new_children`
-            // to opt into the same behavior.
+        if let Some(cached) = cache.get(&expr_id) {
+            // Since expressions may manage their own internal state when
+            // deriving expressions via `with_new_children`, we use
+            // `with_new_children` to opt into the same behavior.
             //
-            // For example, one `DynamicFilterPhysicalExpr` may be derived from
-            // another resulting in shared references. Using `with_new_children`
-            // is meant to preserve those references.
+            // For example, one `DynamicFilterPhysicalExpr` may be derived
+            // from another resulting in shared references (e.g. a SortExec
+            // dynamic filter at the parent schema and a pushed-down FileScan
+            // predicate at the file schema, sharing the same `Inner` Arc
+            // but with different children). Using `with_new_children`
+            // preserves those references: the cached `Arc<Inner>` is kept,
+            // while this occurrence's children (parsed from the proto body)
+            // are installed onto a fresh outer wrapper.
+            //
+            // Ported from apache/datafusion#21807; without this the cache
+            // hit path returned the entire cached outer Arc and silently
+            // discarded the proto body's children, breaking column ref
+            // alignment in plans where FilterPushdown rewrote them.
             let children: Vec<_> = parsed.children().into_iter().cloned().collect();
             return Arc::clone(cached).with_new_children(children);
         }
 
-        cache.insert(id, Arc::clone(&parsed));
+        cache.insert(expr_id, Arc::clone(&parsed));
         Ok(parsed)
     }
 
