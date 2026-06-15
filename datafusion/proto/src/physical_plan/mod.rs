@@ -4072,24 +4072,49 @@ impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
     where
         Self: Sized,
     {
-        if let Some(expr_id) = proto.expr_id {
-            // Check cache first
-            if let Some(cached) = self.cache.borrow().get(&expr_id) {
-                return Ok(Arc::clone(cached));
-            }
-            // Deserialize and cache
-            let expr = parse_physical_expr_with_converter(
+        let Some(expr_id) = proto.expr_id else {
+            return parse_physical_expr_with_converter(
                 proto,
                 ctx,
                 input_schema,
                 codec,
                 self,
-            )?;
-            self.cache.borrow_mut().insert(expr_id, Arc::clone(&expr));
-            Ok(expr)
-        } else {
-            parse_physical_expr_with_converter(proto, ctx, input_schema, codec, self)
+            );
+        };
+
+        // Always parse the proto body first. The cache hit path below uses
+        // `parsed.children()` (which carry this occurrence's column refs as
+        // they appeared in the proto -- e.g. file-schema indices after
+        // FilterPushdown rewrote them), so we can't short-circuit before
+        // parsing.
+        let parsed =
+            parse_physical_expr_with_converter(proto, ctx, input_schema, codec, self)?;
+
+        let mut cache = self.cache.borrow_mut();
+        if let Some(cached) = cache.get(&expr_id) {
+            // Since expressions may manage their own internal state when
+            // deriving expressions via `with_new_children`, we use
+            // `with_new_children` to opt into the same behavior.
+            //
+            // For example, one `DynamicFilterPhysicalExpr` may be derived
+            // from another resulting in shared references (e.g. a SortExec
+            // dynamic filter at the parent schema and a pushed-down FileScan
+            // predicate at the file schema, sharing the same `Inner` Arc
+            // but with different children). Using `with_new_children`
+            // preserves those references: the cached `Arc<Inner>` is kept,
+            // while this occurrence's children (parsed from the proto body)
+            // are installed onto a fresh outer wrapper.
+            //
+            // Ported from apache/datafusion#21807; without this the cache
+            // hit path returned the entire cached outer Arc and silently
+            // discarded the proto body's children, breaking column ref
+            // alignment in plans where FilterPushdown rewrote them.
+            let children: Vec<_> = parsed.children().into_iter().cloned().collect();
+            return Arc::clone(cached).with_new_children(children);
         }
+
+        cache.insert(expr_id, Arc::clone(&parsed));
+        Ok(parsed)
     }
 
     fn physical_expr_to_proto(
