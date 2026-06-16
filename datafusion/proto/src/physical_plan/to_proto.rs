@@ -34,7 +34,7 @@ use datafusion_expr::WindowFrame;
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_expr::window::{SlidingAggregateWindowExpr, StandardWindowExpr};
-use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr;
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 use datafusion_physical_plan::expressions::{
     BinaryExpr, CaseExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr,
@@ -324,8 +324,34 @@ pub fn serialize_physical_expr_with_converter(
     }
 
     // Snapshot the expr in case it has dynamic predicate state so
-    // it can be serialized
-    let value = snapshot_physical_expr(Arc::clone(value))?;
+    // it can be serialized.
+    //
+    // BUT: `DynamicFilterPhysicalExpr` has its own dedicated wire format
+    // (`PhysicalDynamicFilterNode`) and a dedup pipeline that lets multiple
+    // references on the data-server side share one `Arc<Inner>` across the
+    // wire. If we let the generic snapshot walker fold a nested
+    // `DynamicFilterPhysicalExpr` to its `current()` literal here, the
+    // wrapper is gone and the data server can never observe a live update
+    // again -- which is the X-2935 ny2 prod regression in atlas's distributed
+    // pipeline. Skip `DynamicFilterPhysicalExpr` during the snapshot walk so
+    // it survives to the downcast chain below (which has a dedicated branch
+    // serializing it as `PhysicalDynamicFilterNode`).
+    //
+    // Upstream apache/datafusion#21929 fixed this structurally by removing
+    // the top-level `snapshot_physical_expr` call entirely and routing
+    // through per-expression `try_to_proto` hooks. Until atlas adopts that
+    // refactor, this is the minimal patch.
+    let value = Arc::clone(value)
+        .transform_up(|e| {
+            if e.as_any().is::<DynamicFilterPhysicalExpr>() {
+                Ok(Transformed::no(e))
+            } else if let Some(snapshot) = e.snapshot()? {
+                Ok(Transformed::yes(snapshot))
+            } else {
+                Ok(Transformed::no(e))
+            }
+        })
+        .data()?;
     let expr = value.as_any();
 
     // HashTableLookupExpr is used for dynamic filter pushdown in hash joins.

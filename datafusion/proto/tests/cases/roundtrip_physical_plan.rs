@@ -3486,6 +3486,110 @@ fn dynamic_filter_dedup_distinct_children_via_with_new_children() -> Result<()> 
     Ok(())
 }
 
+/// Regression for the X-2935 ny2 prod symptom: a `DynamicFilterPhysicalExpr`
+/// nested inside a `BinaryExpr` (the shape produced when `FilterPushdown(Post)`
+/// re-pushes a SortExec self-filter into a FileScan that already had a static
+/// WHERE) must survive proto roundtrip as a live wrapper, NOT be folded into
+/// a `Literal` snapshot.
+///
+/// Before this patch, `serialize_physical_expr_with_converter`'s top-level
+/// `snapshot_physical_expr(value)` call walked the whole expression tree and
+/// replaced every `DynamicFilterPhysicalExpr` with its current() literal.
+/// The top-level special case at line 318 only saved the wrapper when it was
+/// the OUTERMOST node; any nesting (BinaryExpr/CastExpr/NotExpr/...) folded
+/// the inner wrapper to a literal, breaking the live link between SortExec
+/// and the FileScan predicate on the data-server side.
+///
+/// Upstream apache/datafusion#21929 (commit 077f08a9a, merged 2026-05-22)
+/// fixed this structurally by removing that top-level call and routing each
+/// expression through `try_to_proto` hooks. This test pins the minimal patch
+/// in atlas's DF fork: skip `DynamicFilterPhysicalExpr` during the snapshot
+/// walk so it survives to the downcast chain.
+#[test]
+fn dynamic_filter_nested_in_binary_expr_survives_proto_roundtrip() -> Result<()> {
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_plan::expressions::Column;
+    use datafusion_physical_expr::expressions::{BinaryExpr, DynamicFilterPhysicalExpr};
+    use datafusion_proto::physical_plan::{
+        DeduplicatingDeserializer, DeduplicatingSerializer,
+        PhysicalProtoConverterExtension,
+    };
+
+    let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
+
+    let initial: Arc<dyn PhysicalExpr> = lit(true);
+    let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+    let dyn_filter: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![Arc::clone(&col_a)],
+        Arc::clone(&initial),
+    ));
+
+    // Mimic the prod shape: a static WHERE ANDed with the TopK dyn filter.
+    // The static side is `a > 0`; the dynamic side is the wrapper.
+    let static_where: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::clone(&col_a),
+        Operator::Gt,
+        lit(0_i64),
+    ));
+    let nested: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        static_where,
+        Operator::And,
+        Arc::clone(&dyn_filter),
+    ));
+
+    let codec = DefaultPhysicalExtensionCodec {};
+    let serializer = DeduplicatingSerializer::new();
+    let proto = serializer.physical_expr_to_proto(&nested, &codec)?;
+
+    let ctx = SessionContext::new().task_ctx();
+    let deserializer = DeduplicatingDeserializer::new();
+    let decoded = deserializer.proto_to_physical_expr(&proto, &ctx, &schema, &codec)?;
+
+    // The decoded predicate must still be `BinaryExpr(static, AND, dyn)` --
+    // crucially, the right side must be a live `DynamicFilterPhysicalExpr`,
+    // NOT a `Literal(true)` snapshot from before the patch.
+    let binary = decoded
+        .as_any()
+        .downcast_ref::<BinaryExpr>()
+        .expect("decoded predicate must be a BinaryExpr");
+    assert_eq!(*binary.op(), Operator::And, "op preserved");
+
+    let right_is_dyn = binary
+        .right()
+        .as_any()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .is_some();
+    assert!(
+        right_is_dyn,
+        "BinaryExpr.right must remain a DynamicFilterPhysicalExpr after \
+         proto roundtrip. If it's a Literal here, the snapshot walker in \
+         to_proto.rs folded the wrapper -- that is the X-2935 ny2 bug."
+    );
+
+    // And tree-wide `snapshot_generation` must still be nonzero (i.e.
+    // dynamic), and `update()` on the decoded dyn must bump it.
+    use datafusion_physical_expr_common::physical_expr::snapshot_generation;
+    let g_before = snapshot_generation(&decoded);
+    assert!(
+        g_before > 0,
+        "decoded predicate must report a dynamic snapshot_generation"
+    );
+    let decoded_dyn = binary
+        .right()
+        .as_any()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .unwrap();
+    decoded_dyn.update(lit(42_i64))?;
+    let g_after = snapshot_generation(&decoded);
+    assert!(
+        g_after > g_before,
+        "update on decoded dyn must bump tree snapshot_generation \
+         (before={g_before}, after={g_after})"
+    );
+
+    Ok(())
+}
+
 /// Without the deduplicating codec, two decodes still both reconstruct the
 /// wrapper (no snapshotting) but get distinct Arcs. Guards the invariant
 /// that the wire format itself is dedup-agnostic; dedup is the codec's
