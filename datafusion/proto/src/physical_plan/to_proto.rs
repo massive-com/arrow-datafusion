@@ -332,8 +332,7 @@ pub fn serialize_physical_expr_with_converter(
     // wire. If we let the generic snapshot walker fold a nested
     // `DynamicFilterPhysicalExpr` to its `current()` literal here, the
     // wrapper is gone and the data server can never observe a live update
-    // again -- which is the X-2935 ny2 prod regression in atlas's distributed
-    // pipeline. Skip `DynamicFilterPhysicalExpr` during the snapshot walk so
+    // again. Skip `DynamicFilterPhysicalExpr` during the snapshot walk so
     // it survives to the downcast chain below (which has a dedicated branch
     // serializing it as `PhysicalDynamicFilterNode`).
     //

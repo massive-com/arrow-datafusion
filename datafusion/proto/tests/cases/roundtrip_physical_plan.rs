@@ -3494,11 +3494,12 @@ fn dynamic_filter_dedup_distinct_children_via_with_new_children() -> Result<()> 
 ///
 /// Before this patch, `serialize_physical_expr_with_converter`'s top-level
 /// `snapshot_physical_expr(value)` call walked the whole expression tree and
-/// replaced every `DynamicFilterPhysicalExpr` with its current() literal.
-/// The top-level special case at line 318 only saved the wrapper when it was
-/// the OUTERMOST node; any nesting (BinaryExpr/CastExpr/NotExpr/...) folded
-/// the inner wrapper to a literal, breaking the live link between SortExec
-/// and the FileScan predicate on the data-server side.
+/// replaced every `DynamicFilterPhysicalExpr` with its `current()` literal.
+/// The dedicated `DynamicFilterPhysicalExpr` branch in the downcast chain
+/// only fired when the wrapper was the OUTERMOST node; any nesting
+/// (BinaryExpr/CastExpr/NotExpr/...) folded the inner wrapper to a literal,
+/// breaking the live link between SortExec and the FileScan predicate on
+/// the data-server side.
 ///
 /// Upstream apache/datafusion#21929 (commit 077f08a9a, merged 2026-05-22)
 /// fixed this structurally by removing that top-level call and routing each
@@ -3579,7 +3580,10 @@ fn dynamic_filter_nested_in_binary_expr_survives_proto_roundtrip() -> Result<()>
         .as_any()
         .downcast_ref::<DynamicFilterPhysicalExpr>()
         .unwrap();
-    decoded_dyn.update(lit(42_i64))?;
+    // Boolean-typed update -- the wrapped predicate is Boolean, so the
+    // refreshed inner expr must stay Boolean too (DynamicFilterPhysicalExpr
+    // caches data_type and asserts immutability in test builds).
+    decoded_dyn.update(lit(false))?;
     let g_after = snapshot_generation(&decoded);
     assert!(
         g_after > g_before,
