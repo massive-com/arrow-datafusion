@@ -20,6 +20,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::writer::StreamWriter;
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
     DataFusionError, Result, internal_datafusion_err, internal_err, not_impl_err,
 };
@@ -330,8 +331,33 @@ pub fn serialize_physical_expr_with_converter(
     }
 
     // Snapshot the expr in case it has dynamic predicate state so
-    // it can be serialized
-    let value = snapshot_physical_expr(Arc::clone(value))?;
+    // it can be serialized.
+    //
+    // BUT: `DynamicFilterPhysicalExpr` has its own dedicated wire format
+    // (`PhysicalDynamicFilterNode`) and a dedup pipeline that lets multiple
+    // references on the data-server side share one `Arc<Inner>` across the
+    // wire. If we let the generic snapshot walker fold a nested
+    // `DynamicFilterPhysicalExpr` to its `current()` literal here, the
+    // wrapper is gone and the data server can never observe a live update
+    // again. Skip `DynamicFilterPhysicalExpr` during the snapshot walk so
+    // it survives to the downcast chain below (which has a dedicated branch
+    // serializing it as `PhysicalDynamicFilterNode`).
+    //
+    // Upstream apache/datafusion#21929 fixed this structurally by removing
+    // the top-level `snapshot_physical_expr` call entirely and routing
+    // through per-expression `try_to_proto` hooks. Until atlas adopts that
+    // refactor, this is the minimal patch.
+    let value = Arc::clone(value)
+        .transform_up(|e| {
+            if e.as_any().is::<DynamicFilterPhysicalExpr>() {
+                Ok(Transformed::no(e))
+            } else if let Some(snapshot) = e.snapshot()? {
+                Ok(Transformed::yes(snapshot))
+            } else {
+                Ok(Transformed::no(e))
+            }
+        })
+        .data()?;
     let expr = value.as_any();
 
     // HashTableLookupExpr is used for dynamic filter pushdown in hash joins.
