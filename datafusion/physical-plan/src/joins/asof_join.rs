@@ -129,7 +129,9 @@ impl AsOfJoinCondition {
 ///
 /// this initial implementation is a bounded, in-memory operator and it requests
 /// single-partition inputs, collects both sides, sorts them by equality keys and
+/// the as-of key, then does a linear merge inside each equality partition
 #[derive(Debug, Clone)]
+pub struct AsOfJoinExec {
     /// left input
     pub(crate) left: Arc<dyn ExecutionPlan>,
     /// right input
