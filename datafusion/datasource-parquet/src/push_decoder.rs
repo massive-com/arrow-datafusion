@@ -34,7 +34,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use arrow::array::{RecordBatch, RecordBatchOptions};
+use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::Schema;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -219,14 +219,51 @@ impl PushDecoderStreamState {
         let mut batch = self.projector.project_batch(batch)?;
         if self.replace_schema {
             // Ensure the output batch has the expected schema.
-            // This handles things like schema level and field level metadata, which may not be present
-            // in the physical file schema.
-            // It is also possible for nullability to differ; some writers create files with
-            // OPTIONAL fields even when there are no nulls in the data.
-            // In these cases it may make sense for the logical schema to be `NOT NULL`.
-            // RecordBatch::try_new_with_options checks that if the schema is NOT NULL
-            // the array cannot contain nulls, amongst other checks.
-            let (_stream_schema, arrays, num_rows) = batch.into_parts();
+            //
+            // DataFusion 51's SchemaAdapter::map_batch() adapted array data to
+            // the logical output schema. Preserve that behavior here for schema
+            // evolution casts and nested field metadata/nullability differences.
+            let (stream_schema, arrays, num_rows) = batch.into_parts();
+            let arrays = arrays
+                .iter()
+                .enumerate()
+                .map(|(i, array)| {
+                    let target_type = self.output_schema.field(i).data_type();
+                    if array.data_type() == target_type {
+                        return Ok(Arc::clone(array));
+                    }
+
+                    let casted =
+                        if arrow::compute::can_cast_types(array.data_type(), target_type)
+                        {
+                            arrow::compute::cast(array, target_type)?
+                        } else {
+                            Arc::clone(array)
+                        };
+
+                    if casted.data_type() == target_type {
+                        return Ok(casted);
+                    }
+
+                    let data = casted
+                        .to_data()
+                        .into_builder()
+                        .data_type(target_type.clone())
+                        .build()
+                        .map_err(|e| {
+                            DataFusionError::ArrowError(
+                                Box::new(e),
+                                Some(format!(
+                                    "Failed to adapt column '{}' from {} to {}",
+                                    stream_schema.field(i).name(),
+                                    array.data_type(),
+                                    target_type,
+                                )),
+                            )
+                        })?;
+                    Ok(arrow::array::make_array(data))
+                })
+                .collect::<Result<Vec<ArrayRef>>>()?;
             let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
             batch = RecordBatch::try_new_with_options(
                 Arc::clone(&self.output_schema),

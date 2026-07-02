@@ -1458,7 +1458,10 @@ mod test {
         CachedParquetFileReaderFactory, DefaultParquetFileReaderFactory,
         ParquetFileReaderFactory, RowGroupAccess,
     };
-    use arrow::array::RecordBatch;
+    use arrow::array::{
+        Array, ArrayRef, Int32Array, ListArray, RecordBatch, StringArray,
+    };
+    use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use bytes::{BufMut, BytesMut};
     use datafusion_common::{
@@ -1480,8 +1483,8 @@ mod test {
         DefaultPhysicalExprAdapterFactory, replace_columns_with_literals,
     };
     use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
-    use futures::StreamExt;
     use futures::stream::BoxStream;
+    use futures::{StreamExt, TryStreamExt};
     use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
@@ -1820,13 +1823,12 @@ mod test {
     async fn collect_int32_values(
         mut stream: BoxStream<'static, Result<RecordBatch>>,
     ) -> Vec<i32> {
-        use arrow::array::Array;
         let mut values = vec![];
         while let Some(Ok(batch)) = stream.next().await {
             let array = batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<arrow::array::Int32Array>()
+                .downcast_ref::<Int32Array>()
                 .unwrap();
             for i in 0..array.len() {
                 if !array.is_null(i) {
@@ -1843,6 +1845,123 @@ mod test {
         batch: arrow::record_batch::RecordBatch,
     ) -> usize {
         write_parquet_batches(store, filename, vec![batch], None).await
+    }
+
+    async fn read_batches_with_schema(
+        store: Arc<dyn ObjectStore>,
+        filename: &str,
+        data_size: usize,
+        schema: SchemaRef,
+    ) -> Vec<RecordBatch> {
+        let projection_indices: Vec<usize> = (0..schema.fields().len()).collect();
+        let file =
+            PartitionedFile::new(filename.to_string(), u64::try_from(data_size).unwrap());
+        let opener = ParquetMorselizerBuilder::new()
+            .with_store(store)
+            .with_schema(schema)
+            .with_projection_indices(&projection_indices)
+            .build();
+        let stream = open_file(&opener, file).await.unwrap();
+        stream.try_collect().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_schema_adaptation_utf8_to_date32() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_schema =
+            Arc::new(Schema::new(vec![Field::new("date", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(StringArray::from(vec![
+                "2026-01-01",
+                "2026-02-01",
+            ]))],
+        )
+        .unwrap();
+        let data_size =
+            write_parquet(Arc::clone(&store), "schema_adapt_dates.parquet", batch).await;
+
+        let logical_schema = Arc::new(Schema::new(vec![Field::new(
+            "date",
+            DataType::Date32,
+            true,
+        )]));
+        let batches = read_batches_with_schema(
+            store,
+            "schema_adapt_dates.parquet",
+            data_size,
+            logical_schema,
+        )
+        .await;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+        assert_eq!(batches[0].column(0).data_type(), &DataType::Date32);
+    }
+
+    #[tokio::test]
+    async fn test_schema_adaptation_list_field_name_and_nullability() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let inner_field = Arc::new(Field::new("conditions", DataType::Int32, false));
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "conditions",
+            DataType::List(Arc::clone(&inner_field)),
+            true,
+        )]));
+        let values = Int32Array::from(vec![1, 2, 3, 4]);
+        let offsets = OffsetBuffer::from_lengths([2, 2]);
+        let list = ListArray::new(inner_field, offsets, Arc::new(values), None);
+        let batch =
+            RecordBatch::try_new(file_schema, vec![Arc::new(list) as ArrayRef]).unwrap();
+        let data_size =
+            write_parquet(Arc::clone(&store), "schema_adapt_list.parquet", batch).await;
+
+        let logical_inner = Arc::new(Field::new("element", DataType::Int32, true));
+        let logical_schema = Arc::new(Schema::new(vec![Field::new(
+            "conditions",
+            DataType::List(logical_inner),
+            true,
+        )]));
+        let batches = read_batches_with_schema(
+            store,
+            "schema_adapt_list.parquet",
+            data_size,
+            Arc::clone(&logical_schema),
+        )
+        .await;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+        assert_eq!(batches[0].schema(), logical_schema);
+    }
+
+    #[tokio::test]
+    async fn test_schema_adaptation_nullability_mismatch() {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            file_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let data_size =
+            write_parquet(Arc::clone(&store), "schema_adapt_nullable.parquet", batch)
+                .await;
+
+        let logical_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let batches = read_batches_with_schema(
+            store,
+            "schema_adapt_nullable.parquet",
+            data_size,
+            logical_schema,
+        )
+        .await;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
+        assert!(batches[0].schema().field(0).is_nullable());
     }
 
     /// Write multiple batches to a parquet file with optional writer properties
