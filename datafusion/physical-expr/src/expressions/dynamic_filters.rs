@@ -17,7 +17,7 @@
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{any::Any, fmt::Display, hash::Hash, sync::Arc};
+use std::{fmt::Display, hash::Hash, sync::Arc};
 use tokio::sync::watch;
 
 use crate::PhysicalExpr;
@@ -134,26 +134,6 @@ impl Inner {
         &self.expr
     }
 }
-
-/// An atomic counter used to generate monotonic u64 ids for
-/// `DynamicFilterPhysicalExpr` instances.
-struct ExpressionIdAtomicCounter {
-    inner: AtomicU64,
-}
-
-impl ExpressionIdAtomicCounter {
-    const fn new() -> Self {
-        Self {
-            inner: AtomicU64::new(0),
-        }
-    }
-
-    fn next(&self) -> u64 {
-        self.inner.fetch_add(1, Ordering::Relaxed)
-    }
-}
-
-static EXPR_ID_SOURCE: ExpressionIdAtomicCounter = ExpressionIdAtomicCounter::new();
 
 impl Hash for DynamicFilterPhysicalExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {

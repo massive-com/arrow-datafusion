@@ -17042,6 +17042,9 @@ impl serde::Serialize for PhysicalExprNode {
                 physical_expr_node::ExprType::HashExpr(v) => {
                     struct_ser.serialize_field("hashExpr", v)?;
                 }
+                physical_expr_node::ExprType::ScalarSubquery(v) => {
+                    struct_ser.serialize_field("scalarSubquery", v)?;
+                }
                 physical_expr_node::ExprType::DynamicFilter(v) => {
                     struct_ser.serialize_field("dynamicFilter", v)?;
                 }
@@ -17091,6 +17094,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
             "unknownColumn",
             "hash_expr",
             "hashExpr",
+            "scalar_subquery",
+            "scalarSubquery",
             "dynamic_filter",
             "dynamicFilter",
         ];
@@ -17117,6 +17122,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
             Extension,
             UnknownColumn,
             HashExpr,
+            ScalarSubquery,
             DynamicFilter,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
@@ -17159,6 +17165,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
                             "extension" => Ok(GeneratedField::Extension),
                             "unknownColumn" | "unknown_column" => Ok(GeneratedField::UnknownColumn),
                             "hashExpr" | "hash_expr" => Ok(GeneratedField::HashExpr),
+                            "scalarSubquery" | "scalar_subquery" => Ok(GeneratedField::ScalarSubquery),
                             "dynamicFilter" | "dynamic_filter" => Ok(GeneratedField::DynamicFilter),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
@@ -17322,6 +17329,13 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
                                 return Err(serde::de::Error::duplicate_field("hashExpr"));
                             }
                             expr_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_expr_node::ExprType::HashExpr)
+;
+                        }
+                        GeneratedField::ScalarSubquery => {
+                            if expr_type__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("scalarSubquery"));
+                            }
+                            expr_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_expr_node::ExprType::ScalarSubquery)
 ;
                         }
                         GeneratedField::DynamicFilter => {

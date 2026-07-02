@@ -38,6 +38,7 @@ use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{FunctionRegistry, TaskContext};
 use datafusion_expr::WindowFunctionDefinition;
 use datafusion_expr::dml::InsertOp;
+use datafusion_expr::execution_props::SubqueryIndex;
 use datafusion_physical_expr::expressions::{
     DynamicFilterInner, DynamicFilterPhysicalExpr,
 };
@@ -62,10 +63,6 @@ use super::{
 use crate::logical_plan::{self};
 use crate::protobuf::physical_expr_node::ExprType;
 use crate::{convert_required, protobuf};
-use datafusion_physical_expr::expressions::{
-    DynamicFilterInner, DynamicFilterPhysicalExpr,
-};
-
 impl From<&protobuf::PhysicalColumn> for Column {
     fn from(c: &protobuf::PhysicalColumn) -> Column {
         Column::new(&c.name, c.index as usize)
@@ -516,53 +513,6 @@ pub fn parse_physical_expr_with_converter(
                 results.clone(),
             ))
         }
-        ExprType::DynamicFilter(dynamic_filter) => {
-            let children = parse_physical_exprs(
-                &dynamic_filter.children,
-                ctx,
-                input_schema,
-                proto_converter,
-            )?;
-
-            let remapped_children = if !dynamic_filter.remapped_children.is_empty() {
-                Some(parse_physical_exprs(
-                    &dynamic_filter.remapped_children,
-                    ctx,
-                    input_schema,
-                    proto_converter,
-                )?)
-            } else {
-                None
-            };
-
-            let inner_expr = parse_required_physical_expr(
-                dynamic_filter.inner_expr.as_deref(),
-                ctx,
-                "inner_expr",
-                input_schema,
-                proto_converter,
-            )?;
-
-            let expression_id = proto.expr_id.ok_or_else(|| {
-                proto_error(
-                    "DynamicFilterPhysicalExpr requires PhysicalExprNode.expr_id \
-                     to be set by the serializer",
-                )
-            })?;
-
-            let base_filter: Arc<dyn PhysicalExpr> =
-                Arc::new(DynamicFilterPhysicalExpr::from_parts(
-                    children,
-                    remapped_children,
-                    DynamicFilterInner {
-                        expression_id,
-                        generation: dynamic_filter.generation,
-                        expr: inner_expr,
-                        is_complete: dynamic_filter.is_complete,
-                    },
-                ));
-            base_filter
-        }
         ExprType::Extension(extension) => {
             let inputs: Vec<Arc<dyn PhysicalExpr>> = extension
                 .inputs
@@ -573,8 +523,11 @@ pub fn parse_physical_expr_with_converter(
             // that embed nested `PhysicalExprNode` fields can thread the
             // active `proto_converter` into their own parsing of those
             // nested expressions, sharing the dedup cache.
-            codec.try_decode_expr(extension.expr.as_slice(), &inputs, proto_converter)?
-                as _
+            ctx.codec().try_decode_expr(
+                extension.expr.as_slice(),
+                &inputs,
+                proto_converter,
+            )? as _
         }
         ExprType::DynamicFilter(df_proto) => {
             // Reconstruct the DynamicFilterPhysicalExpr wrapper. When this
@@ -587,7 +540,7 @@ pub fn parse_physical_expr_with_converter(
             // Ported from upstream apache/datafusion#21807 (minimal subset).
             let inner_expr = match df_proto.inner_expr.as_deref() {
                 Some(p) => {
-                    proto_converter.proto_to_physical_expr(p, ctx, input_schema, codec)?
+                    proto_converter.proto_to_physical_expr(p, input_schema, ctx)?
                 }
                 None => {
                     return Err(proto_error(
@@ -598,9 +551,7 @@ pub fn parse_physical_expr_with_converter(
             let children = df_proto
                 .children
                 .iter()
-                .map(|c| {
-                    proto_converter.proto_to_physical_expr(c, ctx, input_schema, codec)
-                })
+                .map(|c| proto_converter.proto_to_physical_expr(c, input_schema, ctx))
                 .collect::<Result<Vec<_>>>()?;
             let remapped_children = if df_proto.remapped_children.is_empty() {
                 None
@@ -610,12 +561,7 @@ pub fn parse_physical_expr_with_converter(
                         .remapped_children
                         .iter()
                         .map(|c| {
-                            proto_converter.proto_to_physical_expr(
-                                c,
-                                ctx,
-                                input_schema,
-                                codec,
-                            )
+                            proto_converter.proto_to_physical_expr(c, input_schema, ctx)
                         })
                         .collect::<Result<Vec<_>>>()?,
                 )

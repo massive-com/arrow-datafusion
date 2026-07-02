@@ -22,9 +22,9 @@ use datafusion::common::{DataFusionError, Result, exec_datafusion_err, exec_err}
 #[cfg(feature = "substrait")]
 use datafusion_sqllogictest::DataFusionSubstraitRoundTrip;
 use datafusion_sqllogictest::{
-    CurrentlyExecutingSqlTracker, DataFusion, Filter, TestContext, df_value_validator,
-    read_dir_recursive, setup_scratch_dir, should_skip_file, should_skip_record,
-    value_normalizer,
+    CurrentlyExecutingSqlTracker, DataFusion, Filter, TestContext, TestFile,
+    df_value_validator, read_dir_recursive, setup_scratch_dir, should_skip_file,
+    should_skip_record, value_normalizer,
 };
 use futures::stream::StreamExt;
 use indicatif::{
@@ -427,6 +427,7 @@ fn is_env_truthy(name: &str) -> bool {
         })
 }
 
+#[expect(dead_code)]
 fn parse_timing_top_n(arg: &str) -> std::result::Result<usize, String> {
     let parsed = arg
         .parse::<usize>()

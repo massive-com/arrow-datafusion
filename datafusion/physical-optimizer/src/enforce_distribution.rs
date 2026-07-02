@@ -1098,8 +1098,7 @@ pub fn replace_order_preserving_variants(
         }
         context.plan = Arc::new(CoalescePartitionsExec::new(child_plan));
         return Ok((context, fetch));
-    } else if let Some(repartition) =
-        context.plan.as_any().downcast_ref::<RepartitionExec>()
+    } else if let Some(repartition) = context.plan.downcast_ref::<RepartitionExec>()
         && repartition.preserve_order()
     {
         context.plan = Arc::new(RepartitionExec::try_new(
@@ -1420,12 +1419,6 @@ pub fn ensure_distribution(
                 }
             };
 
-            let streaming_benefit = if child.data {
-                preserving_order_enables_streaming(&plan, &child.plan)?
-            } else {
-                false
-            };
-
             // There is an ordering requirement of the operator:
             if let Some(required_input_ordering) = required_input_ordering {
                 // Either:
@@ -1450,21 +1443,12 @@ pub fn ensure_distribution(
                     // make sure ordering requirements are still satisfied after.
                     if ordering_satisfied {
                         // Make sure to satisfy ordering requirement:
-                        child = add_sort_above_with_check(
-                            child,
-                            sort_req,
-                            fetch,
-                        )?;
+                        child = add_sort_above_with_check(child, sort_req, fetch)?;
                     }
                 }
                 // Stop tracking distribution changing operators
                 child.data = false;
             } else {
-                let streaming_benefit = if child.data {
-                    preserving_order_enables_streaming(&plan, &child.plan)?
-                } else {
-                    false
-                };
                 // no ordering requirement
                 match requirement {
                     // Operator requires specific distribution.
@@ -1481,7 +1465,7 @@ pub fn ensure_distribution(
                     }
                     Distribution::UnspecifiedDistribution => {
                         // Since ordering is lost, trying to preserve ordering is pointless
-                        if !maintains || plan.as_any().is::<OutputRequirementExec>() {
+                        if !maintains || plan.is::<OutputRequirementExec>() {
                             child = replace_order_preserving_variants(child, false)?.0;
                         }
                     }

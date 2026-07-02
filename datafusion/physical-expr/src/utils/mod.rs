@@ -71,15 +71,14 @@ impl ConstExpr {
             input_eqs: &EquivalenceProperties,
         ) -> Option<AcrossPartitions> {
             input_eqs.is_expr_constant(expr).or_else(|| {
-                expr.as_any()
-                    .downcast_ref::<Literal>()
+                expr.downcast_ref::<Literal>()
                     .map(|l| AcrossPartitions::Uniform(Some(l.value().clone())))
             })
         }
 
         let mut constants = Vec::new();
         for conjunction in split_conjunction(predicate) {
-            if let Some(binary) = conjunction.as_any().downcast_ref::<BinaryExpr>()
+            if let Some(binary) = conjunction.downcast_ref::<BinaryExpr>()
                 && binary.op() == &Operator::Eq
             {
                 // Check if either side is constant — either already known

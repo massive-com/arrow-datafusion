@@ -72,8 +72,7 @@ use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlanProperties, PlanProperties,
-    displayable,
+    DisplayAs, DisplayFormatType, ExecutionPlanProperties, PlanProperties, displayable,
 };
 use insta::Settings;
 
@@ -296,6 +295,7 @@ impl ExecutionPlan for SinglePartitionMaintainsOrderExec {
     }
 }
 
+#[expect(dead_code)]
 fn single_partition_maintains_order_exec(
     input: Arc<dyn ExecutionPlan>,
 ) -> Arc<dyn ExecutionPlan> {

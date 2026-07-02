@@ -21,7 +21,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::PhysicalExpr;
-use crate::expressions::{Column, Literal};
+use crate::expressions::{CastExpr, Column, Literal};
 use crate::scalar_function::ScalarFunctionExpr;
 use crate::utils::collect_columns;
 
@@ -1108,17 +1108,11 @@ impl ProjectionMapping {
             //   p.ticker → get_field(col("details"), "ticker")
             // enabling the optimizer to know that sorting by
             // `details.ticker` is equivalent to sorting by `p.ticker`.
-            if let Some(func_expr) =
-                source_expr.as_any().downcast_ref::<ScalarFunctionExpr>()
-            {
+            if let Some(func_expr) = source_expr.downcast_ref::<ScalarFunctionExpr>() {
                 let literal_args: Vec<Option<ScalarValue>> = func_expr
                     .args()
                     .iter()
-                    .map(|arg| {
-                        arg.as_any()
-                            .downcast_ref::<Literal>()
-                            .map(|l| l.value().clone())
-                    })
+                    .map(|arg| arg.downcast_ref::<Literal>().map(|l| l.value().clone()))
                     .collect();
 
                 #[expect(
@@ -1325,7 +1319,7 @@ pub(crate) mod tests {
             for (target, _) in targets.iter() {
                 // Skip non-Column targets (e.g. struct field decomposition
                 // entries which are ScalarFunctionExpr targets).
-                let Some(column) = target.as_any().downcast_ref::<Column>() else {
+                let Some(column) = target.downcast_ref::<Column>() else {
                     continue;
                 };
                 fields.push(Field::new(column.name(), data_type.clone(), nullable));

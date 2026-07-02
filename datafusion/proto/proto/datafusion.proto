@@ -934,29 +934,20 @@ message PhysicalExprNode {
 
     PhysicalHashExprNode hash_expr = 21;
 
-    // Ported from apache/datafusion#21807 (minimal subset). Allows a
-    // DynamicFilterPhysicalExpr to roundtrip through proto with its wrapper
-    // intact, so the receiver (combined with DeduplicatingDeserializer)
-    // can rebuild a shared `Arc<Inner>` across e.g. SortExec.filter and the
-    // FileScan predicate pushed down from it.
-    //
-    // Field 22 is intentionally skipped to match upstream's field number
-    // for a future scalar_subquery variant atlas doesn't need yet.
+    PhysicalScalarSubqueryExprNode scalar_subquery = 22;
+
     PhysicalDynamicFilterNode dynamic_filter = 23;
   }
 }
 
-// Ported from apache/datafusion#21807. See `dynamic_filter = 23` above.
 message PhysicalDynamicFilterNode {
   repeated PhysicalExprNode children = 1;
   repeated PhysicalExprNode remapped_children = 2;
   uint64 generation = 3;
   PhysicalExprNode inner_expr = 4;
   bool is_complete = 5;
-  // Stable identity of this dynamic filter. References with the same id
-  // MUST deserialize to the same `Arc<DynamicFilterPhysicalExpr>` so heap-max
-  // updates propagate from SortExec to the FileScan predicate it was
-  // pushed down to.
+  // Stable identity of this dynamic filter for deduplication across repeated
+  // references in the same physical plan.
   uint64 expression_id = 6;
 }
 
