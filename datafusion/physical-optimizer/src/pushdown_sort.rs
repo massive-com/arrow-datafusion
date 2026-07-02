@@ -58,12 +58,13 @@ use crate::PhysicalOptimizerRule;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::SortOrderPushdownResult;
 use datafusion_physical_plan::buffer::BufferExec;
+use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use std::sync::Arc;
 
 /// A PhysicalOptimizerRule that attempts to push down sort requirements to data sources.
@@ -176,6 +177,15 @@ impl PhysicalOptimizerRule for PushdownSort {
                     // CoalescePartitionsExec can concatenate locally sorted partitions.
                     let preserve_partitioning =
                         sort_exec.preserve_partitioning() && sort_exec.fetch().is_none();
+                    let needs_global_topk =
+                        sort_exec.preserve_partitioning() && sort_exec.fetch().is_some();
+                    let inner = if needs_global_topk
+                        && inner.output_partitioning().partition_count() > 1
+                    {
+                        Arc::new(CoalescePartitionsExec::new(inner))
+                    } else {
+                        inner
+                    };
                     Ok(Transformed::yes(Arc::new(
                         SortExec::new(required_ordering.clone(), inner)
                             .with_fetch(sort_exec.fetch())
