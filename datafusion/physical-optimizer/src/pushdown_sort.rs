@@ -172,12 +172,14 @@ impl PhysicalOptimizerRule for PushdownSort {
                     // Data source is optimized for the ordering but not perfectly sorted
                     // Keep the Sort operator but use the optimized input
                     // Benefits: TopK queries can terminate early, better cache locality
+                    // A standalone TopK still needs a global final sort; otherwise
+                    // CoalescePartitionsExec can concatenate locally sorted partitions.
+                    let preserve_partitioning =
+                        sort_exec.preserve_partitioning() && sort_exec.fetch().is_none();
                     Ok(Transformed::yes(Arc::new(
                         SortExec::new(required_ordering.clone(), inner)
                             .with_fetch(sort_exec.fetch())
-                            .with_preserve_partitioning(
-                                sort_exec.preserve_partitioning(),
-                            ),
+                            .with_preserve_partitioning(preserve_partitioning),
                     )))
                 }
                 SortOrderPushdownResult::Unsupported => {
