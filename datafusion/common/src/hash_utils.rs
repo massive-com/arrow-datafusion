@@ -24,11 +24,12 @@ use arrow::compute::take;
 use arrow::datatypes::*;
 #[cfg(not(feature = "force_hash_collisions"))]
 use arrow::{downcast_dictionary_array, downcast_primitive_array};
+use foldhash::fast::FixedState;
 #[cfg(not(feature = "force_hash_collisions"))]
 use itertools::Itertools;
 #[cfg(not(feature = "force_hash_collisions"))]
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 
 /// The hash random state used throughout DataFusion for hashing.
 pub type RandomState = FixedState;
@@ -42,7 +43,7 @@ use crate::cast::{
 };
 use crate::error::Result;
 use crate::error::{_internal_datafusion_err, _internal_err};
-use std::{cell::RefCell, hash::BuildHasher};
+use std::cell::RefCell;
 
 // Combines two hashes into one hash
 #[inline]
@@ -182,9 +183,6 @@ impl<T: HashValue + ?Sized> HashValue for &T {
     fn hash_one<S: BuildHasher>(&self, state: &S) -> u64 {
         T::hash_one(self, state)
     }
-    fn hash_write(&self, hasher: &mut impl Hasher) {
-        T::hash_write(self, hasher)
-    }
 }
 
 macro_rules! hash_value {
@@ -192,9 +190,6 @@ macro_rules! hash_value {
         $(impl HashValue for $t {
             fn hash_one<S: BuildHasher>(&self, state: &S) -> u64 {
                 state.hash_one(self)
-            }
-            fn hash_write(&self, hasher: &mut impl Hasher) {
-                Hash::hash(self, hasher)
             }
         })+
     };
@@ -208,25 +203,10 @@ macro_rules! hash_float_value {
             fn hash_one<S: BuildHasher>(&self, state: &S) -> u64 {
                 state.hash_one(<$i>::from_ne_bytes(self.to_ne_bytes()))
             }
-            fn hash_write(&self, hasher: &mut impl Hasher) {
-                hasher.write(&self.to_ne_bytes())
-            }
         })+
     };
 }
 hash_float_value!((half::f16, u16), (f32, u32), (f64, u64));
-
-/// Create a `SeedableRandomState` whose per-hasher seed incorporates `seed`.
-/// This folds the previous hash into the hasher's initial state so only the
-/// new value needs to pass through the hash function — same cost as `hash_one`.
-#[cfg(not(feature = "force_hash_collisions"))]
-#[inline]
-fn seeded_state(seed: u64) -> foldhash::fast::SeedableRandomState {
-    foldhash::fast::SeedableRandomState::with_seed(
-        seed,
-        foldhash::SharedSeed::global_fixed(),
-    )
-}
 
 /// Builds hash values of PrimitiveArray and writes them into `hashes_buffer`
 /// If `rehash==true` this folds the existing hash into the hasher state
@@ -1204,11 +1184,11 @@ mod tests {
         )
         .unwrap();
 
-        let random_state = RandomState::with_seeds(0, 0, 0, 0);
-        let mut ahash_hashes = vec![0; array.len()];
-        create_hashes([array], &random_state, &mut ahash_hashes).unwrap();
+        let random_state = RandomState::with_seed(0);
+        let mut default_hashes = vec![0; array.len()];
+        create_hashes([array], &random_state, &mut default_hashes).unwrap();
 
-        assert_ne!(custom_hashes, ahash_hashes);
+        assert_ne!(custom_hashes, default_hashes);
     }
 
     #[test]

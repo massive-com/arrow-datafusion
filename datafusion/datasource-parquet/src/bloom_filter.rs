@@ -33,7 +33,7 @@ use parquet::data_type::Decimal;
 /// This structure implements [`PruningStatistics`] and is used to prune
 /// Parquet row groups and data pages based on the query predicate.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct BloomFilterStatistics {
+pub struct BloomFilterStatistics {
     /// Per-column Bloom filters
     /// Key: predicate column name
     /// Value:
@@ -44,19 +44,19 @@ pub(crate) struct BloomFilterStatistics {
 
 impl BloomFilterStatistics {
     /// Create an empty [`BloomFilterStatistics`]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Default::default()
     }
 
     /// Create an empty [`BloomFilterStatistics`] with the specified capacity
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             column_sbbf: HashMap::with_capacity(capacity),
         }
     }
 
     /// Add a Bloom filter and type for the specified column
-    pub(crate) fn insert(&mut self, column: impl Into<String>, sbbf: Sbbf, ty: Type) {
+    pub fn insert(&mut self, column: impl Into<String>, sbbf: Sbbf, ty: Type) {
         self.column_sbbf.insert(column.into(), (sbbf, ty));
     }
 

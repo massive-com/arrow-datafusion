@@ -149,7 +149,7 @@ unsafe extern "C" fn try_decode_fn_wrapper(
     // so dedup of nested expressions stops here (matches pre-#21807 behavior).
     let proto_converter =
         datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {};
-    let plan = rresult_return!(codec.try_decode(
+    let plan = sresult_return!(codec.try_decode(
         buf.as_ref(),
         &inputs,
         task_ctx.as_ref(),
@@ -172,7 +172,7 @@ unsafe extern "C" fn try_encode_fn_wrapper(
     // so dedup of nested expressions stops here (matches pre-#21807 behavior).
     let proto_converter =
         datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {};
-    rresult_return!(codec.try_encode(plan, &mut bytes, &proto_converter));
+    sresult_return!(codec.try_encode(plan, &mut bytes, &proto_converter));
 
     FFI_Result::Ok(bytes.into_iter().collect())
 }

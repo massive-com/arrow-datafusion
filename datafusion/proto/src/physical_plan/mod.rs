@@ -19,7 +19,9 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::{IntervalMonthDayNanoType, Schema, SchemaRef};
@@ -1771,9 +1773,8 @@ impl protobuf::PhysicalPlanNode {
         let new_sort = if let Some(dynamic_filter_proto) = &sort.dynamic_filter {
             let dynamic_filter_expr = proto_converter.proto_to_physical_expr(
                 dynamic_filter_proto,
-                ctx,
                 new_sort.input().schema().as_ref(),
-                codec,
+                ctx,
             )?;
             // After the #21807 port the decoded expression IS a
             // `DynamicFilterPhysicalExpr` (since serialize skips snapshot
@@ -1872,8 +1873,12 @@ impl protobuf::PhysicalPlanNode {
             .map(|i| proto_converter.proto_to_execution_plan(i, ctx))
             .collect::<Result<_>>()?;
 
-        let extension_node =
-            codec.try_decode(extension.node.as_slice(), &inputs, ctx, proto_converter)?;
+        let extension_node = ctx.codec().try_decode(
+            extension.node.as_slice(),
+            &inputs,
+            ctx.task_ctx(),
+            proto_converter,
+        )?;
 
         Ok(extension_node)
     }
@@ -3881,7 +3886,7 @@ pub trait AsExecutionPlan: Debug + Send + Sync + Clone {
         Self: Sized;
 }
 
-pub trait PhysicalExtensionCodec: Debug + Send + Sync {
+pub trait PhysicalExtensionCodec: Debug + Send + Sync + Any {
     /// Decode an extension execution plan.
     ///
     /// `proto_converter` is the active conversion strategy (e.g.
@@ -4113,8 +4118,9 @@ pub struct DeduplicatingSerializer {
 
 impl DeduplicatingSerializer {
     pub fn new() -> Self {
+        static SERIALIZATION_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
         Self {
-            session_id: rand::random(),
+            session_id: SERIALIZATION_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
     }
 }
@@ -4128,9 +4134,8 @@ impl Default for DeduplicatingSerializer {
 impl PhysicalProtoConverterExtension for DeduplicatingSerializer {
     fn proto_to_execution_plan(
         &self,
-        _ctx: &TaskContext,
-        _codec: &dyn PhysicalExtensionCodec,
         _proto: &protobuf::PhysicalPlanNode,
+        _ctx: &PhysicalPlanDecodeContext<'_>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         internal_err!("DeduplicatingSerializer cannot deserialize execution plans")
     }
@@ -4153,9 +4158,8 @@ impl PhysicalProtoConverterExtension for DeduplicatingSerializer {
     fn proto_to_physical_expr(
         &self,
         _proto: &protobuf::PhysicalExprNode,
-        _ctx: &TaskContext,
         _input_schema: &Schema,
-        _codec: &dyn PhysicalExtensionCodec,
+        _ctx: &PhysicalPlanDecodeContext<'_>,
     ) -> Result<Arc<dyn PhysicalExpr>>
     where
         Self: Sized,
@@ -4254,13 +4258,7 @@ impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
         Self: Sized,
     {
         let Some(expr_id) = proto.expr_id else {
-            return parse_physical_expr_with_converter(
-                proto,
-                ctx,
-                input_schema,
-                codec,
-                self,
-            );
+            return parse_physical_expr_with_converter(proto, input_schema, ctx, self);
         };
 
         // Always parse the proto body first. The cache hit path below uses
@@ -4268,8 +4266,7 @@ impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
         // they appeared in the proto -- e.g. file-schema indices after
         // FilterPushdown rewrote them), so we can't short-circuit before
         // parsing.
-        let parsed =
-            parse_physical_expr_with_converter(proto, ctx, input_schema, codec, self)?;
+        let parsed = parse_physical_expr_with_converter(proto, input_schema, ctx, self)?;
 
         let mut cache = self.cache.borrow_mut();
         if let Some(cached) = cache.get(&expr_id) {
@@ -4336,11 +4333,7 @@ impl PhysicalProtoConverterExtension for DeduplicatingProtoConverter {
     where
         Self: Sized,
     {
-        protobuf::PhysicalPlanNode::try_from_physical_plan_with_converter(
-            Arc::clone(plan),
-            codec,
-            self,
-        )
+        DeduplicatingSerializer::new().execution_plan_to_proto(plan, codec)
     }
 
     fn proto_to_physical_expr(
@@ -4361,7 +4354,7 @@ impl PhysicalProtoConverterExtension for DeduplicatingProtoConverter {
         expr: &Arc<dyn PhysicalExpr>,
         codec: &dyn PhysicalExtensionCodec,
     ) -> Result<protobuf::PhysicalExprNode> {
-        serialize_physical_expr_with_converter(expr, codec, self)
+        DeduplicatingSerializer::new().physical_expr_to_proto(expr, codec)
     }
 }
 

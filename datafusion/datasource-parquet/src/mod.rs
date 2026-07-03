@@ -45,6 +45,7 @@ mod test_util;
 mod writer;
 
 pub use access_plan::{ParquetAccessPlan, RowGroupAccess};
+pub use bloom_filter::BloomFilterStatistics;
 pub use file_format::*;
 pub use metrics::ParquetFileMetrics;
 pub use page_filter::PagePruningAccessPlanFilter;

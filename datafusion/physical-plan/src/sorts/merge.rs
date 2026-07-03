@@ -187,13 +187,6 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         }
     }
 
-    fn emit_in_progress_batch(&mut self) -> Result<Option<RecordBatch>> {
-        let rows_before = self.in_progress.len();
-        let result = self.in_progress.build_record_batch();
-        self.produced += rows_before - self.in_progress.len();
-        result
-    }
-
     /// If the stream at the given index is not exhausted, and the last cursor for the
     /// stream is finished, poll the stream for the next RecordBatch and create a new
     /// cursor for the stream from the returned result

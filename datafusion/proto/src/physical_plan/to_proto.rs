@@ -34,12 +34,12 @@ use datafusion_datasource_parquet::file_format::ParquetSink;
 use datafusion_expr::WindowFrame;
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion_physical_expr::window::{SlidingAggregateWindowExpr, StandardWindowExpr};
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 use datafusion_physical_plan::expressions::{
-    BinaryExpr, CaseExpr, CastExpr, Column, DynamicFilterPhysicalExpr, InListExpr,
-    IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NegativeExpr, NotExpr, TryCastExpr,
-    UnKnownColumn,
+    BinaryExpr, CaseExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr,
+    LikeExpr, Literal, NegativeExpr, NotExpr, TryCastExpr, UnKnownColumn,
 };
 use datafusion_physical_plan::joins::{HashExpr, HashTableLookupExpr};
 use datafusion_physical_plan::udaf::AggregateFunctionExpr;
@@ -272,7 +272,6 @@ fn serialize_dynamic_filter(
     proto_converter: &dyn PhysicalProtoConverterExtension,
 ) -> Result<protobuf::PhysicalExprNode> {
     let df = value
-        .as_any()
         .downcast_ref::<DynamicFilterPhysicalExpr>()
         .expect("caller already checked downcast");
 
@@ -322,11 +321,7 @@ pub fn serialize_physical_expr_with_converter(
     // discards the wrapper. Without the wrapper the receiver can't
     // reconstruct shared Arc<Inner> identity across SortExec.filter and
     // the FileScan predicate it was pushed down into.
-    if value
-        .as_any()
-        .downcast_ref::<DynamicFilterPhysicalExpr>()
-        .is_some()
-    {
+    if value.downcast_ref::<DynamicFilterPhysicalExpr>().is_some() {
         return serialize_dynamic_filter(value, codec, proto_converter);
     }
 
@@ -349,7 +344,7 @@ pub fn serialize_physical_expr_with_converter(
     // refactor, this is the minimal patch.
     let value = Arc::clone(value)
         .transform_up(|e| {
-            if e.as_any().is::<DynamicFilterPhysicalExpr>() {
+            if e.is::<DynamicFilterPhysicalExpr>() {
                 Ok(Transformed::no(e))
             } else if let Some(snapshot) = e.snapshot()? {
                 Ok(Transformed::yes(snapshot))
@@ -358,7 +353,8 @@ pub fn serialize_physical_expr_with_converter(
             }
         })
         .data()?;
-    let expr = value.as_any();
+    let expr_id = value.expression_id();
+    let expr = value.as_ref();
 
     // HashTableLookupExpr is used for dynamic filter pushdown in hash joins.
     // It contains an Arc<dyn JoinHashMapType> (the build-side hash table) which
@@ -634,39 +630,6 @@ pub fn serialize_physical_expr_with_converter(
                     nullable: expr.nullable(),
                     index: expr.index().as_usize() as u32,
                 },
-            )),
-        })
-    } else if let Some(df) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
-        let children = df
-            .original_children()
-            .iter()
-            .map(|child| proto_converter.physical_expr_to_proto(child, codec))
-            .collect::<Result<Vec<_>>>()?;
-
-        let remapped_children = if let Some(remapped) = df.remapped_children() {
-            remapped
-                .iter()
-                .map(|child| proto_converter.physical_expr_to_proto(child, codec))
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![]
-        };
-
-        // Atomic snapshot of inner state.
-        let inner = df.inner();
-        let inner_expr =
-            Box::new(proto_converter.physical_expr_to_proto(&inner.expr, codec)?);
-
-        Ok(protobuf::PhysicalExprNode {
-            expr_id,
-            expr_type: Some(protobuf::physical_expr_node::ExprType::DynamicFilter(
-                Box::new(protobuf::PhysicalDynamicFilterNode {
-                    children,
-                    remapped_children,
-                    generation: inner.generation,
-                    inner_expr: Some(inner_expr),
-                    is_complete: inner.is_complete,
-                }),
             )),
         })
     } else {

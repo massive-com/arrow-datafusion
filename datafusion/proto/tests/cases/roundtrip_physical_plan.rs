@@ -54,8 +54,6 @@ use datafusion::physical_expr::window::{SlidingAggregateWindowExpr, StandardWind
 use datafusion::physical_expr::{
     LexOrdering, PhysicalSortRequirement, ScalarFunctionExpr,
 };
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
 use datafusion::physical_plan::aggregates::{
     AggregateExec, AggregateMode, LimitOptions, PhysicalGroupBy,
 };
@@ -77,9 +75,6 @@ use datafusion::physical_plan::metrics::MetricType;
 use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::physical_plan::repartition::RepartitionExec;
-use datafusion::physical_plan::scalar_subquery::{
-    ScalarSubqueryExec, ScalarSubqueryLink,
-};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion::physical_plan::unnest::{ListUnnest, UnnestExec};
@@ -102,14 +97,12 @@ use datafusion_common::{
     internal_datafusion_err, internal_err, not_impl_err,
 };
 use datafusion_datasource::TableSchema;
-use datafusion_datasource::file::FileSource;
 use datafusion_expr::async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl};
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{
     Accumulator, AccumulatorFactoryFunction, AggregateUDF, ColumnarValue,
     ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, SimpleAggregateUDF,
     WindowFrame, WindowFrameBound, WindowUDF,
-    execution_props::{ScalarSubqueryResults, SubqueryIndex},
 };
 use datafusion_functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf;
 use datafusion_functions_aggregate::array_agg::array_agg_udaf;
@@ -117,7 +110,6 @@ use datafusion_functions_aggregate::average::avg_udaf;
 use datafusion_functions_aggregate::min_max::max_udaf;
 use datafusion_functions_aggregate::nth_value::nth_value_udaf;
 use datafusion_functions_aggregate::string_agg::string_agg_udaf;
-use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion_proto::bytes::{
     physical_plan_from_bytes_with_proto_converter,
     physical_plan_to_bytes_with_proto_converter,
@@ -2815,11 +2807,16 @@ fn make_reassigned_dynamic_filter(
     Ok((schema, reassigned))
 }
 
-/// Extract the expression id from a [`PhysicalExpr`] proto. Populated by the
-/// default serializer from `PhysicalExpr::expression_id`.
+/// Extract the dynamic filter expression id from a [`PhysicalExpr`] proto.
 fn proto_expression_id(expr: &PhysicalExprNode) -> u64 {
-    expr.expr_id
-        .expect("expected PhysicalExprNode.expr_id to be populated")
+    match expr.expr_type.as_ref() {
+        Some(protobuf::physical_expr_node::ExprType::DynamicFilter(dynamic_filter)) => {
+            dynamic_filter.expression_id
+        }
+        _ => expr
+            .expr_id
+            .expect("expected PhysicalExprNode.expr_id to be populated"),
+    }
 }
 
 /// Roundtrip a single physical expression shaped like so:
@@ -2978,20 +2975,6 @@ fn assert_dynamic_filter_update_is_visible(
     assert_eq!(expected_current, format!("{:?}", right_filter.current()?),);
 
     Ok(())
-}
-
-/// Extract the dynamic-filter predicate that was pushed down to the parquet
-/// scan at the bottom of the plan tree.
-fn parquet_source_predicate(child: &Arc<dyn ExecutionPlan>) -> Arc<dyn PhysicalExpr> {
-    let data_source = child
-        .downcast_ref::<DataSourceExec>()
-        .expect("Child should be DataSourceExec");
-    let (_, parquet_source) = data_source
-        .downcast_to_file_source::<ParquetSource>()
-        .expect("Should be ParquetSource");
-    parquet_source
-        .filter()
-        .expect("ParquetSource should have a predicate after roundtrip")
 }
 
 /// Assert that two dynamic filters are equal both structurally (Debug output)
@@ -3174,8 +3157,9 @@ fn dynamic_filter_dedup_with_deduplicating_codec() -> Result<()> {
 
     let ctx = SessionContext::new().task_ctx();
     let deserializer = DeduplicatingDeserializer::new();
-    let d1 = deserializer.proto_to_physical_expr(&proto1, &ctx, &schema, &codec)?;
-    let d2 = deserializer.proto_to_physical_expr(&proto2, &ctx, &schema, &codec)?;
+    let decode_ctx = PhysicalPlanDecodeContext::new(ctx.as_ref(), &codec);
+    let d1 = deserializer.proto_to_physical_expr(&proto1, &schema, &decode_ctx)?;
+    let d2 = deserializer.proto_to_physical_expr(&proto2, &schema, &decode_ctx)?;
 
     // d1 and d2 may be distinct OUTER Arcs because the cache-hit path
     // rewraps via `with_new_children` to preserve each occurrence's
@@ -3183,18 +3167,12 @@ fn dynamic_filter_dedup_with_deduplicating_codec() -> Result<()> {
     // visible to both). expression_id equality is necessary but not
     // sufficient (the wire carries it across decode), so we also assert
     // observable shared state via `update()` -> `snapshot_generation()`.
-    let d1_df = d1
-        .as_any()
-        .downcast_ref::<DynamicFilterPhysicalExpr>()
-        .expect(
-            "decoded expr must be DynamicFilterPhysicalExpr; snapshot path is bypassed",
-        );
-    let d2_df = d2
-        .as_any()
-        .downcast_ref::<DynamicFilterPhysicalExpr>()
-        .expect(
-            "decoded expr must be DynamicFilterPhysicalExpr; snapshot path is bypassed",
-        );
+    let d1_df = d1.downcast_ref::<DynamicFilterPhysicalExpr>().expect(
+        "decoded expr must be DynamicFilterPhysicalExpr; snapshot path is bypassed",
+    );
+    let d2_df = d2.downcast_ref::<DynamicFilterPhysicalExpr>().expect(
+        "decoded expr must be DynamicFilterPhysicalExpr; snapshot path is bypassed",
+    );
     assert_eq!(
         d1_df.inner().expression_id,
         id_before,
@@ -3260,7 +3238,6 @@ fn dynamic_filter_dedup_distinct_outer_arcs_same_inner() -> Result<()> {
         Arc::clone(&initial),
     ));
     let expected_id = df_arc1
-        .as_any()
         .downcast_ref::<DynamicFilterPhysicalExpr>()
         .unwrap()
         .inner()
@@ -3277,7 +3254,6 @@ fn dynamic_filter_dedup_distinct_outer_arcs_same_inner() -> Result<()> {
     );
     assert_eq!(
         df_arc2
-            .as_any()
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .unwrap()
             .inner()
@@ -3298,19 +3274,14 @@ fn dynamic_filter_dedup_distinct_outer_arcs_same_inner() -> Result<()> {
 
     let ctx = SessionContext::new().task_ctx();
     let deserializer = DeduplicatingDeserializer::new();
-    let d1 = deserializer.proto_to_physical_expr(&proto1, &ctx, &schema, &codec)?;
-    let d2 = deserializer.proto_to_physical_expr(&proto2, &ctx, &schema, &codec)?;
+    let decode_ctx = PhysicalPlanDecodeContext::new(ctx.as_ref(), &codec);
+    let d1 = deserializer.proto_to_physical_expr(&proto1, &schema, &decode_ctx)?;
+    let d2 = deserializer.proto_to_physical_expr(&proto2, &schema, &decode_ctx)?;
     // d1 and d2 may be distinct OUTER Arcs (cache-hit path rewraps via
     // `with_new_children`); the invariant is shared INNER. Verify via
     // observable update propagation, not just expression_id equality.
-    let d1_df = d1
-        .as_any()
-        .downcast_ref::<DynamicFilterPhysicalExpr>()
-        .unwrap();
-    let d2_df = d2
-        .as_any()
-        .downcast_ref::<DynamicFilterPhysicalExpr>()
-        .unwrap();
+    let d1_df = d1.downcast_ref::<DynamicFilterPhysicalExpr>().unwrap();
+    let d2_df = d2.downcast_ref::<DynamicFilterPhysicalExpr>().unwrap();
     assert_eq!(d1_df.inner().expression_id, expected_id);
     assert_dynamic_filter_inner_is_shared(d1_df, d2_df)?;
 
@@ -3368,13 +3339,11 @@ fn dynamic_filter_dedup_distinct_children_via_with_new_children() -> Result<()> 
         Arc::clone(&df_arc1).with_new_children(vec![Arc::clone(&col_a_idx1)])?;
     assert_eq!(
         df_arc1
-            .as_any()
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .unwrap()
             .inner()
             .expression_id,
         df_arc2
-            .as_any()
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .unwrap()
             .inner()
@@ -3393,15 +3362,14 @@ fn dynamic_filter_dedup_distinct_children_via_with_new_children() -> Result<()> 
 
     let ctx = SessionContext::new().task_ctx();
     let deserializer = DeduplicatingDeserializer::new();
-    let d1 = deserializer.proto_to_physical_expr(&proto1, &ctx, &schema, &codec)?;
-    let d2 = deserializer.proto_to_physical_expr(&proto2, &ctx, &schema, &codec)?;
+    let decode_ctx = PhysicalPlanDecodeContext::new(ctx.as_ref(), &codec);
+    let d1 = deserializer.proto_to_physical_expr(&proto1, &schema, &decode_ctx)?;
+    let d2 = deserializer.proto_to_physical_expr(&proto2, &schema, &decode_ctx)?;
 
     let d1_df = d1
-        .as_any()
         .downcast_ref::<DynamicFilterPhysicalExpr>()
         .expect("d1 must remain a DynamicFilterPhysicalExpr after roundtrip");
     let d2_df = d2
-        .as_any()
         .downcast_ref::<DynamicFilterPhysicalExpr>()
         .expect("d2 must remain a DynamicFilterPhysicalExpr after roundtrip");
 
@@ -3411,15 +3379,11 @@ fn dynamic_filter_dedup_distinct_children_via_with_new_children() -> Result<()> 
     // `proto_to_physical_expr`, the second decode would return the first
     // decode's outer Arc and silently keep its children.
     fn child_column_index(expr: &Arc<dyn PhysicalExpr>) -> usize {
-        let dyn_filter = expr
-            .as_any()
-            .downcast_ref::<DynamicFilterPhysicalExpr>()
-            .unwrap();
+        let dyn_filter = expr.downcast_ref::<DynamicFilterPhysicalExpr>().unwrap();
         dyn_filter
             .children()
             .first()
             .unwrap()
-            .as_any()
             .downcast_ref::<Column>()
             .unwrap()
             .index()
@@ -3506,20 +3470,19 @@ fn dynamic_filter_nested_in_binary_expr_survives_proto_roundtrip() -> Result<()>
 
     let ctx = SessionContext::new().task_ctx();
     let deserializer = DeduplicatingDeserializer::new();
-    let decoded = deserializer.proto_to_physical_expr(&proto, &ctx, &schema, &codec)?;
+    let decode_ctx = PhysicalPlanDecodeContext::new(ctx.as_ref(), &codec);
+    let decoded = deserializer.proto_to_physical_expr(&proto, &schema, &decode_ctx)?;
 
     // The decoded predicate must still be `BinaryExpr(static, AND, dyn)` --
     // crucially, the right side must be a live `DynamicFilterPhysicalExpr`,
     // NOT a `Literal(true)` snapshot from before the patch.
     let binary = decoded
-        .as_any()
         .downcast_ref::<BinaryExpr>()
         .expect("decoded predicate must be a BinaryExpr");
     assert_eq!(*binary.op(), Operator::And, "op preserved");
 
     let right_is_dyn = binary
         .right()
-        .as_any()
         .downcast_ref::<DynamicFilterPhysicalExpr>()
         .is_some();
     assert!(
@@ -3539,7 +3502,6 @@ fn dynamic_filter_nested_in_binary_expr_survives_proto_roundtrip() -> Result<()>
     );
     let decoded_dyn = binary
         .right()
-        .as_any()
         .downcast_ref::<DynamicFilterPhysicalExpr>()
         .unwrap();
     // Boolean-typed update -- the wrapped predicate is Boolean, so the
@@ -3588,7 +3550,6 @@ fn dynamic_filter_roundtrip_without_dedup() -> Result<()> {
     assert!(!Arc::ptr_eq(&d1, &d2));
     for d in [&d1, &d2] {
         let inner = d
-            .as_any()
             .downcast_ref::<DynamicFilterPhysicalExpr>()
             .expect("decoded expr must be DynamicFilterPhysicalExpr")
             .inner();
@@ -3652,10 +3613,10 @@ fn sort_exec_proto_roundtrip_preserves_dyn_filter_arc() -> Result<()> {
 
     let ctx = SessionContext::new().task_ctx();
     let deserializer = DeduplicatingDeserializer::new();
-    let decoded = deserializer.proto_to_execution_plan(&ctx, &codec, &decoded_proto)?;
+    let decode_ctx = PhysicalPlanDecodeContext::new(ctx.as_ref(), &codec);
+    let decoded = deserializer.proto_to_execution_plan(&decoded_proto, &decode_ctx)?;
 
     let decoded_sort = decoded
-        .as_any()
         .downcast_ref::<SortExec>()
         .expect("decoded plan must be SortExec");
     let decoded_df = decoded_sort

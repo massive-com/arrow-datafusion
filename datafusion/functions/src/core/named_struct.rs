@@ -25,7 +25,6 @@ use datafusion_expr::{
 };
 use datafusion_expr::{ScalarUDFImpl, Signature, Volatility};
 
-use super::getfield::GetFieldFunc;
 use datafusion_macros::user_doc;
 use std::sync::Arc;
 

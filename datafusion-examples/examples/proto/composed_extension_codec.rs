@@ -153,7 +153,7 @@ impl PhysicalExtensionCodec for ParentPhysicalExtensionCodec {
         buf: &mut Vec<u8>,
         _proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
-        if node.as_any().downcast_ref::<ParentExec>().is_some() {
+        if node.downcast_ref::<ParentExec>().is_some() {
             buf.extend_from_slice("ParentExec".as_bytes());
             Ok(())
         } else {
@@ -229,7 +229,7 @@ impl PhysicalExtensionCodec for ChildPhysicalExtensionCodec {
         buf: &mut Vec<u8>,
         _proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<()> {
-        if node.as_any().downcast_ref::<ChildExec>().is_some() {
+        if node.downcast_ref::<ChildExec>().is_some() {
             buf.extend_from_slice("ChildExec".as_bytes());
             Ok(())
         } else {

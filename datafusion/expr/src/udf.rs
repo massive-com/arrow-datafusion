@@ -385,14 +385,6 @@ impl ScalarUDF {
         self.inner.documentation()
     }
 
-    /// See [`ScalarUDFImpl::struct_field_mapping`] for more details.
-    pub fn struct_field_mapping(
-        &self,
-        literal_args: &[Option<ScalarValue>],
-    ) -> Option<StructFieldMapping> {
-        self.inner.struct_field_mapping(literal_args)
-    }
-
     /// Return true if this function is an async function
     pub fn as_async(&self) -> Option<&AsyncScalarUDF> {
         self.inner().downcast_ref::<AsyncScalarUDF>()
@@ -1036,25 +1028,6 @@ pub trait ScalarUDFImpl: Debug + DynEq + DynHash + Send + Sync + Any {
     fn placement(&self, _args: &[ExpressionPlacement]) -> ExpressionPlacement {
         ExpressionPlacement::KeepInPlace
     }
-
-    /// For struct-producing functions, return how output fields map to input
-    /// arguments. This enables the optimizer to propagate orderings through
-    /// struct projections.
-    ///
-    /// `literal_args[i]` is `Some(value)` if argument `i` is a known literal,
-    /// allowing extraction of field names from arguments like
-    /// `named_struct('field_name', value, ...)`.
-    ///
-    /// For example, `named_struct('a', col1, 'b', col2)` would return a
-    /// mapping indicating that output field `'a'` (accessed via
-    /// `get_field(output, 'a')`) corresponds to input argument `col1` at
-    /// index 1, and field `'b'` corresponds to `col2` at index 3.
-    fn struct_field_mapping(
-        &self,
-        _literal_args: &[Option<ScalarValue>],
-    ) -> Option<StructFieldMapping> {
-        None
-    }
 }
 
 impl dyn ScalarUDFImpl {
@@ -1207,13 +1180,6 @@ impl ScalarUDFImpl for AliasedScalarUDFImpl {
 
     fn placement(&self, args: &[ExpressionPlacement]) -> ExpressionPlacement {
         self.inner.placement(args)
-    }
-
-    fn struct_field_mapping(
-        &self,
-        literal_args: &[Option<ScalarValue>],
-    ) -> Option<StructFieldMapping> {
-        self.inner.struct_field_mapping(literal_args)
     }
 }
 
