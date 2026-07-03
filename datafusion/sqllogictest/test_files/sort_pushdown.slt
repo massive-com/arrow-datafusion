@@ -262,8 +262,7 @@ WITH ORDER (id ASC);
 statement ok
 SET datafusion.execution.target_partitions = 4;
 
-# Multi-partition standalone TopK coalesces before the pushed-down TopK so
-# the final `SortPreservingMergeExec` receives one globally sorted stream.
+# Now we should see RepartitionExec because we have 3 input partitions (3 files)
 query TT
 EXPLAIN SELECT * FROM sorted_parquet_multi ORDER BY id DESC LIMIT 3;
 ----
@@ -272,9 +271,8 @@ logical_plan
 02)--TableScan: sorted_parquet_multi projection=[id, value, name]
 physical_plan
 01)SortPreservingMergeExec: [id@0 DESC], fetch=3
-02)--SortExec: TopK(fetch=3), expr=[id@0 DESC], preserve_partitioning=[false]
-03)----CoalescePartitionsExec
-04)------DataSourceExec: file_groups={3 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/sorted_multi/part1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/sorted_multi/part2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/sorted_multi/part3.parquet]]}, projection=[id, value, name], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[id@0 DESC], reverse_row_groups=true
+02)--SortExec: TopK(fetch=3), expr=[id@0 DESC], preserve_partitioning=[true]
+03)----DataSourceExec: file_groups={3 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/sorted_multi/part1.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/sorted_multi/part2.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/sort_pushdown/sorted_multi/part3.parquet]]}, projection=[id, value, name], file_type=parquet, predicate=DynamicFilter [ empty ], sort_order_for_reorder=[id@0 DESC], reverse_row_groups=true
 
 # Verify correctness with repartitioning and multiple files
 query IIT
