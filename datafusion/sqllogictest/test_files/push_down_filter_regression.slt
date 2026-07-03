@@ -295,18 +295,17 @@ STORED AS PARQUET
 LOCATION 'test_files/scratch/push_down_filter_regression/agg_dyn_single/';
 
 # Use `analyze_level = summary` + `analyze_categories = 'none'` so metrics
-# render empty; we only care that the `predicate=DynamicFilter [ ... ]` text
-# matches. Pruning metrics here are subject to a parallel-execution race
-# (the order in which Partial aggregates publish filter updates vs. when the
-# scan reads each partition), so the filter *content* is deterministic but
-# the pruning counts are not.
+# render empty; we only care that the `predicate=DynamicFilter [ ... ]`
+# structure is present. Pruning metrics and published bounds here are subject
+# to a parallel-execution race (the order in which Partial aggregates publish
+# filter updates vs. when the scan reads each partition).
 statement ok
 set datafusion.explain.analyze_level = summary;
 
 statement ok
 set datafusion.explain.analyze_categories = 'none';
 
-# MIN(a) -> DynamicFilter [ a < 1 ]
+# MIN(a) -> DynamicFilter [ a < <min_seen> ]
 query TT
 EXPLAIN ANALYZE SELECT MIN(a) FROM agg_dyn_single;
 ----
@@ -314,7 +313,7 @@ Plan with Metrics
 01)AggregateExec: mode=Final, gby=[], aggr=[min(agg_dyn_single.a)], metrics=[]
 02)--CoalescePartitionsExec, metrics=[]
 03)----AggregateExec: mode=Partial, gby=[], aggr=[min(agg_dyn_single.a)], metrics=[]
-04)------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/push_down_filter_regression/agg_dyn_single/file_0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/push_down_filter_regression/agg_dyn_single/file_1.parquet]]}, projection=[a], file_type=parquet, predicate=DynamicFilter [ a@0 < 1 ], pruning_predicate=a_null_count@1 != row_count@2 AND a_min@0 < 1, required_guarantees=[], metrics=[]
+04)------DataSourceExec: file_groups={2 groups: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/push_down_filter_regression/agg_dyn_single/file_0.parquet], [WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/push_down_filter_regression/agg_dyn_single/file_1.parquet]]}, projection=[a], file_type=parquet, predicate=DynamicFilter [ a@0 < <slt:ignore> ], pruning_predicate=a_null_count@1 != row_count@2 AND a_min@0 < <slt:ignore>, required_guarantees=[], metrics=[]
 
 # MAX(a) -> DynamicFilter [ a > 8 ]
 query TT
