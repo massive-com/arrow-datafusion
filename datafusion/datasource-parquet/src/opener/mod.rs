@@ -27,10 +27,10 @@ use crate::access_plan::PreparedAccessPlan;
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::push_decoder::{DecoderBuilderConfig, PushDecoderStreamState};
 use crate::row_filter::{RowFilterGenerator, build_projection_read_plan};
-use crate::row_group_filter::{BloomFilterStatistics, RowGroupAccessPlanFilter};
+use crate::row_group_filter::RowGroupAccessPlanFilter;
 use crate::{
-    Int96Coercer, ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
-    apply_file_schema_type_coercions,
+    BloomFilterStatistics, Int96Coercer, ParquetAccessPlan, ParquetFileMetrics,
+    ParquetFileReaderFactory, apply_file_schema_type_coercions,
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
