@@ -152,6 +152,61 @@ fn split_human_display_alias<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field};
+    use datafusion_physical_expr::expressions::Column;
+    use datafusion_physical_plan::{
+        DisplayAs, DisplayFormatType, PlanProperties, SendableRecordBatchStream,
+    };
+
+    #[derive(Debug)]
+    struct DelegatingExec {
+        inner: Arc<dyn ExecutionPlan>,
+    }
+
+    impl DisplayAs for DelegatingExec {
+        fn fmt_as(
+            &self,
+            t: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            self.inner.fmt_as(t, f)
+        }
+    }
+
+    impl ExecutionPlan for DelegatingExec {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+            Some(self.inner.as_ref())
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            self.inner.children()
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                inner: self.inner.clone().with_new_children(children)?,
+            }))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            self.inner.execute(partition, context)
+        }
+    }
 
     #[test]
     fn split_human_display_alias_ignores_mismatched_alias() {
@@ -171,6 +226,35 @@ mod tests {
             split_human_display_alias(&display, "agg"),
             (display.as_str(), None)
         );
+    }
+
+    #[test]
+    fn physical_plan_encode_uses_downcast_delegate() -> Result<()> {
+        let input_schema = Arc::new(Schema::new(vec![Field::new(
+            "ticker",
+            DataType::Utf8,
+            false,
+        )]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(DelegatingExec {
+            inner: Arc::new(EmptyExec::new(input_schema)),
+        });
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("ticker", 0));
+        let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+            vec![(expr, "ticker".to_string())],
+            input,
+        )?);
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(DelegatingExec { inner: projection });
+
+        let node = protobuf::PhysicalPlanNode::try_from_physical_plan(
+            plan,
+            &DefaultPhysicalExtensionCodec {},
+        )?;
+        assert!(matches!(
+            node.physical_plan_type,
+            Some(PhysicalPlanType::Projection(_))
+        ));
+
+        Ok(())
     }
 }
 
@@ -427,7 +511,7 @@ impl protobuf::PhysicalPlanNode {
         Self: Sized,
     {
         let plan_clone = Arc::clone(&plan);
-        let plan = plan.as_ref() as &dyn Any;
+        let plan = plan.as_ref();
 
         if let Some(exec) = plan.downcast_ref::<ExplainExec>() {
             return protobuf::PhysicalPlanNode::try_from_explain_exec(exec, codec);
