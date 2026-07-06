@@ -28,14 +28,16 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{JoinSide, JoinType, internal_err};
+use datafusion_expr::Operator;
 use datafusion_expr_common::sort_properties::SortProperties;
 use datafusion_physical_expr::LexOrdering;
-use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::PhysicalExprRef;
+use datafusion_physical_expr::expressions::{BinaryExpr, Column};
 use datafusion_physical_plan::execution_plan::EmissionType;
-use datafusion_physical_plan::joins::utils::ColumnIndex;
+use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter, JoinOn};
 use datafusion_physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
-    StreamJoinPartitionMode, SymmetricHashJoinExec,
+    AsOfJoinCondition, AsOfJoinExec, CrossJoinExec, HashJoinExec, NestedLoopJoinExec,
+    PartitionMode, StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use std::sync::Arc;
@@ -260,67 +262,288 @@ fn statistical_join_selection_subrule(
     collect_threshold_byte_size: usize,
     collect_threshold_num_rows: usize,
 ) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
-    let transformed =
-        if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
-            match hash_join.partition_mode() {
-                PartitionMode::Auto => try_collect_left(
-                    hash_join,
-                    false,
-                    collect_threshold_byte_size,
-                    collect_threshold_num_rows,
-                )?
+    let transformed = if let Some(asof_join) = try_asof_join(&plan)? {
+        Some(asof_join)
+    } else if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        match hash_join.partition_mode() {
+            PartitionMode::Auto => try_collect_left(
+                hash_join,
+                false,
+                collect_threshold_byte_size,
+                collect_threshold_num_rows,
+            )?
+            .map_or_else(
+                || partitioned_hash_join(hash_join).map(Some),
+                |v| Ok(Some(v)),
+            )?,
+            PartitionMode::CollectLeft => try_collect_left(hash_join, true, 0, 0)?
                 .map_or_else(
                     || partitioned_hash_join(hash_join).map(Some),
                     |v| Ok(Some(v)),
                 )?,
-                PartitionMode::CollectLeft => try_collect_left(hash_join, true, 0, 0)?
-                    .map_or_else(
-                        || partitioned_hash_join(hash_join).map(Some),
-                        |v| Ok(Some(v)),
-                    )?,
-                PartitionMode::Partitioned => {
-                    let left = hash_join.left();
-                    let right = hash_join.right();
-                    // Don't swap null-aware anti joins as they have specific side requirements
-                    if hash_join.join_type().supports_swap()
-                        && !hash_join.null_aware
-                        && should_swap_join_order(&**left, &**right)?
-                    {
-                        hash_join
-                            .swap_inputs(PartitionMode::Partitioned)
-                            .map(Some)?
-                    } else {
-                        None
-                    }
+            PartitionMode::Partitioned => {
+                let left = hash_join.left();
+                let right = hash_join.right();
+                // Don't swap null-aware anti joins as they have specific side requirements
+                if hash_join.join_type().supports_swap()
+                    && !hash_join.null_aware
+                    && should_swap_join_order(&**left, &**right)?
+                {
+                    hash_join
+                        .swap_inputs(PartitionMode::Partitioned)
+                        .map(Some)?
+                } else {
+                    None
                 }
             }
-        } else if let Some(cross_join) = plan.as_any().downcast_ref::<CrossJoinExec>() {
-            let left = cross_join.left();
-            let right = cross_join.right();
-            if should_swap_join_order(&**left, &**right)? {
-                cross_join.swap_inputs().map(Some)?
-            } else {
-                None
-            }
-        } else if let Some(nl_join) = plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
-            let left = nl_join.left();
-            let right = nl_join.right();
-            if nl_join.join_type().supports_swap()
-                && should_swap_join_order(&**left, &**right)?
-            {
-                nl_join.swap_inputs().map(Some)?
-            } else {
-                None
-            }
+        }
+    } else if let Some(cross_join) = plan.as_any().downcast_ref::<CrossJoinExec>() {
+        let left = cross_join.left();
+        let right = cross_join.right();
+        if should_swap_join_order(&**left, &**right)? {
+            cross_join.swap_inputs().map(Some)?
         } else {
             None
-        };
+        }
+    } else if let Some(nl_join) = plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
+        let left = nl_join.left();
+        let right = nl_join.right();
+        if nl_join.join_type().supports_swap()
+            && should_swap_join_order(&**left, &**right)?
+        {
+            nl_join.swap_inputs().map(Some)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     Ok(if let Some(transformed) = transformed {
         Transformed::yes(transformed)
     } else {
         Transformed::no(plan)
     })
+}
+
+fn try_asof_join(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        if !matches!(hash_join.join_type(), JoinType::Inner | JoinType::Left) {
+            return Ok(None);
+        }
+
+        let Some(filter) = hash_join.filter() else {
+            return Ok(None);
+        };
+        let Some((filter_on, asof_condition)) =
+            extract_asof_join_predicates(filter, hash_join.left(), hash_join.right())?
+        else {
+            return Ok(None);
+        };
+
+        let mut on = hash_join.on().to_vec();
+        on.extend(filter_on);
+
+        return Ok(Some(Arc::new(AsOfJoinExec::try_new(
+            Arc::clone(hash_join.left()),
+            Arc::clone(hash_join.right()),
+            on,
+            asof_condition,
+            *hash_join.join_type(),
+            hash_join.projection.as_ref().map(|p| p.to_vec()),
+            hash_join.null_equality(),
+        )?)));
+    }
+
+    if let Some(nl_join) = plan.as_any().downcast_ref::<NestedLoopJoinExec>() {
+        if !matches!(nl_join.join_type(), JoinType::Inner | JoinType::Left) {
+            return Ok(None);
+        }
+
+        let Some(filter) = nl_join.filter() else {
+            return Ok(None);
+        };
+        let Some((on, asof_condition)) =
+            extract_asof_join_predicates(filter, nl_join.left(), nl_join.right())?
+        else {
+            return Ok(None);
+        };
+
+        return Ok(Some(Arc::new(AsOfJoinExec::try_new(
+            Arc::clone(nl_join.left()),
+            Arc::clone(nl_join.right()),
+            on,
+            asof_condition,
+            *nl_join.join_type(),
+            nl_join.projection().as_ref().map(|p| p.to_vec()),
+            datafusion_common::NullEquality::NullEqualsNothing,
+        )?)));
+    }
+
+    Ok(None)
+}
+
+fn extract_asof_join_predicates(
+    filter: &JoinFilter,
+    left: &Arc<dyn ExecutionPlan>,
+    right: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<(JoinOn, AsOfJoinCondition)>> {
+    let mut visitor = AsOfPredicateVisitor {
+        filter,
+        left,
+        right,
+        on: vec![],
+        asof_condition: None,
+        inequality_count: 0,
+        unsupported: false,
+    };
+    visitor.visit(filter.expression())?;
+
+    if visitor.unsupported || visitor.inequality_count != 1 {
+        return Ok(None);
+    }
+
+    Ok(visitor
+        .asof_condition
+        .map(|asof_condition| (visitor.on, asof_condition)))
+}
+
+struct AsOfPredicateVisitor<'a> {
+    filter: &'a JoinFilter,
+    left: &'a Arc<dyn ExecutionPlan>,
+    right: &'a Arc<dyn ExecutionPlan>,
+    on: JoinOn,
+    asof_condition: Option<AsOfJoinCondition>,
+    inequality_count: usize,
+    unsupported: bool,
+}
+
+impl AsOfPredicateVisitor<'_> {
+    fn visit(&mut self, expr: &PhysicalExprRef) -> Result<()> {
+        let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() else {
+            self.unsupported = true;
+            return Ok(());
+        };
+
+        if binary.op() == &Operator::And {
+            self.visit(binary.left())?;
+            self.visit(binary.right())?;
+            return Ok(());
+        }
+
+        match binary.op() {
+            Operator::Eq => {
+                if let Some((left, right)) =
+                    self.extract_side_pair(binary.left(), binary.right(), *binary.op())?
+                {
+                    self.on.push((left, right));
+                } else {
+                    self.unsupported = true;
+                }
+            }
+            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
+                self.inequality_count += 1;
+                if self.inequality_count > 1 {
+                    self.unsupported = true;
+                    return Ok(());
+                }
+
+                if let Some((left, right, op)) =
+                    self.extract_inequality(binary.left(), binary.right(), *binary.op())?
+                {
+                    self.asof_condition =
+                        Some(AsOfJoinCondition::try_new(left, op, right)?);
+                } else {
+                    self.unsupported = true;
+                }
+            }
+            _ => self.unsupported = true,
+        }
+
+        Ok(())
+    }
+
+    fn extract_side_pair(
+        &self,
+        left_expr: &PhysicalExprRef,
+        right_expr: &PhysicalExprRef,
+        op: Operator,
+    ) -> Result<Option<(PhysicalExprRef, PhysicalExprRef)>> {
+        let Some((left_side, left_expr)) = self.filter_column(left_expr)? else {
+            return Ok(None);
+        };
+        let Some((right_side, right_expr)) = self.filter_column(right_expr)? else {
+            return Ok(None);
+        };
+
+        match (left_side, right_side, op) {
+            (JoinSide::Left, JoinSide::Right, Operator::Eq) => {
+                Ok(Some((left_expr, right_expr)))
+            }
+            (JoinSide::Right, JoinSide::Left, Operator::Eq) => {
+                Ok(Some((right_expr, left_expr)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn extract_inequality(
+        &self,
+        left_expr: &PhysicalExprRef,
+        right_expr: &PhysicalExprRef,
+        op: Operator,
+    ) -> Result<Option<(PhysicalExprRef, PhysicalExprRef, Operator)>> {
+        let Some((left_side, left_expr)) = self.filter_column(left_expr)? else {
+            return Ok(None);
+        };
+        let Some((right_side, right_expr)) = self.filter_column(right_expr)? else {
+            return Ok(None);
+        };
+
+        match (left_side, right_side) {
+            (JoinSide::Left, JoinSide::Right) => Ok(Some((left_expr, right_expr, op))),
+            (JoinSide::Right, JoinSide::Left) => {
+                Ok(Some((right_expr, left_expr, flip_inequality(op)?)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn filter_column(
+        &self,
+        expr: &PhysicalExprRef,
+    ) -> Result<Option<(JoinSide, PhysicalExprRef)>> {
+        let Some(column) = expr.as_any().downcast_ref::<Column>() else {
+            return Ok(None);
+        };
+        let Some(column_index) = self.filter.column_indices().get(column.index()) else {
+            return Ok(None);
+        };
+
+        let (schema, side) = match column_index.side {
+            JoinSide::Left => (self.left.schema(), JoinSide::Left),
+            JoinSide::Right => (self.right.schema(), JoinSide::Right),
+            JoinSide::None => return Ok(None),
+        };
+
+        let field = schema.field(column_index.index);
+        Ok(Some((
+            side,
+            Arc::new(Column::new(field.name(), column_index.index)) as _,
+        )))
+    }
+}
+
+fn flip_inequality(op: Operator) -> Result<Operator> {
+    match op {
+        Operator::Lt => Ok(Operator::Gt),
+        Operator::LtEq => Ok(Operator::GtEq),
+        Operator::Gt => Ok(Operator::Lt),
+        Operator::GtEq => Ok(Operator::LtEq),
+        _ => internal_err!("Can not flip non-inequality operator {op}"),
+    }
 }
 
 /// Pipeline-fixing join selection subrule.

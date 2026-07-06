@@ -18,6 +18,7 @@
 //! DataFusion Join implementations
 
 use arrow::array::BooleanBufferBuilder;
+pub use asof_join::{AsOfJoinCondition, AsOfJoinDirection, AsOfJoinExec};
 pub use cross_join::CrossJoinExec;
 use datafusion_physical_expr::PhysicalExprRef;
 pub use hash_join::{
@@ -30,6 +31,7 @@ pub use piecewise_merge_join::PiecewiseMergeJoinExec;
 pub use sort_merge_join::SortMergeJoinExec;
 pub use symmetric_hash_join::SymmetricHashJoinExec;
 pub mod chain;
+mod asof_join;
 mod cross_join;
 mod hash_join;
 mod nested_loop_join;
