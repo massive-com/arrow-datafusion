@@ -195,7 +195,7 @@ mod tests {
             children: Vec<Arc<dyn ExecutionPlan>>,
         ) -> Result<Arc<dyn ExecutionPlan>> {
             Ok(Arc::new(Self {
-                inner: self.inner.clone().with_new_children(children)?,
+                inner: Arc::clone(&self.inner).with_new_children(children)?,
             }))
         }
 
