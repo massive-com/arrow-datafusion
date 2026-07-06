@@ -206,6 +206,10 @@ name = "distinct_query_sql"
 
 [[bench]]
 harness = false
+name = "asof_join_sql"
+
+[[bench]]
+harness = false
 name = "push_down_filter"
 
 [[bench]]
