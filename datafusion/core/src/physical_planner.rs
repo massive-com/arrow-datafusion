@@ -29,7 +29,8 @@ use crate::error::{DataFusionError, Result};
 use crate::execution::context::{ExecutionProps, SessionState};
 use crate::logical_expr::utils::generate_sort_key;
 use crate::logical_expr::{
-    Aggregate, EmptyRelation, Join, Projection, Sort, TableScan, Unnest, Values, Window,
+    Aggregate, AsOfJoin, EmptyRelation, Join, Projection, Sort, TableScan, Unnest,
+    Values, Window,
 };
 use crate::logical_expr::{
     Expr, LogicalPlan, Partitioning as LogicalPartitioning, PlanType, Repartition,
@@ -42,7 +43,8 @@ use crate::physical_plan::explain::ExplainExec;
 use crate::physical_plan::filter::FilterExecBuilder;
 use crate::physical_plan::joins::utils as join_utils;
 use crate::physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec,
+    AsOfJoinCondition, AsOfJoinExec, CrossJoinExec, HashJoinExec, NestedLoopJoinExec,
+    PartitionMode, SortMergeJoinExec,
 };
 use crate::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use crate::physical_plan::projection::{ProjectionExec, ProjectionExpr};
@@ -1709,6 +1711,137 @@ impl DefaultPhysicalPlanner {
                     join
                 }
             }
+            LogicalPlan::AsOfJoin(AsOfJoin {
+                left,
+                right,
+                on,
+                match_condition,
+                join_type,
+                null_equality,
+                ..
+            }) => {
+                let [physical_left, physical_right] = children.two()?;
+
+                let left_df_schema = left.schema();
+                let right_df_schema = right.schema();
+                let execution_props = session_state.execution_props();
+
+                // Equijoin keys: `.0` references the LEFT input, `.1` the RIGHT.
+                let join_on = on
+                    .iter()
+                    .map(|(l, r)| {
+                        let l = create_physical_expr(l, left_df_schema, execution_props)?;
+                        let r =
+                            create_physical_expr(r, right_df_schema, execution_props)?;
+                        Ok((l, r))
+                    })
+                    .collect::<Result<join_utils::JoinOn>>()?;
+
+                // The match condition must be a single inequality comparison.
+                let Expr::BinaryExpr(BinaryExpr {
+                    left: match_left,
+                    op,
+                    right: match_right,
+                }) = match_condition
+                else {
+                    return plan_err!(
+                        "AsOfJoin match_condition must be a binary inequality expression, got {match_condition}"
+                    );
+                };
+
+                let mut op = *op;
+                if !matches!(
+                    op,
+                    Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+                ) {
+                    return plan_err!(
+                        "AsOfJoin match_condition requires an inequality operator (<, <=, >, >=), got {op:?}"
+                    );
+                }
+
+                fn reverse_ineq(op: Operator) -> Operator {
+                    match op {
+                        Operator::Lt => Operator::Gt,
+                        Operator::LtEq => Operator::GtEq,
+                        Operator::Gt => Operator::Lt,
+                        Operator::GtEq => Operator::LtEq,
+                        _ => op,
+                    }
+                }
+
+                #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+                enum Side {
+                    Left,
+                    Right,
+                    Both,
+                }
+
+                let side_of = |e: &Expr| -> Result<Side> {
+                    let cols = e.column_refs();
+                    let any_left = cols
+                        .iter()
+                        .any(|c| left_df_schema.index_of_column(c).is_ok());
+                    let any_right = cols
+                        .iter()
+                        .any(|c| right_df_schema.index_of_column(c).is_ok());
+                    Ok(match (any_left, any_right) {
+                        (true, false) => Side::Left,
+                        (false, true) => Side::Right,
+                        (true, true) => Side::Both,
+                        (false, false) => {
+                            return plan_err!(
+                                "AsOfJoin match_condition operand must reference an input column"
+                            );
+                        }
+                    })
+                };
+
+                // Orient the condition so it reads `left_input op right_input`,
+                // flipping the operator if it was written the other way around.
+                let mut lhs_logical = match_left.as_ref();
+                let mut rhs_logical = match_right.as_ref();
+                let lhs_side = side_of(lhs_logical)?;
+                let rhs_side = side_of(rhs_logical)?;
+
+                if lhs_side == Side::Both || rhs_side == Side::Both {
+                    return plan_err!(
+                        "AsOfJoin match_condition operands must each reference a single input side"
+                    );
+                }
+
+                if lhs_side == Side::Right && rhs_side == Side::Left {
+                    std::mem::swap(&mut lhs_logical, &mut rhs_logical);
+                    op = reverse_ineq(op);
+                } else if !(lhs_side == Side::Left && rhs_side == Side::Right) {
+                    return plan_err!(
+                        "AsOfJoin match_condition must compare the left input against the right input"
+                    );
+                }
+
+                let condition_left =
+                    create_physical_expr(lhs_logical, left_df_schema, execution_props)?;
+                let condition_right =
+                    create_physical_expr(rhs_logical, right_df_schema, execution_props)?;
+                let asof_condition =
+                    AsOfJoinCondition::try_new(condition_left, op, condition_right)?;
+
+                let use_sorted_input = session_state
+                    .config_options()
+                    .optimizer
+                    .asof_join_use_sorted_input;
+                Arc::new(
+                    AsOfJoinExec::try_new(
+                        physical_left,
+                        physical_right,
+                        join_on,
+                        asof_condition,
+                        *join_type,
+                        None,
+                        *null_equality,
+                    )?
+                    .with_required_input_ordering(use_sorted_input),
+                )
+            }
             LogicalPlan::RecursiveQuery(RecursiveQuery {
                 name, is_distinct, ..
             }) => {
@@ -2167,6 +2300,7 @@ fn extract_dml_filters(
             | LogicalPlan::Sort(_)
             | LogicalPlan::Union(_)
             | LogicalPlan::Join(_)
+            | LogicalPlan::AsOfJoin(_)
             | LogicalPlan::Repartition(_)
             | LogicalPlan::Aggregate(_)
             | LogicalPlan::Window(_)
@@ -3781,6 +3915,37 @@ mod tests {
             "total_rows",
             physical_plan.schema().field(0).name().as_str()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_asof_join_planning() -> Result<()> {
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("t", DataType::Int64, false),
+        ]);
+
+        let left = scan_empty(Some("l"), &schema, None)?.build()?;
+        let right = scan_empty(Some("r"), &schema, None)?.build()?;
+
+        let asof = AsOfJoin::try_new(
+            Arc::new(left),
+            Arc::new(right),
+            vec![(col("l.k"), col("r.k"))],
+            col("l.t").gt_eq(col("r.t")),
+            JoinType::Inner,
+            datafusion_common::NullEquality::NullEqualsNothing,
+        )?;
+        let logical_plan = LogicalPlan::AsOfJoin(asof);
+
+        let session_state = make_session_state();
+        let planner = DefaultPhysicalPlanner::default();
+        let physical_plan = planner
+            .create_physical_plan(&logical_plan, &session_state)
+            .await?;
+
+        let displayed = displayable(physical_plan.as_ref()).indent(true).to_string();
+        assert_contains!(displayed, "AsOfJoinExec");
         Ok(())
     }
 

@@ -49,9 +49,9 @@ use datafusion_expr::type_coercion::other::{
 };
 use datafusion_expr::utils::merge_schema;
 use datafusion_expr::{
-    Cast, Expr, ExprSchemable, Join, Limit, LogicalPlan, Operator, Projection, Union,
-    WindowFrame, WindowFrameBound, WindowFrameUnits, is_false, is_not_false, is_not_true,
-    is_not_unknown, is_true, is_unknown, lit, not,
+    AsOfJoin, Cast, Expr, ExprSchemable, Join, Limit, LogicalPlan, Operator, Projection,
+    Union, WindowFrame, WindowFrameBound, WindowFrameUnits, is_false, is_not_false,
+    is_not_true, is_not_unknown, is_true, is_unknown, lit, not,
 };
 
 /// Performs type coercion by determining the schema
@@ -167,6 +167,7 @@ impl<'a> TypeCoercionRewriter<'a> {
     pub fn coerce_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
         match plan {
             LogicalPlan::Join(join) => self.coerce_join(join),
+            LogicalPlan::AsOfJoin(asof) => self.coerce_asof_join(asof),
             LogicalPlan::Union(union) => Self::coerce_union(union),
             LogicalPlan::Limit(limit) => Self::coerce_limit(limit),
             _ => Ok(plan),
@@ -208,6 +209,26 @@ impl<'a> TypeCoercionRewriter<'a> {
             .transpose()?;
 
         Ok(LogicalPlan::Join(join))
+    }
+
+    /// Coerce the equijoin key pairs of an AsOf join.
+    ///
+    /// Like [`Self::coerce_join`], the equality keys are stored as a parallel
+    /// list of left/right expressions, so each pair must be coerced together.
+    /// The `match_condition` is a single binary comparison and is coerced by the
+    /// generic expression pass.
+    pub fn coerce_asof_join(&mut self, mut asof: AsOfJoin) -> Result<LogicalPlan> {
+        asof.on = asof
+            .on
+            .into_iter()
+            .map(|(lhs, rhs)| {
+                let left_schema = asof.left.schema();
+                let right_schema = asof.right.schema();
+                self.coerce_binary_op(lhs, left_schema, Operator::Eq, rhs, right_schema)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(LogicalPlan::AsOfJoin(asof))
     }
 
     /// Coerce the union’s inputs to a common schema compatible with all inputs.

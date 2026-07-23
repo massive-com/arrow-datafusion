@@ -570,6 +570,7 @@ impl OptimizerRule for CommonSubexprEliminate {
             LogicalPlan::Window(window) => self.try_optimize_window(window, config)?,
             LogicalPlan::Aggregate(agg) => self.try_optimize_aggregate(agg, config)?,
             LogicalPlan::Join(_)
+            | LogicalPlan::AsOfJoin(_)
             | LogicalPlan::Repartition(_)
             | LogicalPlan::Union(_)
             | LogicalPlan::TableScan(_)

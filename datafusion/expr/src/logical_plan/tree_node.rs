@@ -38,7 +38,7 @@
 //! * [`LogicalPlan::expressions`]: Return a copy of the plan's expressions
 
 use crate::{
-    Aggregate, Analyze, CreateMemoryTable, CreateView, DdlStatement, Distinct,
+    Aggregate, Analyze, AsOfJoin, CreateMemoryTable, CreateView, DdlStatement, Distinct,
     DistinctOn, DmlStatement, Execute, Explain, Expr, Extension, Filter, Join, Limit,
     LogicalPlan, Partitioning, Prepare, Projection, RecursiveQuery, Repartition, Sort,
     Statement, Subquery, SubqueryAlias, TableScan, Union, Unnest, UserDefinedLogicalNode,
@@ -145,6 +145,25 @@ impl TreeNode for LogicalPlan {
                     schema,
                     null_equality,
                     null_aware,
+                })
+            }),
+            LogicalPlan::AsOfJoin(AsOfJoin {
+                left,
+                right,
+                on,
+                match_condition,
+                join_type,
+                schema,
+                null_equality,
+            }) => (left, right).map_elements(f)?.update_data(|(left, right)| {
+                LogicalPlan::AsOfJoin(AsOfJoin {
+                    left,
+                    right,
+                    on,
+                    match_condition,
+                    join_type,
+                    schema,
+                    null_equality,
                 })
             }),
             LogicalPlan::Limit(Limit { skip, fetch, input }) => input
@@ -430,6 +449,13 @@ impl LogicalPlan {
             LogicalPlan::Join(Join { on, filter, .. }) => {
                 (on, filter).apply_ref_elements(f)
             }
+            // The rewritable expressions of an AsOf join are the equijoin (on)
+            // pairs followed by the single required match_condition.
+            LogicalPlan::AsOfJoin(AsOfJoin {
+                on,
+                match_condition,
+                ..
+            }) => (on, match_condition).apply_ref_elements(f),
             LogicalPlan::Sort(Sort { expr, .. }) => expr.apply_elements(f),
             LogicalPlan::Extension(extension) => {
                 // would be nice to avoid this copy -- maybe can
@@ -580,6 +606,30 @@ impl LogicalPlan {
                     null_aware,
                 })
             }),
+            // The rewritable expressions of an AsOf join are the equijoin (on)
+            // pairs followed by the single required match_condition, in the same
+            // order as observed by apply_expressions.
+            LogicalPlan::AsOfJoin(AsOfJoin {
+                left,
+                right,
+                on,
+                match_condition,
+                join_type,
+                schema,
+                null_equality,
+            }) => (on, match_condition).map_elements(f)?.update_data(
+                |(on, match_condition)| {
+                    LogicalPlan::AsOfJoin(AsOfJoin {
+                        left,
+                        right,
+                        on,
+                        match_condition,
+                        join_type,
+                        schema,
+                        null_equality,
+                    })
+                },
+            ),
             LogicalPlan::Sort(Sort { expr, input, fetch }) => expr
                 .map_elements(f)?
                 .update_data(|expr| LogicalPlan::Sort(Sort { expr, input, fetch })),

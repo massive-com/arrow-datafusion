@@ -5,7 +5,7 @@
 pub struct LogicalPlanNode {
     #[prost(
         oneof = "logical_plan_node::LogicalPlanType",
-        tags = "1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33"
+        tags = "1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34"
     )]
     pub logical_plan_type: ::core::option::Option<logical_plan_node::LogicalPlanType>,
 }
@@ -77,6 +77,8 @@ pub mod logical_plan_node {
         CteWorkTableScan(super::CteWorkTableScanNode),
         #[prost(message, tag = "33")]
         Dml(::prost::alloc::boxed::Box<super::DmlNode>),
+        #[prost(message, tag = "34")]
+        AsOfJoin(::prost::alloc::boxed::Box<super::AsOfJoinNode>),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -384,6 +386,23 @@ pub struct JoinNode {
     pub null_equality: i32,
     #[prost(message, optional, tag = "8")]
     pub filter: ::core::option::Option<LogicalExprNode>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AsOfJoinNode {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub left: ::core::option::Option<::prost::alloc::boxed::Box<LogicalPlanNode>>,
+    #[prost(message, optional, boxed, tag = "2")]
+    pub right: ::core::option::Option<::prost::alloc::boxed::Box<LogicalPlanNode>>,
+    #[prost(enumeration = "super::datafusion_common::JoinType", tag = "3")]
+    pub join_type: i32,
+    #[prost(message, repeated, tag = "4")]
+    pub left_join_key: ::prost::alloc::vec::Vec<LogicalExprNode>,
+    #[prost(message, repeated, tag = "5")]
+    pub right_join_key: ::prost::alloc::vec::Vec<LogicalExprNode>,
+    #[prost(enumeration = "super::datafusion_common::NullEquality", tag = "6")]
+    pub null_equality: i32,
+    #[prost(message, optional, tag = "7")]
+    pub match_condition: ::core::option::Option<LogicalExprNode>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DistinctNode {
@@ -1079,7 +1098,7 @@ pub mod table_reference {
 pub struct PhysicalPlanNode {
     #[prost(
         oneof = "physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38"
+        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39"
     )]
     pub physical_plan_type: ::core::option::Option<physical_plan_node::PhysicalPlanType>,
 }
@@ -1163,6 +1182,8 @@ pub mod physical_plan_node {
         Buffer(::prost::alloc::boxed::Box<super::BufferExecNode>),
         #[prost(message, tag = "38")]
         ArrowScan(super::ArrowScanExecNode),
+        #[prost(message, tag = "39")]
+        AsOfJoin(::prost::alloc::boxed::Box<super::AsOfJoinExecNode>),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1747,6 +1768,29 @@ pub struct HashJoinExecNode {
     pub projection: ::prost::alloc::vec::Vec<u32>,
     #[prost(bool, tag = "10")]
     pub null_aware: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AsOfJoinExecNode {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub left: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
+    #[prost(message, optional, boxed, tag = "2")]
+    pub right: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
+    #[prost(message, repeated, tag = "3")]
+    pub on: ::prost::alloc::vec::Vec<JoinOn>,
+    #[prost(enumeration = "super::datafusion_common::JoinType", tag = "4")]
+    pub join_type: i32,
+    #[prost(enumeration = "super::datafusion_common::NullEquality", tag = "5")]
+    pub null_equality: i32,
+    #[prost(message, optional, tag = "6")]
+    pub match_condition_left: ::core::option::Option<PhysicalExprNode>,
+    #[prost(message, optional, tag = "7")]
+    pub match_condition_right: ::core::option::Option<PhysicalExprNode>,
+    #[prost(string, tag = "8")]
+    pub match_condition_op: ::prost::alloc::string::String,
+    #[prost(uint32, repeated, tag = "9")]
+    pub projection: ::prost::alloc::vec::Vec<u32>,
+    #[prost(bool, tag = "10")]
+    pub require_input_ordering: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SymmetricHashJoinExecNode {

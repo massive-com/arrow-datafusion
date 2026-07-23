@@ -16,12 +16,19 @@
 // under the License.
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-use datafusion_common::{Column, Result, not_impl_err, plan_datafusion_err};
-use datafusion_expr::{JoinType, LogicalPlan, LogicalPlanBuilder};
+use datafusion_common::{
+    Column, NullEquality, Result, not_impl_err, plan_datafusion_err, plan_err,
+};
+use datafusion_expr::utils::{find_valid_equijoin_key_pair, split_conjunction};
+use datafusion_expr::{
+    AsOfJoin, BinaryExpr, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Operator,
+};
 use sqlparser::ast::{
-    Join, JoinConstraint, JoinOperator, ObjectName, TableFactor, TableWithJoins,
+    Expr as SqlExpr, Join, JoinConstraint, JoinOperator, ObjectName, TableFactor,
+    TableWithJoins,
 };
 use std::collections::HashSet;
+use std::sync::Arc;
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
     pub(crate) fn plan_table_with_joins(
@@ -98,6 +105,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             JoinOperator::CrossJoin(JoinConstraint::None) => {
                 self.parse_cross_join(left, right)
             }
+            JoinOperator::AsOf {
+                match_condition,
+                constraint,
+            } => self.parse_asof_join(
+                left,
+                right,
+                match_condition,
+                constraint,
+                planner_context,
+            ),
             other => not_impl_err!("Unsupported JOIN operator {other:?}"),
         }
     }
@@ -108,6 +125,89 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         right: LogicalPlan,
     ) -> Result<LogicalPlan> {
         LogicalPlanBuilder::from(left).cross_join(right)?.build()
+    }
+
+    fn parse_asof_join(
+        &self,
+        left: LogicalPlan,
+        right: LogicalPlan,
+        match_condition: SqlExpr,
+        constraint: JoinConstraint,
+        planner_context: &mut PlannerContext,
+    ) -> Result<LogicalPlan> {
+        let join_schema = left.schema().join(right.schema())?;
+
+        // The MATCH_CONDITION must be a single inequality comparison. The
+        // physical planner auto-orients its operands, so we only validate here.
+        let match_condition =
+            self.sql_to_expr(match_condition, &join_schema, planner_context)?;
+        match &match_condition {
+            Expr::BinaryExpr(BinaryExpr { op, .. })
+                if matches!(
+                    op,
+                    Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
+                ) => {}
+            other => {
+                return plan_err!(
+                    "ASOF JOIN MATCH_CONDITION must be a single inequality \
+                     (<, <=, >, >=), got {other}"
+                );
+            }
+        }
+
+        // Build the equijoin key pairs from the ON clause, oriented so that
+        // `.0` references the left input and `.1` the right input.
+        let on = match constraint {
+            JoinConstraint::On(sql_expr) => {
+                let on_expr =
+                    self.sql_to_expr(sql_expr, &join_schema, planner_context)?;
+                let mut keys: Vec<(Expr, Expr)> = vec![];
+                for conjunct in split_conjunction(&on_expr) {
+                    let Expr::BinaryExpr(BinaryExpr {
+                        left: lhs,
+                        op: Operator::Eq,
+                        right: rhs,
+                    }) = conjunct
+                    else {
+                        return plan_err!(
+                            "ASOF JOIN ON clause must be equality conditions \
+                             between the two inputs"
+                        );
+                    };
+                    match find_valid_equijoin_key_pair(
+                        lhs,
+                        rhs,
+                        left.schema(),
+                        right.schema(),
+                    )? {
+                        Some(pair) => keys.push(pair),
+                        None => {
+                            return plan_err!(
+                                "ASOF JOIN ON clause must be equality conditions \
+                                 between the two inputs"
+                            );
+                        }
+                    }
+                }
+                keys
+            }
+            // ASOF with no partition keys is allowed.
+            JoinConstraint::None => vec![],
+            JoinConstraint::Using(_) | JoinConstraint::Natural => {
+                return not_impl_err!("USING/NATURAL not supported for ASOF JOIN");
+            }
+        };
+
+        // Snowflake ASOF keeps every left row, emitting NULLs when there is no
+        // matching right row, so default to a LEFT join.
+        Ok(LogicalPlan::AsOfJoin(AsOfJoin::try_new(
+            Arc::new(left),
+            Arc::new(right),
+            on,
+            match_condition,
+            JoinType::Left,
+            NullEquality::NullEqualsNothing,
+        )?))
     }
 
     fn parse_join(

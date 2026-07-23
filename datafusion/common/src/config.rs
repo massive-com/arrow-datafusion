@@ -1077,6 +1077,12 @@ config_namespace! {
         /// one range filter.
         pub enable_piecewise_merge_join: bool, default = false
 
+        /// When set to true, an as-of join (`ASOF JOIN`) requires its inputs to be sorted by
+        /// the equality keys and then the as-of key. The planner adds a sort only when an input
+        /// is not already so ordered, letting pre-sorted inputs skip sorting entirely. When
+        /// false, the operator instead collects and sorts each input in memory.
+        pub asof_join_use_sorted_input: bool, default = true
+
         /// The maximum estimated size in bytes for one input side of a HashJoin
         /// will be collected into a single partition
         pub hash_join_single_partition_threshold: usize, default = 1024 * 1024

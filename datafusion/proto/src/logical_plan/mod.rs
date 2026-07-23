@@ -58,10 +58,10 @@ use datafusion_expr::{
     DistinctOn, DropView, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, SortExpr,
     Statement, WindowUDF, dml,
     logical_plan::{
-        Aggregate, CreateCatalog, CreateCatalogSchema, CreateExternalTable, CreateView,
-        DdlStatement, Distinct, EmptyRelation, Extension, Join, JoinConstraint, Prepare,
-        Projection, Repartition, Sort, SubqueryAlias, TableScan, Values, Window,
-        builder::project,
+        Aggregate, AsOfJoin, CreateCatalog, CreateCatalogSchema, CreateExternalTable,
+        CreateView, DdlStatement, Distinct, EmptyRelation, Extension, Join,
+        JoinConstraint, Prepare, Projection, Repartition, Sort, SubqueryAlias, TableScan,
+        Values, Window, builder::project,
     },
 };
 
@@ -776,6 +776,44 @@ impl AsLogicalPlan for LogicalPlanNode {
 
                 builder.build()
             }
+            LogicalPlanType::AsOfJoin(join) => {
+                let left_keys: Vec<Expr> =
+                    from_proto::parse_exprs(&join.left_join_key, ctx, extension_codec)?;
+                let right_keys: Vec<Expr> =
+                    from_proto::parse_exprs(&join.right_join_key, ctx, extension_codec)?;
+                let join_type =
+                    protobuf::JoinType::try_from(join.join_type).map_err(|_| {
+                        proto_error(format!(
+                            "Received an AsOfJoinNode message with unknown JoinType {}",
+                            join.join_type
+                        ))
+                    })?;
+                let null_equality =
+                    protobuf::NullEquality::try_from(join.null_equality).map_err(|_| {
+                        proto_error(format!(
+                            "Received an AsOfJoinNode message with unknown NullEquality {}",
+                            join.null_equality
+                        ))
+                    })?;
+                let match_condition = from_proto::parse_expr(
+                    join.match_condition.as_ref().ok_or_else(|| {
+                        proto_error("AsOfJoinNode is missing its match_condition")
+                    })?,
+                    ctx,
+                    extension_codec,
+                )?;
+                let left = into_logical_plan!(join.left, ctx, extension_codec)?;
+                let right = into_logical_plan!(join.right, ctx, extension_codec)?;
+                let on = left_keys.into_iter().zip(right_keys).collect::<Vec<_>>();
+                Ok(LogicalPlan::AsOfJoin(AsOfJoin::try_new(
+                    Arc::new(left),
+                    Arc::new(right),
+                    on,
+                    match_condition,
+                    join_type.into(),
+                    null_equality.into(),
+                )?))
+            }
             LogicalPlanType::Union(union) => {
                 assert_or_internal_err!(
                     union.inputs.len() >= 2,
@@ -1362,6 +1400,52 @@ impl AsLogicalPlan for LogicalPlanNode {
                             right_join_key,
                             null_equality: null_equality.into(),
                             filter,
+                        },
+                    ))),
+                })
+            }
+            LogicalPlan::AsOfJoin(AsOfJoin {
+                left,
+                right,
+                on,
+                match_condition,
+                join_type,
+                null_equality,
+                ..
+            }) => {
+                let left: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    left.as_ref(),
+                    extension_codec,
+                )?;
+                let right: LogicalPlanNode = LogicalPlanNode::try_from_logical_plan(
+                    right.as_ref(),
+                    extension_codec,
+                )?;
+                let (left_join_key, right_join_key) = on
+                    .iter()
+                    .map(|(l, r)| {
+                        Ok((
+                            serialize_expr(l, extension_codec)?,
+                            serialize_expr(r, extension_codec)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, ToProtoError>>()?
+                    .into_iter()
+                    .unzip();
+                let join_type: protobuf::JoinType = join_type.to_owned().into();
+                let null_equality: protobuf::NullEquality =
+                    null_equality.to_owned().into();
+                let match_condition = serialize_expr(match_condition, extension_codec)?;
+                Ok(LogicalPlanNode {
+                    logical_plan_type: Some(LogicalPlanType::AsOfJoin(Box::new(
+                        protobuf::AsOfJoinNode {
+                            left: Some(Box::new(left)),
+                            right: Some(Box::new(right)),
+                            join_type: join_type.into(),
+                            left_join_key,
+                            right_join_key,
+                            null_equality: null_equality.into(),
+                            match_condition: Some(match_condition),
                         },
                     ))),
                 })
