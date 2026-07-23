@@ -51,7 +51,7 @@ use datafusion_datasource_parquet::source::ParquetSource;
 #[cfg(feature = "parquet")]
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{FunctionRegistry, TaskContext};
-use datafusion_expr::{AggregateUDF, ScalarUDF, WindowUDF};
+use datafusion_expr::{AggregateUDF, Operator, ScalarUDF, WindowUDF};
 use datafusion_functions_table::generate_series::{
     Empty, GenSeriesArgs, GenerateSeriesTable, GenericSeriesState, TimestampValue,
 };
@@ -76,8 +76,9 @@ use datafusion_physical_plan::expressions::PhysicalSortExpr;
 use datafusion_physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion_physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec,
-    StreamJoinPartitionMode, SymmetricHashJoinExec,
+    AsOfJoinCondition, AsOfJoinDirection, AsOfJoinExec, CrossJoinExec, HashJoinExec,
+    NestedLoopJoinExec, PartitionMode, SortMergeJoinExec, StreamJoinPartitionMode,
+    SymmetricHashJoinExec,
 };
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::memory::LazyMemoryExec;
@@ -313,6 +314,13 @@ impl protobuf::PhysicalPlanNode {
             PhysicalPlanType::SortMergeJoin(sort_join) => {
                 self.try_into_sort_join(sort_join, ctx, codec, proto_converter)
             }
+            PhysicalPlanType::AsOfJoin(asof_join) => self
+                .try_into_as_of_join_physical_plan(
+                    asof_join,
+                    ctx,
+                    codec,
+                    proto_converter,
+                ),
             PhysicalPlanType::AsyncFunc(async_func) => self
                 .try_into_async_func_physical_plan(
                     async_func,
@@ -399,6 +407,14 @@ impl protobuf::PhysicalPlanNode {
 
         if let Some(exec) = plan.downcast_ref::<SortMergeJoinExec>() {
             return protobuf::PhysicalPlanNode::try_from_sort_merge_join_exec(
+                exec,
+                codec,
+                proto_converter,
+            );
+        }
+
+        if let Some(exec) = plan.downcast_ref::<AsOfJoinExec>() {
+            return protobuf::PhysicalPlanNode::try_from_as_of_join_exec(
                 exec,
                 codec,
                 proto_converter,
@@ -1420,6 +1436,97 @@ impl protobuf::PhysicalPlanNode {
             null_equality.into(),
             hashjoin.null_aware,
         )?))
+    }
+
+    fn try_into_as_of_join_physical_plan(
+        &self,
+        asof_join: &protobuf::AsOfJoinExecNode,
+        ctx: &TaskContext,
+        codec: &dyn PhysicalExtensionCodec,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let left: Arc<dyn ExecutionPlan> =
+            into_physical_plan(&asof_join.left, ctx, codec, proto_converter)?;
+        let right: Arc<dyn ExecutionPlan> =
+            into_physical_plan(&asof_join.right, ctx, codec, proto_converter)?;
+        let left_schema = left.schema();
+        let right_schema = right.schema();
+        let on: Vec<(PhysicalExprRef, PhysicalExprRef)> = asof_join
+            .on
+            .iter()
+            .map(|col| {
+                let left = proto_converter.proto_to_physical_expr(
+                    &col.left.clone().unwrap(),
+                    ctx,
+                    left_schema.as_ref(),
+                    codec,
+                )?;
+                let right = proto_converter.proto_to_physical_expr(
+                    &col.right.clone().unwrap(),
+                    ctx,
+                    right_schema.as_ref(),
+                    codec,
+                )?;
+                Ok((left, right))
+            })
+            .collect::<Result<_>>()?;
+        let join_type =
+            protobuf::JoinType::try_from(asof_join.join_type).map_err(|_| {
+                proto_error(format!(
+                    "Received an AsOfJoinExecNode message with unknown JoinType {}",
+                    asof_join.join_type
+                ))
+            })?;
+        let null_equality = protobuf::NullEquality::try_from(asof_join.null_equality)
+            .map_err(|_| {
+                proto_error(format!(
+                    "Received an AsOfJoinExecNode message with unknown NullEquality {}",
+                    asof_join.null_equality
+                ))
+            })?;
+        let match_left = proto_converter.proto_to_physical_expr(
+            asof_join.match_condition_left.as_ref().ok_or_else(|| {
+                proto_error("AsOfJoinExecNode is missing match_condition_left")
+            })?,
+            ctx,
+            left_schema.as_ref(),
+            codec,
+        )?;
+        let match_right = proto_converter.proto_to_physical_expr(
+            asof_join.match_condition_right.as_ref().ok_or_else(|| {
+                proto_error("AsOfJoinExecNode is missing match_condition_right")
+            })?,
+            ctx,
+            right_schema.as_ref(),
+            codec,
+        )?;
+        let op = crate::logical_plan::from_proto::from_proto_binary_op(
+            &asof_join.match_condition_op,
+        )?;
+        let asof_condition = AsOfJoinCondition::try_new(match_left, op, match_right)?;
+        let projection = if !asof_join.projection.is_empty() {
+            Some(
+                asof_join
+                    .projection
+                    .iter()
+                    .map(|i| *i as usize)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        Ok(Arc::new(
+            AsOfJoinExec::try_new(
+                left,
+                right,
+                on,
+                asof_condition,
+                join_type.into(),
+                projection,
+                null_equality.into(),
+            )?
+            .with_required_input_ordering(asof_join.require_input_ordering),
+        ))
     }
 
     fn try_into_symmetric_hash_join_physical_plan(
@@ -2511,6 +2618,66 @@ impl protobuf::PhysicalPlanNode {
                         v.iter().map(|x| *x as u32).collect::<Vec<u32>>()
                     }),
                     null_aware: exec.null_aware,
+                },
+            ))),
+        })
+    }
+
+    fn try_from_as_of_join_exec(
+        exec: &AsOfJoinExec,
+        codec: &dyn PhysicalExtensionCodec,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<Self> {
+        let left = protobuf::PhysicalPlanNode::try_from_physical_plan_with_converter(
+            exec.left().to_owned(),
+            codec,
+            proto_converter,
+        )?;
+        let right = protobuf::PhysicalPlanNode::try_from_physical_plan_with_converter(
+            exec.right().to_owned(),
+            codec,
+            proto_converter,
+        )?;
+        let on: Vec<protobuf::JoinOn> = exec
+            .on()
+            .iter()
+            .map(|tuple| {
+                let l = proto_converter.physical_expr_to_proto(&tuple.0, codec)?;
+                let r = proto_converter.physical_expr_to_proto(&tuple.1, codec)?;
+                Ok::<_, DataFusionError>(protobuf::JoinOn {
+                    left: Some(l),
+                    right: Some(r),
+                })
+            })
+            .collect::<Result<_>>()?;
+        let join_type: protobuf::JoinType = exec.join_type().to_owned().into();
+        let null_equality: protobuf::NullEquality = exec.null_equality().into();
+        let condition = exec.asof_condition();
+        let match_condition_left =
+            proto_converter.physical_expr_to_proto(&condition.left, codec)?;
+        let match_condition_right =
+            proto_converter.physical_expr_to_proto(&condition.right, codec)?;
+        let op = match (condition.direction, condition.strict) {
+            (AsOfJoinDirection::Backward, true) => Operator::Gt,
+            (AsOfJoinDirection::Backward, false) => Operator::GtEq,
+            (AsOfJoinDirection::Forward, true) => Operator::Lt,
+            (AsOfJoinDirection::Forward, false) => Operator::LtEq,
+        };
+        Ok(protobuf::PhysicalPlanNode {
+            physical_plan_type: Some(PhysicalPlanType::AsOfJoin(Box::new(
+                protobuf::AsOfJoinExecNode {
+                    left: Some(Box::new(left)),
+                    right: Some(Box::new(right)),
+                    on,
+                    join_type: join_type.into(),
+                    null_equality: null_equality.into(),
+                    match_condition_left: Some(match_condition_left),
+                    match_condition_right: Some(match_condition_right),
+                    match_condition_op: format!("{op:?}"),
+                    projection: exec.projection.as_ref().map_or_else(Vec::new, |v| {
+                        v.iter().map(|x| *x as u32).collect::<Vec<u32>>()
+                    }),
+                    require_input_ordering: exec.require_input_ordering(),
                 },
             ))),
         })

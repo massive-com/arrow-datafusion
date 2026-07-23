@@ -62,6 +62,7 @@ message LogicalPlanNode {
     RecursiveQueryNode recursive_query = 31;
     CteWorkTableScanNode cte_work_table_scan = 32;
     DmlNode dml = 33;
+    AsOfJoinNode as_of_join = 34;
   }
 }
 
@@ -250,6 +251,16 @@ message JoinNode {
   repeated LogicalExprNode right_join_key = 6;
   datafusion_common.NullEquality null_equality = 7;
   LogicalExprNode filter = 8;
+}
+
+message AsOfJoinNode {
+  LogicalPlanNode left = 1;
+  LogicalPlanNode right = 2;
+  datafusion_common.JoinType join_type = 3;
+  repeated LogicalExprNode left_join_key = 4;
+  repeated LogicalExprNode right_join_key = 5;
+  datafusion_common.NullEquality null_equality = 6;
+  LogicalExprNode match_condition = 7;
 }
 
 message DistinctNode {
@@ -752,6 +763,7 @@ message PhysicalPlanNode {
     AsyncFuncExecNode async_func = 36;
     BufferExecNode buffer = 37;
     ArrowScanExecNode arrow_scan = 38;
+    AsOfJoinExecNode as_of_join = 39;
   }
 }
 
@@ -1165,6 +1177,19 @@ message HashJoinExecNode {
   JoinFilter filter = 8;
   repeated uint32 projection = 9;
   bool null_aware = 10;
+}
+
+message AsOfJoinExecNode {
+  PhysicalPlanNode left = 1;
+  PhysicalPlanNode right = 2;
+  repeated JoinOn on = 3;
+  datafusion_common.JoinType join_type = 4;
+  datafusion_common.NullEquality null_equality = 5;
+  PhysicalExprNode match_condition_left = 6;
+  PhysicalExprNode match_condition_right = 7;
+  string match_condition_op = 8;
+  repeated uint32 projection = 9;
+  bool require_input_ordering = 10;
 }
 
 enum StreamPartitionMode {

@@ -32,16 +32,16 @@ use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::{JoinType, NullEquality};
 use datafusion_execution::TaskContext;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::col;
+use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::joins::utils::JoinOn;
 use datafusion_physical_plan::joins::{AsOfJoinCondition, AsOfJoinExec};
 use datafusion_physical_plan::test::TestMemoryExec;
-use datafusion_physical_plan::ExecutionPlan;
 use tokio::runtime::Runtime;
 
 /// Build in-memory batches (split into ~8192-row chunks).

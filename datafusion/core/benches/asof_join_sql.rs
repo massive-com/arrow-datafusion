@@ -42,7 +42,7 @@ use std::sync::Arc;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::datasource::MemTable;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
@@ -124,8 +124,7 @@ fn report_plan(ctx: &SessionContext, rt: &Runtime, label: &str, sql: &str) {
             df.create_physical_plan().await
         })
         .unwrap();
-    let displayable =
-        datafusion::physical_plan::displayable(plan.as_ref()).indent(true);
+    let displayable = datafusion::physical_plan::displayable(plan.as_ref()).indent(true);
     eprintln!("\n===== physical plan [{label}] =====\n{displayable}");
 }
 
@@ -141,9 +140,7 @@ fn bench_asof_sql(c: &mut Criterion) {
     group.bench_function("inner_backward", |b| {
         b.iter(|| run_sql(&ctx, &rt, SQL_INNER))
     });
-    group.bench_function("left_backward", |b| {
-        b.iter(|| run_sql(&ctx, &rt, SQL_LEFT))
-    });
+    group.bench_function("left_backward", |b| b.iter(|| run_sql(&ctx, &rt, SQL_LEFT)));
 
     group.finish();
 }

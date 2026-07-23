@@ -2514,6 +2514,70 @@ fn join_with_using() {
 }
 
 #[test]
+fn asof_join_with_on() {
+    let sql = "SELECT j1_id, j2_id \
+            FROM j1 \
+            ASOF JOIN j2 \
+            MATCH_CONDITION (j1.j1_id >= j2.j2_id) \
+            ON j1.j1_string = j2.j2_string";
+    let plan = logical_plan(sql).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: j1.j1_id, j2.j2_id
+      Left AsOf Join: j1.j1_string = j2.j2_string Match: j1.j1_id >= j2.j2_id
+        TableScan: j1
+        TableScan: j2
+    "
+    );
+}
+
+#[test]
+fn asof_join_without_on() {
+    let sql = "SELECT j1_id, j2_id \
+            FROM j1 \
+            ASOF JOIN j2 \
+            MATCH_CONDITION (j1.j1_id >= j2.j2_id)";
+    let plan = logical_plan(sql).unwrap();
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: j1.j1_id, j2.j2_id
+      Left AsOf Join: Match: j1.j1_id >= j2.j2_id
+        TableScan: j1
+        TableScan: j2
+    "
+    );
+}
+
+#[test]
+fn asof_join_match_condition_not_inequality() {
+    let sql = "SELECT j1_id, j2_id \
+            FROM j1 \
+            ASOF JOIN j2 \
+            MATCH_CONDITION (j1.j1_id = j2.j2_id) \
+            ON j1.j1_string = j2.j2_string";
+    let err = logical_plan(sql).unwrap_err().strip_backtrace();
+    assert_contains!(
+        err,
+        "ASOF JOIN MATCH_CONDITION must be a single inequality (<, <=, >, >=)"
+    );
+}
+
+#[test]
+fn asof_join_match_condition_conjunction() {
+    let sql = "SELECT j1_id, j2_id \
+            FROM j1 \
+            ASOF JOIN j2 \
+            MATCH_CONDITION (j1.j1_id >= j2.j2_id AND j1.j1_id <= j2.j2_id)";
+    let err = logical_plan(sql).unwrap_err().strip_backtrace();
+    assert_contains!(
+        err,
+        "ASOF JOIN MATCH_CONDITION must be a single inequality (<, <=, >, >=)"
+    );
+}
+
+#[test]
 fn equijoin_explicit_syntax_3_tables() {
     let sql = "SELECT id, order_id, l_description \
             FROM person \

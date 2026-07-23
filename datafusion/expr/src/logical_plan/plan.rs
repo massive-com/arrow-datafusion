@@ -234,6 +234,10 @@ pub enum LogicalPlan {
     /// Join two logical plans on one or more join columns.
     /// This is used to implement SQL `JOIN`
     Join(Join),
+    /// AsOf join: match each left row to the single nearest right row per an
+    /// explicit `MATCH_CONDITION` inequality. Produced only by `ASOF JOIN`
+    /// syntax, never by an optimizer rewrite, so semantics are always opt-in.
+    AsOfJoin(AsOfJoin),
     /// Repartitions the input based on a partitioning scheme. This is
     /// used to add parallelism and is sometimes referred to as an
     /// "exchange" operator in other systems
@@ -334,6 +338,7 @@ impl LogicalPlan {
             LogicalPlan::Aggregate(Aggregate { schema, .. }) => schema,
             LogicalPlan::Sort(Sort { input, .. }) => input.schema(),
             LogicalPlan::Join(Join { schema, .. }) => schema,
+            LogicalPlan::AsOfJoin(AsOfJoin { schema, .. }) => schema,
             LogicalPlan::Repartition(Repartition { input, .. }) => input.schema(),
             LogicalPlan::Limit(Limit { input, .. }) => input.schema(),
             LogicalPlan::Statement(statement) => statement.schema(),
@@ -365,7 +370,8 @@ impl LogicalPlan {
             | LogicalPlan::Projection(_)
             | LogicalPlan::Aggregate(_)
             | LogicalPlan::Unnest(_)
-            | LogicalPlan::Join(_) => self
+            | LogicalPlan::Join(_)
+            | LogicalPlan::AsOfJoin(_) => self
                 .inputs()
                 .iter()
                 .map(|input| input.schema().as_ref())
@@ -455,6 +461,7 @@ impl LogicalPlan {
             LogicalPlan::Aggregate(Aggregate { input, .. }) => vec![input],
             LogicalPlan::Sort(Sort { input, .. }) => vec![input],
             LogicalPlan::Join(Join { left, right, .. }) => vec![left, right],
+            LogicalPlan::AsOfJoin(AsOfJoin { left, right, .. }) => vec![left, right],
             LogicalPlan::Limit(Limit { input, .. }) => vec![input],
             LogicalPlan::Subquery(Subquery { subquery, .. }) => vec![subquery],
             LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => vec![input],
@@ -563,6 +570,13 @@ impl LogicalPlan {
                     right.head_output_expr()
                 }
             },
+            LogicalPlan::AsOfJoin(AsOfJoin { left, right, .. }) => {
+                if left.schema().fields().is_empty() {
+                    right.head_output_expr()
+                } else {
+                    left.head_output_expr()
+                }
+            }
             LogicalPlan::RecursiveQuery(RecursiveQuery { static_term, .. }) => {
                 static_term.head_output_expr()
             }
@@ -684,6 +698,36 @@ impl LogicalPlan {
                     schema: DFSchemaRef::new(schema),
                     null_equality,
                     null_aware,
+                }))
+            }
+            LogicalPlan::AsOfJoin(AsOfJoin {
+                left,
+                right,
+                on,
+                match_condition,
+                join_type,
+                schema: _,
+                null_equality,
+            }) => {
+                let schema =
+                    build_join_schema(left.schema(), right.schema(), &join_type)?;
+
+                let new_on: Vec<_> = on
+                    .into_iter()
+                    .map(|equi_expr| {
+                        // SimplifyExpression rule may add alias to the equi_expr.
+                        (equi_expr.0.unalias(), equi_expr.1.unalias())
+                    })
+                    .collect();
+
+                Ok(LogicalPlan::AsOfJoin(AsOfJoin {
+                    left,
+                    right,
+                    on: new_on,
+                    match_condition,
+                    join_type,
+                    schema: DFSchemaRef::new(schema),
+                    null_equality,
                 }))
             }
             LogicalPlan::Subquery(_) => Ok(self),
@@ -946,6 +990,52 @@ impl LogicalPlan {
                     schema: DFSchemaRef::new(schema),
                     null_equality: *null_equality,
                     null_aware: *null_aware,
+                }))
+            }
+            LogicalPlan::AsOfJoin(AsOfJoin {
+                join_type,
+                on,
+                null_equality,
+                ..
+            }) => {
+                let (left, right) = self.only_two_inputs(inputs)?;
+                let schema = build_join_schema(left.schema(), right.schema(), join_type)?;
+
+                let equi_expr_count = on.len() * 2;
+                // The equijoin expressions are followed by the single required
+                // match_condition expression.
+                assert_eq!(expr.len(), equi_expr_count + 1);
+
+                let Some(match_condition) = expr.pop() else {
+                    internal_err!(
+                        "Expected a match_condition expression to construct the AsOf join"
+                    )?
+                };
+
+                // The first part of expr is equi-exprs,
+                // and the struct of each equi-expr is like `left-expr = right-expr`.
+                assert_eq!(expr.len(), equi_expr_count);
+                let mut new_on = Vec::with_capacity(on.len());
+                let mut iter = expr.into_iter();
+                while let Some(left) = iter.next() {
+                    let Some(right) = iter.next() else {
+                        internal_err!(
+                            "Expected a pair of expressions to construct the join on expression"
+                        )?
+                    };
+
+                    // SimplifyExpression rule may add alias to the equi_expr.
+                    new_on.push((left.unalias(), right.unalias()));
+                }
+
+                Ok(LogicalPlan::AsOfJoin(AsOfJoin {
+                    left: Arc::new(left),
+                    right: Arc::new(right),
+                    on: new_on,
+                    match_condition,
+                    join_type: *join_type,
+                    schema: DFSchemaRef::new(schema),
+                    null_equality: *null_equality,
                 }))
             }
             LogicalPlan::Subquery(Subquery {
@@ -1360,6 +1450,11 @@ impl LogicalPlan {
                     right.max_rows()
                 }
             },
+            LogicalPlan::AsOfJoin(AsOfJoin { left, .. }) => {
+                // AsOf joins (Inner/Left) emit at most one right match per
+                // left row, so the output is bounded by the left input.
+                left.max_rows()
+            }
             LogicalPlan::Repartition(Repartition { input, .. }) => input.max_rows(),
             LogicalPlan::Union(Union { inputs, .. }) => {
                 inputs.iter().try_fold(0usize, |mut acc, plan| {
@@ -1410,6 +1505,7 @@ impl LogicalPlan {
             LogicalPlan::Window(_) => Ok(None),
             LogicalPlan::Aggregate(_) => Ok(None),
             LogicalPlan::Join(_) => Ok(None),
+            LogicalPlan::AsOfJoin(_) => Ok(None),
             LogicalPlan::Repartition(_) => Ok(None),
             LogicalPlan::Union(_) => Ok(None),
             LogicalPlan::EmptyRelation(_) => Ok(None),
@@ -1448,6 +1544,7 @@ impl LogicalPlan {
             LogicalPlan::Window(_) => Ok(None),
             LogicalPlan::Aggregate(_) => Ok(None),
             LogicalPlan::Join(_) => Ok(None),
+            LogicalPlan::AsOfJoin(_) => Ok(None),
             LogicalPlan::Repartition(_) => Ok(None),
             LogicalPlan::Union(_) => Ok(None),
             LogicalPlan::EmptyRelation(_) => Ok(None),
@@ -2070,6 +2167,20 @@ impl LogicalPlan {
                                 )
                             }
                         }
+                    }
+                    LogicalPlan::AsOfJoin(AsOfJoin {
+                        on: keys,
+                        match_condition,
+                        join_type,
+                        ..
+                    }) => {
+                        let join_expr: Vec<String> =
+                            keys.iter().map(|(l, r)| format!("{l} = {r}")).collect();
+                        write!(f, "{join_type} AsOf Join:")?;
+                        if !join_expr.is_empty() {
+                            write!(f, " {}", join_expr.join(", "))?;
+                        }
+                        write!(f, " Match: {match_condition}")
                     }
                     LogicalPlan::Repartition(Repartition {
                         partitioning_scheme,
@@ -3843,6 +3954,89 @@ pub struct Sort {
     pub input: Arc<LogicalPlan>,
     /// Optional fetch limit
     pub fetch: Option<usize>,
+}
+
+/// AsOf join: for each left row, emit the single nearest right row that
+/// satisfies the `match_condition` inequality, within groups defined by the
+/// `on` equijoin keys.
+///
+/// Unlike a regular [`Join`] with an inequality filter (which returns *all*
+/// matching right rows), an AsOf join returns only the closest match. It is
+/// produced only by explicit `ASOF JOIN ... MATCH_CONDITION (...)` syntax,
+/// never by an optimizer rewrite, so query semantics are always opt-in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AsOfJoin {
+    /// Left input
+    pub left: Arc<LogicalPlan>,
+    /// Right input
+    pub right: Arc<LogicalPlan>,
+    /// Equijoin keys from the `ON` clause, as (left, right) expression pairs.
+    pub on: Vec<(Expr, Expr)>,
+    /// The single `MATCH_CONDITION` inequality: a binary comparison
+    /// (`<`, `<=`, `>`, `>=`) oriented as `left_expr op right_expr`.
+    pub match_condition: Expr,
+    /// Join type. Only `Inner` and `Left` are supported.
+    pub join_type: JoinType,
+    /// The output schema: left fields followed by right fields.
+    pub schema: DFSchemaRef,
+    /// Null equality for the equijoin keys.
+    pub null_equality: NullEquality,
+}
+
+impl AsOfJoin {
+    /// Creates a new AsOf join, computing the output schema from the inputs.
+    pub fn try_new(
+        left: Arc<LogicalPlan>,
+        right: Arc<LogicalPlan>,
+        on: Vec<(Expr, Expr)>,
+        match_condition: Expr,
+        join_type: JoinType,
+        null_equality: NullEquality,
+    ) -> Result<Self> {
+        let join_schema = build_join_schema(left.schema(), right.schema(), &join_type)?;
+        Ok(AsOfJoin {
+            left,
+            right,
+            on,
+            match_condition,
+            join_type,
+            schema: Arc::new(join_schema),
+            null_equality,
+        })
+    }
+}
+
+impl PartialOrd for AsOfJoin {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        #[derive(PartialEq, PartialOrd)]
+        struct ComparableAsOfJoin<'a> {
+            pub left: &'a Arc<LogicalPlan>,
+            pub right: &'a Arc<LogicalPlan>,
+            pub on: &'a Vec<(Expr, Expr)>,
+            pub match_condition: &'a Expr,
+            pub join_type: &'a JoinType,
+            pub null_equality: &'a NullEquality,
+        }
+        let comparable_self = ComparableAsOfJoin {
+            left: &self.left,
+            right: &self.right,
+            on: &self.on,
+            match_condition: &self.match_condition,
+            join_type: &self.join_type,
+            null_equality: &self.null_equality,
+        };
+        let comparable_other = ComparableAsOfJoin {
+            left: &other.left,
+            right: &other.right,
+            on: &other.on,
+            match_condition: &other.match_condition,
+            join_type: &other.join_type,
+            null_equality: &other.null_equality,
+        };
+        comparable_self
+            .partial_cmp(&comparable_other)
+            .filter(|cmp| *cmp != Ordering::Equal || self == other)
+    }
 }
 
 /// Join two logical plans on one or more join columns

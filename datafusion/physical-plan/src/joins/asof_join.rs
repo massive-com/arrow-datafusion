@@ -24,43 +24,43 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use super::utils::{
-    build_batch_from_indices, build_join_schema, check_join_is_valid,
-    estimate_join_statistics, ColumnIndex,
-};
 use super::JoinOn;
+use super::utils::{
+    ColumnIndex, build_batch_from_indices, build_join_schema, check_join_is_valid,
+    estimate_join_statistics, symmetric_join_output_partitioning,
+};
 use crate::common::can_project;
-use crate::execution_plan::{boundedness_from_children, EmissionType};
+use crate::execution_plan::{EmissionType, boundedness_from_children};
 use crate::joins::JoinOnRef;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use crate::projection::{EmbeddedProjection, ProjectionExec};
 use crate::sorts::sort::sort_batch;
 use crate::{
-    common, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
-    ExecutionPlanProperties, PhysicalSortExpr, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
+    PhysicalSortExpr, PlanProperties, RecordBatchStream, SendableRecordBatchStream,
+    Statistics, common,
 };
 
 use arrow::array::{ArrayRef, UInt32Builder, UInt64Builder};
-use arrow::compute::{concat_batches, SortOptions};
+use arrow::compute::{SortOptions, concat_batches};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::row::{RowConverter, Rows, SortField};
 use datafusion_common::{
-    exec_err, internal_err, plan_err, project_schema, JoinSide, JoinType, NullEquality,
-    Result,
+    JoinSide, JoinType, NullEquality, Result, exec_err, internal_err, plan_err,
+    project_schema,
 };
 use datafusion_execution::TaskContext;
 use datafusion_expr::{ColumnarValue, Operator};
-use datafusion_physical_expr::equivalence::{
-    join_equivalence_properties, ProjectionMapping,
-};
 use datafusion_physical_expr::PhysicalExprRef;
+use datafusion_physical_expr::equivalence::{
+    ProjectionMapping, join_equivalence_properties,
+};
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
-use datafusion_physical_expr_common::sort_expr::LexOrdering;
+use datafusion_physical_expr_common::sort_expr::{LexOrdering, OrderingRequirements};
 
 use futures::future::{BoxFuture, FutureExt};
-use futures::{ready, Stream};
+use futures::{Stream, ready};
 
 /// whether an as-of join searches backward or forward from each left row
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +102,7 @@ impl AsOfJoinCondition {
             _ => {
                 return plan_err!(
                     "AsOfJoinCondition requires an inequality operator, got {op}"
-                )
+                );
             }
         };
 
@@ -127,9 +127,11 @@ impl AsOfJoinCondition {
 /// one nearest right-side row for each left-side row that satisfies the as-of
 /// inequality
 ///
-/// this initial implementation is a bounded, in-memory operator and it requests
-/// single-partition inputs, collects both sides, sorts them by equality keys and
-/// the as-of key, then does a linear merge inside each equality partition
+/// this implementation hash-partitions both inputs by the equality keys so
+/// partitions can be joined independently in parallel; within each partition it
+/// is a bounded, in-memory operator that collects both sides, sorts them by the
+/// equality keys and the as-of key, then does a linear merge inside each
+/// equality group. with no equality keys it falls back to a single partition
 #[derive(Debug, Clone)]
 pub struct AsOfJoinExec {
     /// left input
@@ -150,6 +152,11 @@ pub struct AsOfJoinExec {
     pub projection: Option<Vec<usize>>,
     /// defines null equality for the equality partition keys
     pub(crate) null_equality: NullEquality,
+    /// when true the operator requires its inputs to already be sorted by the
+    /// equality keys and then the as-of key; `required_input_ordering`
+    /// advertises that order (so pre-sorted inputs skip sorting) and the kernel
+    /// does not sort internally. when false it collects and sorts internally.
+    pub(crate) require_input_ordering: bool,
     /// execution metrics
     metrics: ExecutionPlanMetricsSet,
     /// cache holding plan properties
@@ -202,9 +209,19 @@ impl AsOfJoinExec {
             column_indices,
             projection,
             null_equality,
+            require_input_ordering: false,
             metrics: ExecutionPlanMetricsSet::new(),
             cache,
         })
+    }
+
+    /// Returns a copy that requires its inputs to already be ordered by the
+    /// equality keys and then the as-of key. When set, [`Self::required_input_ordering`]
+    /// advertises that order — so a pre-sorted input avoids a sort entirely and
+    /// otherwise the planner inserts one — and the kernel skips its own sort.
+    pub fn with_required_input_ordering(mut self, require: bool) -> Self {
+        self.require_input_ordering = require;
+        self
     }
 
     /// left input
@@ -237,6 +254,12 @@ impl AsOfJoinExec {
         self.null_equality
     }
 
+    /// whether the operator requires pre-sorted inputs and skips its internal
+    /// sort (see [`Self::with_required_input_ordering`])
+    pub fn require_input_ordering(&self) -> bool {
+        self.require_input_ordering
+    }
+
     /// returns whether the join contains a projection
     pub fn contains_projection(&self) -> bool {
         self.projection.is_some()
@@ -261,6 +284,7 @@ impl AsOfJoinExec {
             projection,
             self.null_equality,
         )
+        .map(|exec| exec.with_required_input_ordering(self.require_input_ordering))
     }
 
     fn maintains_input_order(_join_type: JoinType) -> Vec<bool> {
@@ -285,8 +309,14 @@ impl AsOfJoinExec {
             on,
         )?;
 
-        let mut output_partitioning =
-            datafusion_physical_expr::Partitioning::UnknownPartitioning(1);
+        // With equality keys, both inputs are hash-partitioned on those keys
+        // (see `required_input_distribution`), so the output carries the same
+        // partitioning. Without keys we fall back to a single partition.
+        let mut output_partitioning = if on.is_empty() {
+            datafusion_physical_expr::Partitioning::UnknownPartitioning(1)
+        } else {
+            symmetric_join_output_partitioning(left, right, &join_type)?
+        };
 
         if let Some(projection) = projection {
             let projection_mapping =
@@ -383,7 +413,38 @@ impl ExecutionPlan for AsOfJoinExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition, Distribution::SinglePartition]
+        if self.on.is_empty() {
+            // Without equality keys there is nothing to hash-partition on, so
+            // the nearest match must be computed over a single partition.
+            vec![Distribution::SinglePartition, Distribution::SinglePartition]
+        } else {
+            // Hash-partition both sides on the equality keys so rows sharing a
+            // key co-locate in the same partition on both sides; each partition
+            // can then be joined independently in parallel.
+            let (left_keys, right_keys): (Vec<_>, Vec<_>) = self
+                .on
+                .iter()
+                .map(|(l, r)| (Arc::clone(l) as _, Arc::clone(r) as _))
+                .unzip();
+            vec![
+                Distribution::HashPartitioned(left_keys),
+                Distribution::HashPartitioned(right_keys),
+            ]
+        }
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
+        if !self.require_input_ordering {
+            return vec![None, None];
+        }
+        // This order must match `sort_join_input` exactly so the kernel can
+        // safely skip its internal sort; when the input already provides it the
+        // planner inserts no sort.
+        let left = input_sort_ordering(&self.on, &self.asof_condition, JoinSide::Left)
+            .map(OrderingRequirements::from);
+        let right = input_sort_ordering(&self.on, &self.asof_condition, JoinSide::Right)
+            .map(OrderingRequirements::from);
+        vec![left, right]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -398,15 +459,18 @@ impl ExecutionPlan for AsOfJoinExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::try_new(
-            Arc::clone(&children[0]),
-            Arc::clone(&children[1]),
-            self.on.clone(),
-            self.asof_condition.clone(),
-            self.join_type,
-            self.projection.clone(),
-            self.null_equality,
-        )?))
+        Ok(Arc::new(
+            Self::try_new(
+                Arc::clone(&children[0]),
+                Arc::clone(&children[1]),
+                self.on.clone(),
+                self.asof_condition.clone(),
+                self.join_type,
+                self.projection.clone(),
+                self.null_equality,
+            )?
+            .with_required_input_ordering(self.require_input_ordering),
+        ))
     }
 
     fn execute(
@@ -414,14 +478,22 @@ impl ExecutionPlan for AsOfJoinExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
+        let left_partitions = self.left.output_partitioning().partition_count();
+        let right_partitions = self.right.output_partitioning().partition_count();
+        if left_partitions != right_partitions {
             return internal_err!(
-                "Invalid AsOfJoinExec partition {partition}; this operator produces one partition"
+                "Invalid AsOfJoinExec: partition count mismatch \
+                 {left_partitions}!={right_partitions}, consider using RepartitionExec"
             );
         }
 
-        let left = self.left.execute(0, Arc::clone(&context))?;
-        let right = self.right.execute(0, Arc::clone(&context))?;
+        // Each output partition joins the matching input partition from both
+        // sides. Because the inputs are hash-partitioned on the equality keys
+        // (see `required_input_distribution`), all rows sharing a key land in
+        // the same partition on both sides, so joining per-partition is
+        // complete and correct.
+        let left = self.left.execute(partition, Arc::clone(&context))?;
+        let right = self.right.execute(partition, Arc::clone(&context))?;
 
         let column_indices_after_projection = match &self.projection {
             Some(projection) => projection
@@ -435,12 +507,16 @@ impl ExecutionPlan for AsOfJoinExec {
             self.schema(),
             left,
             right,
-            Arc::clone(&self.join_schema),
+            // The output batch is assembled directly from the (possibly
+            // projected) `column_indices`, so its schema must match the
+            // projected output schema rather than the full join schema.
+            self.schema(),
             column_indices_after_projection,
             self.on.clone(),
             self.asof_condition.clone(),
             self.join_type,
             self.null_equality,
+            self.require_input_ordering,
             context.session_config().batch_size(),
             BaselineMetrics::new(&self.metrics, partition),
         )))
@@ -507,6 +583,7 @@ impl AsOfJoinStream {
         asof_condition: AsOfJoinCondition,
         join_type: JoinType,
         null_equality: NullEquality,
+        sorted_input: bool,
         batch_size: usize,
         baseline_metrics: BaselineMetrics,
     ) -> Self {
@@ -526,6 +603,7 @@ impl AsOfJoinStream {
                     asof_condition,
                     join_type,
                     null_equality,
+                    sorted_input,
                 )
             }
             .boxed(),
@@ -605,6 +683,7 @@ fn join_asof(
     asof_condition: AsOfJoinCondition,
     join_type: JoinType,
     null_equality: NullEquality,
+    sorted_input: bool,
 ) -> Result<RecordBatch> {
     if right.num_rows() > u32::MAX as usize {
         return exec_err!(
@@ -613,8 +692,16 @@ fn join_asof(
         );
     }
 
-    let left = sort_join_input(&left, &on, &asof_condition, JoinSide::Left)?;
-    let right = sort_join_input(&right, &on, &asof_condition, JoinSide::Right)?;
+    let (left, right) = if sorted_input {
+        // Inputs are already ordered by the equality keys then the as-of key
+        // (guaranteed by `required_input_ordering`), so skip the internal sort.
+        (left, right)
+    } else {
+        (
+            sort_join_input(&left, &on, &asof_condition, JoinSide::Left)?,
+            sort_join_input(&right, &on, &asof_condition, JoinSide::Right)?,
+        )
+    };
 
     let left_keys = SortedKeyValues::try_new(
         &left,
@@ -778,12 +865,15 @@ fn append_unmatched_left(
     }
 }
 
-fn sort_join_input(
-    batch: &RecordBatch,
+/// The ordering a join input must have for the merge: the equality keys
+/// ascending (nulls last), then the as-of key in the direction the merge
+/// expects. Single source of truth shared by the internal sort and
+/// [`AsOfJoinExec::required_input_ordering`], so the two can never diverge.
+fn input_sort_ordering(
     on: JoinOnRef<'_>,
     asof_condition: &AsOfJoinCondition,
     side: JoinSide,
-) -> Result<RecordBatch> {
+) -> Option<LexOrdering> {
     let mut sort_exprs = on
         .iter()
         .map(|(left, right)| PhysicalSortExpr {
@@ -801,7 +891,16 @@ fn sort_join_input(
         options: asof_condition.sort_options(),
     });
 
-    let Some(sort_exprs) = LexOrdering::new(sort_exprs) else {
+    LexOrdering::new(sort_exprs)
+}
+
+fn sort_join_input(
+    batch: &RecordBatch,
+    on: JoinOnRef<'_>,
+    asof_condition: &AsOfJoinCondition,
+    side: JoinSide,
+) -> Result<RecordBatch> {
+    let Some(sort_exprs) = input_sort_ordering(on, asof_condition, side) else {
         return plan_err!("AsOfJoinExec requires at least one as-of sort expression");
     };
 

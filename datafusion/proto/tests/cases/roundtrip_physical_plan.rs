@@ -67,8 +67,8 @@ use datafusion::physical_plan::expressions::{
 };
 use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion::physical_plan::joins::{
-    HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec,
-    StreamJoinPartitionMode, SymmetricHashJoinExec,
+    AsOfJoinCondition, AsOfJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
+    SortMergeJoinExec, StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion::physical_plan::metrics::MetricType;
@@ -304,6 +304,41 @@ fn roundtrip_hash_join() -> Result<()> {
                 NullEquality::NullEqualsNothing,
                 false,
             )?))?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn roundtrip_as_of_join() -> Result<()> {
+    let field_sym = Field::new("sym", DataType::Int64, false);
+    let field_t = Field::new("t", DataType::Int64, false);
+    let schema_left = Arc::new(Schema::new(vec![field_sym.clone(), field_t.clone()]));
+    let schema_right = Arc::new(Schema::new(vec![field_sym, field_t]));
+
+    let on = vec![(
+        Arc::new(Column::new("sym", 0)) as _,
+        Arc::new(Column::new("sym", 0)) as _,
+    )];
+
+    for join_type in &[JoinType::Inner, JoinType::Left] {
+        for op in &[Operator::Gt, Operator::GtEq, Operator::Lt, Operator::LtEq] {
+            for projection in [None, Some(vec![0usize, 2, 3])] {
+                let condition = AsOfJoinCondition::try_new(
+                    Arc::new(Column::new("t", 1)),
+                    *op,
+                    Arc::new(Column::new("t", 1)),
+                )?;
+                roundtrip_test(Arc::new(AsOfJoinExec::try_new(
+                    Arc::new(EmptyExec::new(schema_left.clone())),
+                    Arc::new(EmptyExec::new(schema_right.clone())),
+                    on.clone(),
+                    condition,
+                    *join_type,
+                    projection,
+                    NullEquality::NullEqualsNothing,
+                )?))?;
+            }
         }
     }
     Ok(())

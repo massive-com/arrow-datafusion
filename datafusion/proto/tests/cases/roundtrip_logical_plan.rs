@@ -78,7 +78,7 @@ use datafusion_expr::expr::{
     self, Between, BinaryExpr, Case, Cast, GroupingSet, InList, Like, NullTreatment,
     ScalarFunction, Unnest, WildcardOptions,
 };
-use datafusion_expr::logical_plan::{Extension, UserDefinedLogicalNodeCore};
+use datafusion_expr::logical_plan::{AsOfJoin, Extension, UserDefinedLogicalNodeCore};
 use datafusion_expr::{
     Accumulator, AggregateUDF, ColumnarValue, ExprFunctionExt, ExprSchemable,
     LimitEffect, Literal, LogicalPlan, LogicalPlanBuilder, Operator, PartitionEvaluator,
@@ -775,6 +775,48 @@ async fn create_parquet_scan(
 
     let input = ctx.table("t1").await?.into_optimized_plan()?;
     Ok(input)
+}
+
+#[tokio::test]
+async fn roundtrip_logical_plan_as_of_join() -> Result<()> {
+    use datafusion_common::{JoinType, NullEquality};
+
+    let ctx = SessionContext::new();
+    ctx.register_csv("t1", "tests/testdata/test.csv", CsvReadOptions::default())
+        .await?;
+    ctx.register_csv("t2", "tests/testdata/test.csv", CsvReadOptions::default())
+        .await?;
+
+    let left = ctx.table("t1").await?.into_optimized_plan()?;
+    let right = ctx.table("t2").await?.into_optimized_plan()?;
+
+    for (join_type, op) in [
+        (JoinType::Inner, Operator::GtEq),
+        (JoinType::Left, Operator::Gt),
+        (JoinType::Left, Operator::Lt),
+        (JoinType::Inner, Operator::LtEq),
+    ] {
+        let match_condition = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(col("t1.b")),
+            op,
+            Box::new(col("t2.b")),
+        ));
+
+        let plan = LogicalPlan::AsOfJoin(AsOfJoin::try_new(
+            Arc::new(left.clone()),
+            Arc::new(right.clone()),
+            vec![(col("t1.a"), col("t2.a"))],
+            match_condition,
+            join_type,
+            NullEquality::NullEqualsNothing,
+        )?);
+
+        let bytes = logical_plan_to_bytes(&plan)?;
+        let logical_round_trip = logical_plan_from_bytes(&bytes, &ctx.task_ctx())?;
+        assert_eq!(format!("{plan}"), format!("{logical_round_trip}"));
+    }
+
+    Ok(())
 }
 
 #[tokio::test]

@@ -324,6 +324,7 @@ impl NamePreserver {
                 plan,
                 LogicalPlan::Filter(_)
                     | LogicalPlan::Join(_)
+                    | LogicalPlan::AsOfJoin(_)
                     | LogicalPlan::TableScan(_)
                     | LogicalPlan::Limit(_)
                     | LogicalPlan::Statement(_)
