@@ -1130,6 +1130,15 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
             max_predicate_cache_size: value.max_predicate_cache_size_opt.map(|opt| match opt {
                 protobuf::parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(v) => Some(v as usize),
             }).unwrap_or(None),
+            // Older plans that predate this field arrive with
+            // `max_in_list_size_opt = None` and must fall back to the
+            // documented default (not the primitive zero, which would
+            // silently disable IN-list pruning). Keep in sync with the
+            // `default = 20` on `ParquetOptions::max_in_list_size` in
+            // `datafusion-common/src/config.rs`.
+            max_in_list_size: value.max_in_list_size_opt.map(|opt| match opt {
+                protobuf::parquet_options::MaxInListSizeOpt::MaxInListSize(v) => v as usize,
+            }).unwrap_or(20),
             content_defined_chunking: value.content_defined_chunking.map(ParquetCdcOptions::from).unwrap_or_default(),
         })
     }

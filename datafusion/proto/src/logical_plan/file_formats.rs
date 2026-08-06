@@ -454,6 +454,9 @@ mod parquet {
                 max_predicate_cache_size_opt: global_options.global.max_predicate_cache_size.map(|size| {
                     parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(size as u64)
                 }),
+                max_in_list_size_opt: Some(parquet_options::MaxInListSizeOpt::MaxInListSize(
+                    global_options.global.max_in_list_size as u64,
+                )),
                 content_defined_chunking: Some(ParquetCdcOptionsProto {
                     enabled: global_options.global.content_defined_chunking.enabled,
                     min_chunk_size: global_options.global.content_defined_chunking.min_chunk_size as u64,
@@ -562,6 +565,12 @@ mod parquet {
             max_predicate_cache_size: proto.max_predicate_cache_size_opt.as_ref().map(|opt| match opt {
                 parquet_options::MaxPredicateCacheSizeOpt::MaxPredicateCacheSize(size) => *size as usize,
             }),
+            // Backward compatibility: proto messages that predate this
+            // field default to the documented `20`, not the primitive zero
+            // (which would silently disable IN-list pruning).
+            max_in_list_size: proto.max_in_list_size_opt.as_ref().map(|opt| match opt {
+                parquet_options::MaxInListSizeOpt::MaxInListSize(size) => *size as usize,
+            }).unwrap_or(20),
             content_defined_chunking: proto.content_defined_chunking.map(|cdc| ParquetCdcOptions {
                 enabled: cdc.enabled,
                 min_chunk_size: cdc.min_chunk_size as usize,
