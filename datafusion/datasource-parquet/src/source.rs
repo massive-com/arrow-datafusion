@@ -465,6 +465,13 @@ impl ParquetSource {
         self.table_parquet_options.global.max_predicate_cache_size
     }
 
+    /// Return the maximum size of an `IN (...)` list that the pruning
+    /// predicate will rewrite into per-value statistics checks. Reads from
+    /// `datafusion.execution.parquet.max_in_list_size`.
+    pub fn max_in_list_size(&self) -> usize {
+        self.table_parquet_options.global.max_in_list_size
+    }
+
     #[cfg(feature = "parquet_encryption")]
     fn get_encryption_factory_with_config(
         &self,
@@ -610,6 +617,7 @@ impl FileSource for ParquetSource {
             #[cfg(feature = "parquet_encryption")]
             encryption_factory: self.get_encryption_factory_with_config(),
             max_predicate_cache_size: self.max_predicate_cache_size(),
+            max_in_list_size: self.max_in_list_size(),
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
         }))
@@ -695,6 +703,7 @@ impl FileSource for ParquetSource {
                         Some(predicate),
                         self.table_schema.table_schema(),
                         &predicate_creation_errors,
+                        self.max_in_list_size(),
                     ) {
                         let mut guarantees = pruning_predicate
                             .literal_guarantees()
