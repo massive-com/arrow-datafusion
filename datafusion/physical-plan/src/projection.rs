@@ -2043,6 +2043,9 @@ mod tests {
         // and indices alone, so a child differing only in nullability keeps the
         // same mapping and must still take the fast path.
         //
+        // The swap tightens nullability rather than loosening it, matching what
+        // `is_allowed_field_change` permits of a physical optimizer rule.
+        //
         // The comparison is against `try_from_projector`, the path this one
         // replaces, rather than a freshly built projection: `with_new_children`
         // carries the existing `Projector` over, so the output schema stays as
@@ -2050,19 +2053,19 @@ mod tests {
         // That difference is inherent to `with_new_children` and not something
         // this fast path introduces, so the meaningful contract is that its two
         // paths agree.
-        let child = filtered_source("a", "b")?;
+        let child = filtered_source_with_nullability("a", "b", true)?;
         let exprs = renaming_exprs(&child.schema())?;
         let projection = Arc::new(ProjectionExec::try_new(exprs, Arc::clone(&child))?);
 
-        let nullable_child = filtered_source_with_nullability("a", "b", true)?;
+        let tightened_child = filtered_source_with_nullability("a", "b", false)?;
         assert_ne!(
             child.schema(),
-            nullable_child.schema(),
+            tightened_child.schema(),
             "the two children were meant to differ in nullability"
         );
         assert_eq!(
             child.properties().equivalence_properties().eq_group(),
-            nullable_child
+            tightened_child
                 .properties()
                 .equivalence_properties()
                 .eq_group(),
@@ -2070,10 +2073,10 @@ mod tests {
         );
 
         let replaced = Arc::clone(&projection)
-            .with_new_children(vec![Arc::clone(&nullable_child)])?;
+            .with_new_children(vec![Arc::clone(&tightened_child)])?;
         let recomputed = ProjectionExec::try_from_projector(
             projection.projector.clone(),
-            nullable_child,
+            tightened_child,
         )?;
 
         assert_same_properties(replaced.as_ref(), &recomputed);
