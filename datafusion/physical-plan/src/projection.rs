@@ -372,8 +372,11 @@ impl ExecutionPlan for ProjectionExec {
         // sorting changes which orderings hold, not which expressions are equal
         // to one another. Projecting that group again would reproduce the group
         // already cached here, so reuse it and derive only the orderings.
-        if self.input.equivalence_properties().eq_group()
-            == children[0].equivalence_properties().eq_group()
+        if self
+            .input
+            .equivalence_properties()
+            .eq_group()
+            .has_same_classes(children[0].equivalence_properties().eq_group())
         {
             let eq_group = self.cache.equivalence_properties().eq_group().clone();
             return ProjectionExec::try_from_projector_reusing_eq_group(
@@ -1914,10 +1917,13 @@ mod tests {
     fn assert_same_properties(actual: &dyn ExecutionPlan, expected: &ProjectionExec) {
         let actual_props = actual.properties().equivalence_properties();
         let expected_props = expected.properties().equivalence_properties();
-        assert_eq!(
+        assert!(
+            actual_props
+                .eq_group()
+                .has_same_classes(expected_props.eq_group()),
+            "equivalence group: {:?} vs {:?}",
             actual_props.eq_group(),
-            expected_props.eq_group(),
-            "equivalence group"
+            expected_props.eq_group()
         );
         assert_eq!(
             actual_props.oeq_class(),
@@ -1967,9 +1973,10 @@ mod tests {
             !child_props.eq_group().is_empty(),
             "the filter did not produce an equivalence class"
         );
-        assert_eq!(
-            child_props.eq_group(),
-            sorted_props.eq_group(),
+        assert!(
+            child_props
+                .eq_group()
+                .has_same_classes(sorted_props.eq_group()),
             "sorting altered the equivalence group"
         );
         assert_ne!(
@@ -2063,12 +2070,17 @@ mod tests {
             tightened_child.schema(),
             "the two children were meant to differ in nullability"
         );
-        assert_eq!(
-            child.properties().equivalence_properties().eq_group(),
-            tightened_child
+        assert!(
+            child
                 .properties()
                 .equivalence_properties()
-                .eq_group(),
+                .eq_group()
+                .has_same_classes(
+                    tightened_child
+                        .properties()
+                        .equivalence_properties()
+                        .eq_group()
+                ),
             "nullability moved the equivalence group, so the fast path is no longer under test"
         );
 
@@ -2097,9 +2109,14 @@ mod tests {
         let replaced =
             Arc::clone(&projection).with_new_children(vec![Arc::clone(&other)])?;
 
-        assert_ne!(
-            replaced.properties().equivalence_properties().eq_group(),
-            projection.properties().equivalence_properties().eq_group(),
+        assert!(
+            !replaced
+                .properties()
+                .equivalence_properties()
+                .eq_group()
+                .has_same_classes(
+                    projection.properties().equivalence_properties().eq_group()
+                ),
             "the projection kept the previous child's equivalence group"
         );
 
