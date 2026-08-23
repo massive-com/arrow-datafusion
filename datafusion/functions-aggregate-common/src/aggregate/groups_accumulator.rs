@@ -34,7 +34,9 @@ use arrow::{
 };
 use datafusion_common::{Result, ScalarValue, arrow_datafusion_err};
 use datafusion_expr_common::accumulator::Accumulator;
-use datafusion_expr_common::groups_accumulator::{EmitTo, GroupsAccumulator};
+use datafusion_expr_common::groups_accumulator::{
+    EmitTo, GroupSelection, GroupsAccumulator,
+};
 
 /// An adapter that implements [`GroupsAccumulator`] for any [`Accumulator`]
 ///
@@ -333,6 +335,34 @@ impl GroupsAccumulator for GroupsAccumulatorAdapter {
         self.adjust_allocation(vec_size_pre, self.states.allocated_size());
 
         result
+    }
+
+    fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        debug_assert!(selection.validate(self.states.len()).is_ok());
+        let selected_len = selection.len(self.states.len());
+        if selected_len == 0 {
+            // ScalarValue::iter_to_array needs at least one value to infer the
+            // output type, so evaluate a temporary empty accumulator.
+            let mut accumulator = (self.factory)()?;
+            return Ok(ScalarValue::iter_to_array([accumulator.evaluate()?])?.slice(0, 0));
+        }
+
+        let mut results = Vec::with_capacity(selected_len);
+        for group_index in selection.iter(self.states.len()) {
+            let (result, size_pre, size_post) = {
+                let state = &mut self.states[group_index];
+                let size_pre = state.size();
+                let result = state.accumulator.evaluate()?;
+                (result, size_pre, state.size())
+            };
+            self.adjust_allocation(size_pre, size_post);
+            results.push(result);
+        }
+        ScalarValue::iter_to_array(results)
+    }
+
+    fn supports_evaluate_preserving(&self) -> bool {
+        true
     }
 
     // filtered_null_mask(opt_filter, &values);

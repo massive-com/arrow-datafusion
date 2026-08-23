@@ -27,8 +27,8 @@ use arrow::{
 use datafusion_common::cast::{as_float64_array, as_uint64_array};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::{
-    Accumulator, AggregateUDFImpl, Documentation, GroupsAccumulator, Signature,
-    Volatility,
+    Accumulator, AggregateUDFImpl, Documentation, GroupSelection, GroupsAccumulator,
+    Signature, Volatility,
     function::{AccumulatorArgs, StateFieldsArgs},
     utils::format_state_name,
 };
@@ -476,16 +476,11 @@ impl VarianceGroupsAccumulator {
             });
     }
 
-    pub fn variance(
-        &mut self,
-        emit_to: datafusion_expr::EmitTo,
+    fn variance_values(
+        &self,
+        mut counts: Vec<u64>,
+        m2s: Vec<f64>,
     ) -> (Vec<f64>, NullBuffer) {
-        let mut counts = emit_to.take_needed(&mut self.counts);
-        // means are only needed for updating m2s and are not needed for the final result.
-        // But we still need to take them to ensure the internal state is consistent.
-        let _ = emit_to.take_needed(&mut self.means);
-        let m2s = emit_to.take_needed(&mut self.m2s);
-
         if let StatsType::Sample = self.stats_type {
             counts.iter_mut().for_each(|count| {
                 *count = count.saturating_sub(1);
@@ -493,11 +488,39 @@ impl VarianceGroupsAccumulator {
         }
         let nulls = NullBuffer::from_iter(counts.iter().map(|&count| count != 0));
         let variance = m2s
-            .iter()
+            .into_iter()
             .zip(counts)
             .map(|(m2, count)| m2 / count as f64)
             .collect();
         (variance, nulls)
+    }
+
+    pub fn variance(
+        &mut self,
+        emit_to: datafusion_expr::EmitTo,
+    ) -> (Vec<f64>, NullBuffer) {
+        let counts = emit_to.take_needed(&mut self.counts);
+        // Means are only needed for updating m2s, but still need to be removed
+        // to keep the internal vectors aligned.
+        let _ = emit_to.take_needed(&mut self.means);
+        let m2s = emit_to.take_needed(&mut self.m2s);
+        self.variance_values(counts, m2s)
+    }
+
+    pub fn variance_preserving(
+        &self,
+        selection: GroupSelection<'_>,
+    ) -> Result<(Vec<f64>, NullBuffer)> {
+        debug_assert!(selection.validate(self.counts.len()).is_ok());
+        let counts = selection
+            .iter(self.counts.len())
+            .map(|index| self.counts[index])
+            .collect();
+        let m2s = selection
+            .iter(self.m2s.len())
+            .map(|index| self.m2s[index])
+            .collect();
+        Ok(self.variance_values(counts, m2s))
     }
 }
 
@@ -571,6 +594,15 @@ impl GroupsAccumulator for VarianceGroupsAccumulator {
         Ok(Arc::new(Float64Array::new(variances.into(), Some(nulls))))
     }
 
+    fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        let (variances, nulls) = self.variance_preserving(selection)?;
+        Ok(Arc::new(Float64Array::new(variances.into(), Some(nulls))))
+    }
+
+    fn supports_evaluate_preserving(&self) -> bool {
+        true
+    }
+
     fn state(&mut self, emit_to: datafusion_expr::EmitTo) -> Result<Vec<ArrayRef>> {
         let counts = emit_to.take_needed(&mut self.counts);
         let means = emit_to.take_needed(&mut self.means);
@@ -616,6 +648,35 @@ impl GroupsAccumulator for VarianceGroupsAccumulator {
             Arc::new(Float64Array::new(m2s.into(), None)),
         ])
     }
+
+    fn state_preserving(
+        &mut self,
+        selection: GroupSelection<'_>,
+    ) -> Result<Vec<ArrayRef>> {
+        debug_assert!(selection.validate(self.counts.len()).is_ok());
+        let counts = selection
+            .iter(self.counts.len())
+            .map(|index| self.counts[index])
+            .collect::<Vec<_>>();
+        let means = selection
+            .iter(self.means.len())
+            .map(|index| self.means[index])
+            .collect::<Vec<_>>();
+        let m2s = selection
+            .iter(self.m2s.len())
+            .map(|index| self.m2s[index])
+            .collect::<Vec<_>>();
+        Ok(vec![
+            Arc::new(UInt64Array::new(counts.into(), None)),
+            Arc::new(Float64Array::new(means.into(), None)),
+            Arc::new(Float64Array::new(m2s.into(), None)),
+        ])
+    }
+
+    fn supports_state_preserving(&self) -> bool {
+        true
+    }
+
     fn size(&self) -> usize {
         self.m2s.capacity() * size_of::<f64>()
             + self.means.capacity() * size_of::<f64>()

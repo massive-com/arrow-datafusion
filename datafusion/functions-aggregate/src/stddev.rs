@@ -30,8 +30,8 @@ use datafusion_common::{Result, internal_err, not_impl_err};
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
-    Accumulator, AggregateUDFImpl, Documentation, GroupsAccumulator, Signature,
-    Volatility,
+    Accumulator, AggregateUDFImpl, Documentation, GroupSelection, GroupsAccumulator,
+    Signature, Volatility,
 };
 use datafusion_functions_aggregate_common::stats::StatsType;
 use datafusion_macros::user_doc;
@@ -341,6 +341,16 @@ impl GroupsAccumulator for StddevGroupsAccumulator {
         Ok(Arc::new(Float64Array::new(variances.into(), Some(nulls))))
     }
 
+    fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        let (mut variances, nulls) = self.variance.variance_preserving(selection)?;
+        variances.iter_mut().for_each(|value| *value = value.sqrt());
+        Ok(Arc::new(Float64Array::new(variances.into(), Some(nulls))))
+    }
+
+    fn supports_evaluate_preserving(&self) -> bool {
+        true
+    }
+
     fn state(&mut self, emit_to: datafusion_expr::EmitTo) -> Result<Vec<ArrayRef>> {
         self.variance.state(emit_to)
     }
@@ -352,6 +362,17 @@ impl GroupsAccumulator for StddevGroupsAccumulator {
     ) -> Result<Vec<ArrayRef>> {
         self.variance.convert_to_state(values, opt_filter)
     }
+    fn state_preserving(
+        &mut self,
+        selection: GroupSelection<'_>,
+    ) -> Result<Vec<ArrayRef>> {
+        self.variance.state_preserving(selection)
+    }
+
+    fn supports_state_preserving(&self) -> bool {
+        true
+    }
+
     fn size(&self) -> usize {
         self.variance.size()
     }

@@ -23,7 +23,9 @@ use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{ArrowPrimitiveType, Field};
 use datafusion_common::HashSet;
 use datafusion_common::hash_utils::RandomState;
-use datafusion_expr_common::groups_accumulator::{EmitTo, GroupsAccumulator};
+use datafusion_expr_common::groups_accumulator::{
+    EmitTo, GroupSelection, GroupsAccumulator,
+};
 use std::hash::Hash;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -101,6 +103,22 @@ where
         }
 
         Ok(Arc::new(Int64Array::from(counts)))
+    }
+
+    fn evaluate_preserving(
+        &mut self,
+        selection: GroupSelection<'_>,
+    ) -> datafusion_common::Result<ArrayRef> {
+        debug_assert!(selection.validate(self.counts.len()).is_ok());
+        let counts = selection
+            .iter(self.counts.len())
+            .map(|index| self.counts[index])
+            .collect::<Vec<_>>();
+        Ok(Arc::new(Int64Array::from(counts)))
+    }
+
+    fn supports_evaluate_preserving(&self) -> bool {
+        true
     }
 
     fn state(&mut self, emit_to: EmitTo) -> datafusion_common::Result<Vec<ArrayRef>> {

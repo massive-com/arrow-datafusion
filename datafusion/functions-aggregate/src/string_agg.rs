@@ -32,8 +32,8 @@ use datafusion_common::{
 use datafusion_expr::function::AccumulatorArgs;
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
-    Accumulator, AggregateUDFImpl, Documentation, EmitTo, GroupsAccumulator, Signature,
-    TypeSignature, Volatility,
+    Accumulator, AggregateUDFImpl, Documentation, EmitTo, GroupSelection,
+    GroupsAccumulator, Signature, TypeSignature, Volatility,
 };
 use datafusion_functions_aggregate_common::accumulator::StateFieldsArgs;
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::nulls::apply_filter_as_nulls;
@@ -405,8 +405,31 @@ impl GroupsAccumulator for StringAggGroupsAccumulator {
         Ok(result)
     }
 
+    fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        debug_assert!(selection.validate(self.values.len()).is_ok());
+        let values = selection
+            .iter(self.values.len())
+            .map(|index| self.values[index].as_deref());
+        Ok(Arc::new(LargeStringArray::from_iter(values)))
+    }
+
+    fn supports_evaluate_preserving(&self) -> bool {
+        true
+    }
+
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         self.evaluate(emit_to).map(|arr| vec![arr])
+    }
+
+    fn state_preserving(
+        &mut self,
+        selection: GroupSelection<'_>,
+    ) -> Result<Vec<ArrayRef>> {
+        self.evaluate_preserving(selection).map(|array| vec![array])
+    }
+
+    fn supports_state_preserving(&self) -> bool {
+        true
     }
 
     fn merge_batch(

@@ -21,7 +21,9 @@ use crate::aggregate::groups_accumulator::nulls::filtered_null_mask;
 use arrow::array::{ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder};
 use arrow::buffer::BooleanBuffer;
 use datafusion_common::Result;
-use datafusion_expr_common::groups_accumulator::{EmitTo, GroupsAccumulator};
+use datafusion_expr_common::groups_accumulator::{
+    EmitTo, GroupSelection, GroupsAccumulator,
+};
 
 use super::accumulate::NullState;
 
@@ -124,8 +126,35 @@ where
         Ok(Arc::new(values))
     }
 
+    fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        debug_assert!(selection.validate(self.values.len()).is_ok());
+        let mut values = BooleanBufferBuilder::new(selection.len(self.values.len()));
+        for index in selection.iter(self.values.len()) {
+            values.append(self.values.get_bit(index));
+        }
+        let nulls = self
+            .null_state
+            .build_preserving(selection, self.values.len())?;
+        Ok(Arc::new(BooleanArray::new(values.finish(), nulls)))
+    }
+
+    fn supports_evaluate_preserving(&self) -> bool {
+        true
+    }
+
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         self.evaluate(emit_to).map(|arr| vec![arr])
+    }
+
+    fn state_preserving(
+        &mut self,
+        selection: GroupSelection<'_>,
+    ) -> Result<Vec<ArrayRef>> {
+        self.evaluate_preserving(selection).map(|arr| vec![arr])
+    }
+
+    fn supports_state_preserving(&self) -> bool {
+        true
     }
 
     fn merge_batch(
