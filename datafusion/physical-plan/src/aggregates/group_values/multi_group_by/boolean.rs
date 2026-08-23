@@ -22,6 +22,7 @@ use crate::aggregates::group_values::multi_group_by::{GroupColumn, nulls_equal_t
 use crate::aggregates::group_values::null_builder::MaybeNullBufferBuilder;
 use arrow::array::{Array as _, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder};
 use datafusion_common::Result;
+use datafusion_expr::GroupSelection;
 
 /// An implementation of [`GroupColumn`] for booleans
 ///
@@ -175,6 +176,15 @@ impl<const NULLABLE: bool> GroupColumn for BooleanGroupValueBuilder<NULLABLE> {
         let arr = BooleanArray::new(buffer.finish(), nulls);
 
         Arc::new(arr)
+    }
+
+    fn values_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        let mut values = BooleanBufferBuilder::new(selection.len(self.buffer.len()));
+        for index in selection.iter(self.buffer.len()) {
+            values.append(self.buffer.get_bit(index));
+        }
+        let nulls = self.nulls.build_preserving(selection, self.buffer.len())?;
+        Ok(Arc::new(BooleanArray::new(values.finish(), nulls)))
     }
 
     fn take_n(&mut self, n: usize) -> ArrayRef {

@@ -31,6 +31,7 @@ use arrow::util::bit_util::apply_bitwise_binary_op;
 use datafusion_common::Result;
 use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_execution::memory_pool::proxy::VecAllocExt;
+use datafusion_expr::GroupSelection;
 use std::iter;
 use std::sync::Arc;
 
@@ -276,6 +277,20 @@ where
         let arr = PrimitiveArray::<T>::new(ScalarBuffer::from(group_values), nulls);
         // Set timezone information for timestamp
         Arc::new(arr.with_data_type(data_type))
+    }
+
+    fn values_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        let values: Vec<T::Native> = selection
+            .iter(self.group_values.len())
+            .map(|index| self.group_values[index])
+            .collect();
+        let nulls = self
+            .nulls
+            .build_preserving(selection, self.group_values.len())?;
+        Ok(Arc::new(
+            PrimitiveArray::<T>::new(ScalarBuffer::from(values), nulls)
+                .with_data_type(self.data_type.clone()),
+        ))
     }
 
     fn take_n(&mut self, n: usize) -> ArrayRef {

@@ -28,6 +28,7 @@ use arrow::datatypes::{ByteArrayType, DataType, GenericBinaryType};
 use datafusion_common::utils::proxy::VecAllocExt;
 use datafusion_common::utils::split_vec_min_alloc;
 use datafusion_common::{Result, exec_datafusion_err};
+use datafusion_expr::GroupSelection;
 use datafusion_physical_expr_common::binary_map::{INITIAL_BUFFER_CAPACITY, OutputType};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -371,6 +372,37 @@ where
             }
             _ => unreachable!("View types should use `ArrowBytesViewMap`"),
         }
+    }
+
+    fn values_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        let selected_len = selection.len(self.len());
+        let mut buffer = BufferBuilder::<u8>::new(0);
+        let mut offsets = Vec::with_capacity(selected_len + 1);
+        let mut nulls = MaybeNullBufferBuilder::new();
+        offsets.push(O::default());
+
+        for index in selection.iter(self.len()) {
+            let is_null = self.nulls.is_null(index);
+            nulls.append(is_null);
+            if !is_null {
+                buffer.append_slice(self.value(index));
+            }
+            offsets.push(O::usize_as(buffer.len()));
+        }
+
+        // SAFETY: offsets are constructed from the length of `buffer`.
+        let offsets = unsafe { OffsetBuffer::new_unchecked(ScalarBuffer::from(offsets)) };
+        let values = buffer.finish();
+        let nulls = nulls.build();
+        Ok(match self.output_type {
+            OutputType::Binary => Arc::new(unsafe {
+                GenericBinaryArray::new_unchecked(offsets, values, nulls)
+            }),
+            OutputType::Utf8 => Arc::new(unsafe {
+                GenericStringArray::new_unchecked(offsets, values, nulls)
+            }),
+            _ => unreachable!("View types should use `ArrowBytesViewMap`"),
+        })
     }
 
     fn take_n(&mut self, n: usize) -> ArrayRef {
