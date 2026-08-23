@@ -18,7 +18,7 @@
 //! Vectorized [`GroupsAccumulator`]
 
 use arrow::array::{ArrayRef, BooleanArray};
-use datafusion_common::{Result, utils::split_vec_min_alloc};
+use datafusion_common::{Result, exec_err, utils::split_vec_min_alloc};
 
 /// Describes how many rows should be emitted during grouping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,57 @@ impl EmitTo {
             }
             Self::First(n) => split_vec_min_alloc(v, *n),
         }
+    }
+}
+
+/// Selects groups for a non-destructive grouped aggregation read.
+///
+/// Unlike [`EmitTo`], this selection does not remove groups or change their
+/// indices. [`Self::Indices`] preserves the requested order and supports
+/// duplicate indices.
+///
+/// Indices are trusted to be valid by preserving read APIs. Call
+/// [`Self::validate`] first when they do not come from a source that guarantees
+/// they are in bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupSelection<'a> {
+    /// Select all groups in group-index order.
+    All,
+    /// Select groups in the order specified by their group indices.
+    Indices(&'a [usize]),
+}
+
+impl<'a> GroupSelection<'a> {
+    /// Validates that every selected index is less than `total_num_groups`.
+    ///
+    /// [`Self::len`] and [`Self::iter`] do not call this method implicitly.
+    pub fn validate(&self, total_num_groups: usize) -> Result<()> {
+        if let Self::Indices(indices) = self
+            && let Some(index) = indices.iter().find(|&&index| index >= total_num_groups)
+        {
+            return exec_err!(
+                "Group index {index} is out of bounds for {total_num_groups} groups"
+            );
+        }
+        Ok(())
+    }
+
+    /// Returns the number of selected groups without validating the selection.
+    pub fn len(&self, total_num_groups: usize) -> usize {
+        match self {
+            Self::All => total_num_groups,
+            Self::Indices(indices) => indices.len(),
+        }
+    }
+
+    /// Returns the selected group indices in output order without validating
+    /// the selection.
+    pub fn iter(self, total_num_groups: usize) -> impl Iterator<Item = usize> + 'a {
+        let (all, indices): (_, &'a [usize]) = match self {
+            Self::All => (0..total_num_groups, &[]),
+            Self::Indices(indices) => (0..0, indices),
+        };
+        all.chain(indices.iter().copied())
     }
 }
 
@@ -247,7 +298,7 @@ pub trait GroupsAccumulator: Send + std::any::Any {
 
 #[cfg(test)]
 mod tests {
-    use super::EmitTo;
+    use super::{EmitTo, GroupSelection};
 
     /// When `n` is small relative to `len`, the old `split_off(n) + swap` pattern had
     /// two allocation problems:
@@ -292,5 +343,27 @@ mod tests {
             v.capacity(),
             original_capacity,
         );
+    }
+
+    #[test]
+    fn group_selection_order_duplicates_and_explicit_validation() {
+        let values = [10, 20, 30, 40];
+        let selected = GroupSelection::Indices(&[3, 1, 3])
+            .iter(values.len())
+            .map(|index| values[index])
+            .collect::<Vec<_>>();
+        assert_eq!(selected, vec![40, 20, 40]);
+
+        let selected = GroupSelection::All
+            .iter(values.len())
+            .map(|index| values[index])
+            .collect::<Vec<_>>();
+        assert_eq!(selected, values);
+
+        let invalid = GroupSelection::Indices(&[4]);
+        assert_eq!(invalid.len(values.len()), 1);
+        assert_eq!(invalid.iter(values.len()).collect::<Vec<_>>(), vec![4]);
+        let error = invalid.validate(values.len()).unwrap_err();
+        assert!(error.to_string().contains("out of bounds"));
     }
 }
