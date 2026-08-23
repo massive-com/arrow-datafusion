@@ -732,7 +732,11 @@ impl From<&ParquetFormatFactory> for protobuf::TableParquetOptions {
                 parquet_options::StatisticsEnabledOpt::StatisticsEnabled(enabled)
             }),
             max_row_group_size: global_options.global.max_row_group_size as u64,
-            max_in_list_size: global_options.global.max_in_list_size as u64,
+            max_in_list_size_opt: Some(
+                parquet_options::MaxInListSizeOpt::MaxInListSize(
+                    global_options.global.max_in_list_size as u64,
+                ),
+            ),
             created_by: global_options.global.created_by.clone(),
             column_index_truncate_length_opt: global_options.global.column_index_truncate_length.map(|length| {
                 parquet_options::ColumnIndexTruncateLengthOpt::ColumnIndexTruncateLength(length as u64)

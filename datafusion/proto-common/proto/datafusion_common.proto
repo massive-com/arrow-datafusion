@@ -617,7 +617,11 @@ message ParquetOptions {
 
   uint64 max_row_group_size = 15;
 
-  uint64 max_in_list_size = 38;
+  // Presence distinguishes an omitted value (default 20) from an explicit
+  // zero, which disables IN-list pruning.
+  oneof max_in_list_size_opt {
+    uint64 max_in_list_size = 38;
+  }
 
   string created_by = 16;
 

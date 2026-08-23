@@ -862,8 +862,6 @@ pub struct ParquetOptions {
     pub data_page_row_count_limit: u64,
     #[prost(uint64, tag = "15")]
     pub max_row_group_size: u64,
-    #[prost(uint64, tag = "38")]
-    pub max_in_list_size: u64,
     #[prost(string, tag = "16")]
     pub created_by: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "35")]
@@ -896,6 +894,10 @@ pub struct ParquetOptions {
     pub bloom_filter_fpp_opt: ::core::option::Option<parquet_options::BloomFilterFppOpt>,
     #[prost(oneof = "parquet_options::BloomFilterNdvOpt", tags = "22")]
     pub bloom_filter_ndv_opt: ::core::option::Option<parquet_options::BloomFilterNdvOpt>,
+    /// Presence distinguishes an omitted value (default 20) from an explicit
+    /// zero, which disables IN-list pruning.
+    #[prost(oneof = "parquet_options::MaxInListSizeOpt", tags = "38")]
+    pub max_in_list_size_opt: ::core::option::Option<parquet_options::MaxInListSizeOpt>,
     #[prost(oneof = "parquet_options::CoerceInt96Opt", tags = "32")]
     pub coerce_int96_opt: ::core::option::Option<parquet_options::CoerceInt96Opt>,
     #[prost(oneof = "parquet_options::MaxPredicateCacheSizeOpt", tags = "33")]
@@ -959,6 +961,13 @@ pub mod parquet_options {
     pub enum BloomFilterNdvOpt {
         #[prost(uint64, tag = "22")]
         BloomFilterNdv(u64),
+    }
+    /// Presence distinguishes an omitted value (default 20) from an explicit
+    /// zero, which disables IN-list pruning.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum MaxInListSizeOpt {
+        #[prost(uint64, tag = "38")]
+        MaxInListSize(u64),
     }
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum CoerceInt96Opt {
