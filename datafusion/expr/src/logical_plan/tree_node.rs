@@ -1034,3 +1034,73 @@ impl LogicalPlan {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Formatter;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Arc, LazyLock};
+
+    use datafusion_common::{DFSchema, DFSchemaRef, Result};
+
+    use super::*;
+    use crate::UserDefinedLogicalNodeCore;
+
+    static REBUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static EMPTY_SCHEMA: LazyLock<DFSchemaRef> =
+        LazyLock::new(|| Arc::new(DFSchema::empty()));
+
+    #[derive(Debug, Eq, Hash, PartialEq, PartialOrd)]
+    struct EmptyExpressionNode;
+
+    impl UserDefinedLogicalNodeCore for EmptyExpressionNode {
+        fn name(&self) -> &str {
+            "EmptyExpressionNode"
+        }
+
+        fn inputs(&self) -> Vec<&LogicalPlan> {
+            vec![]
+        }
+
+        fn schema(&self) -> &DFSchemaRef {
+            &EMPTY_SCHEMA
+        }
+
+        fn expressions(&self) -> Vec<Expr> {
+            vec![]
+        }
+
+        fn fmt_for_explain(&self, f: &mut Formatter) -> std::fmt::Result {
+            write!(f, "EmptyExpressionNode")
+        }
+
+        fn with_exprs_and_inputs(
+            &self,
+            exprs: Vec<Expr>,
+            inputs: Vec<LogicalPlan>,
+        ) -> Result<Self> {
+            assert!(exprs.is_empty());
+            assert!(inputs.is_empty());
+            REBUILD_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(Self)
+        }
+    }
+
+    #[test]
+    fn map_expressions_does_not_rebuild_expressionless_extension() -> Result<()> {
+        REBUILD_COUNT.store(0, AtomicOrdering::Relaxed);
+        let original: Arc<dyn UserDefinedLogicalNode> = Arc::new(EmptyExpressionNode);
+        let plan = LogicalPlan::Extension(Extension {
+            node: Arc::clone(&original),
+        });
+
+        let transformed = plan.map_expressions(|expr| Ok(Transformed::no(expr)))?;
+        let LogicalPlan::Extension(Extension { node }) = transformed.data else {
+            panic!("expected extension plan")
+        };
+
+        assert!(Arc::ptr_eq(&node, &original));
+        assert_eq!(REBUILD_COUNT.load(AtomicOrdering::Relaxed), 0);
+        Ok(())
+    }
+}
