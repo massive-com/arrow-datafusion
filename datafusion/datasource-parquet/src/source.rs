@@ -507,13 +507,28 @@ impl ParquetSource {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_reverse_row_groups(mut self, reverse_row_groups: bool) -> Self {
+    /// Sets whether row groups are read in reverse order.
+    ///
+    /// This changes row-group traversal only; rows within each row group retain
+    /// their file order.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    ///
+    /// use arrow_schema::Schema;
+    /// use datafusion_datasource_parquet::source::ParquetSource;
+    ///
+    /// let source = ParquetSource::new(Arc::new(Schema::empty()))
+    ///     .with_reverse_row_groups(true);
+    /// assert!(source.reverse_row_groups());
+    /// ```
+    pub fn with_reverse_row_groups(mut self, reverse_row_groups: bool) -> Self {
         self.reverse_row_groups = reverse_row_groups;
         self
     }
-    #[cfg(test)]
-    pub(crate) fn reverse_row_groups(&self) -> bool {
+
+    /// Returns whether row groups are read in reverse order.
+    pub fn reverse_row_groups(&self) -> bool {
         self.reverse_row_groups
     }
 }
