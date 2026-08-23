@@ -24,9 +24,9 @@ use arrow::array::types::{
 };
 use arrow::array::{ArrayRef, downcast_primitive};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-use datafusion_common::Result;
+use datafusion_common::{Result, not_impl_err};
 
-use datafusion_expr::EmitTo;
+use datafusion_expr::{EmitTo, GroupSelection};
 
 pub mod multi_group_by;
 
@@ -112,6 +112,26 @@ pub trait GroupValues: Send {
 
     /// Emits the group values
     fn emit(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>>;
+
+    /// Materializes selected group values without changing the stored values or
+    /// their group indices.
+    ///
+    /// Rows are returned in the order specified by `selection`.
+    ///
+    /// Every index in [`GroupSelection::Indices`] must refer to an existing
+    /// group. Call [`GroupSelection::validate`] first if this is not guaranteed
+    /// by the source of the indices. Invalid indices may cause a panic.
+    fn values_preserving(
+        &mut self,
+        _selection: GroupSelection<'_>,
+    ) -> Result<Vec<ArrayRef>> {
+        not_impl_err!("Preserving group values are not implemented")
+    }
+
+    /// Returns `true` if [`Self::values_preserving`] is implemented.
+    fn supports_values_preserving(&self) -> bool {
+        false
+    }
 
     /// Clear the contents and shrink the capacity to the size of the batch (free up memory usage)
     fn clear_shrink(&mut self, num_rows: usize);

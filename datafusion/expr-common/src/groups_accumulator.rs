@@ -18,7 +18,7 @@
 //! Vectorized [`GroupsAccumulator`]
 
 use arrow::array::{ArrayRef, BooleanArray};
-use datafusion_common::{Result, exec_err, utils::split_vec_min_alloc};
+use datafusion_common::{Result, exec_err, not_impl_err, utils::split_vec_min_alloc};
 
 /// Describes how many rows should be emitted during grouping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +205,28 @@ pub trait GroupsAccumulator: Send + std::any::Any {
     /// `n`. See [`EmitTo::First`] for more details.
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef>;
 
+    /// Returns final aggregate values without changing the logical state or
+    /// group indices.
+    ///
+    /// Rows are returned in the order specified by `selection`. Implementations
+    /// may mutate internal caches or builders, but repeated calls and later
+    /// updates must observe the same logical accumulator state.
+    ///
+    /// Every index in [`GroupSelection::Indices`] must refer to an existing
+    /// group. Call [`GroupSelection::validate`] first if this is not guaranteed
+    /// by the source of the indices. Invalid indices may cause a panic.
+    fn evaluate_preserving(
+        &mut self,
+        _selection: GroupSelection<'_>,
+    ) -> Result<ArrayRef> {
+        not_impl_err!("Preserving grouped evaluation is not implemented")
+    }
+
+    /// Returns `true` if [`Self::evaluate_preserving`] is implemented.
+    fn supports_evaluate_preserving(&self) -> bool {
+        false
+    }
+
     /// Returns the intermediate aggregate state for this accumulator,
     /// used for multi-phase grouping, resetting its internal state.
     ///
@@ -222,6 +244,27 @@ pub trait GroupsAccumulator: Send + std::any::Any {
     ///
     /// [`Accumulator::state`]: crate::accumulator::Accumulator::state
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>>;
+
+    /// Returns intermediate aggregate state without changing the logical state
+    /// or group indices.
+    ///
+    /// Each returned array has one row per selected group, in the order
+    /// specified by `selection`.
+    ///
+    /// Every index in [`GroupSelection::Indices`] must refer to an existing
+    /// group. Call [`GroupSelection::validate`] first if this is not guaranteed
+    /// by the source of the indices. Invalid indices may cause a panic.
+    fn state_preserving(
+        &mut self,
+        _selection: GroupSelection<'_>,
+    ) -> Result<Vec<ArrayRef>> {
+        not_impl_err!("Preserving grouped state is not implemented")
+    }
+
+    /// Returns `true` if [`Self::state_preserving`] is implemented.
+    fn supports_state_preserving(&self) -> bool {
+        false
+    }
 
     /// Merges intermediate state (the output from [`Self::state`])
     /// into this accumulator's current state.
