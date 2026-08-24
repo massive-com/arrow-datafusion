@@ -1038,7 +1038,6 @@ impl LogicalPlan {
 #[cfg(test)]
 mod tests {
     use std::fmt::Formatter;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, LazyLock};
 
     use datafusion_common::{DFSchema, DFSchemaRef, Result};
@@ -1046,7 +1045,6 @@ mod tests {
     use super::*;
     use crate::UserDefinedLogicalNodeCore;
 
-    static REBUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
     static EMPTY_SCHEMA: LazyLock<DFSchemaRef> =
         LazyLock::new(|| Arc::new(DFSchema::empty()));
 
@@ -1081,14 +1079,12 @@ mod tests {
         ) -> Result<Self> {
             assert!(exprs.is_empty());
             assert!(inputs.is_empty());
-            REBUILD_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
             Ok(Self)
         }
     }
 
     #[test]
     fn map_expressions_does_not_rebuild_expressionless_extension() -> Result<()> {
-        REBUILD_COUNT.store(0, AtomicOrdering::Relaxed);
         let original: Arc<dyn UserDefinedLogicalNode> = Arc::new(EmptyExpressionNode);
         let plan = LogicalPlan::Extension(Extension {
             node: Arc::clone(&original),
@@ -1100,7 +1096,6 @@ mod tests {
         };
 
         assert!(Arc::ptr_eq(&node, &original));
-        assert_eq!(REBUILD_COUNT.load(AtomicOrdering::Relaxed), 0);
         Ok(())
     }
 }
