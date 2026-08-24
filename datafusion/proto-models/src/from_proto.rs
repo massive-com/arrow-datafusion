@@ -374,17 +374,7 @@ impl TryFrom<&ParquetOptionsProto> for ParquetOptions {
                 },
             ),
             max_row_group_size: proto.max_row_group_size as usize,
-            // Preserve the documented default when an older plan omits the
-            // field; primitive zero disables IN-list pruning.
-            max_in_list_size: proto
-                .max_in_list_size_opt
-                .as_ref()
-                .map(|opt| match opt {
-                    parquet_options::MaxInListSizeOpt::MaxInListSize(size) => {
-                        *size as usize
-                    }
-                })
-                .unwrap_or(20),
+            max_in_list_size: proto.max_in_list_size as usize,
             created_by: proto.created_by.clone(),
             column_index_truncate_length: proto
                 .column_index_truncate_length_opt

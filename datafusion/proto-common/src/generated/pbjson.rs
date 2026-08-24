@@ -6409,6 +6409,9 @@ impl serde::Serialize for ParquetOptions {
         if self.max_row_group_size != 0 {
             len += 1;
         }
+        if self.max_in_list_size != 0 {
+            len += 1;
+        }
         if !self.created_by.is_empty() {
             len += 1;
         }
@@ -6440,9 +6443,6 @@ impl serde::Serialize for ParquetOptions {
             len += 1;
         }
         if self.bloom_filter_ndv_opt.is_some() {
-            len += 1;
-        }
-        if self.max_in_list_size_opt.is_some() {
             len += 1;
         }
         if self.coerce_int96_opt.is_some() {
@@ -6532,6 +6532,11 @@ impl serde::Serialize for ParquetOptions {
             #[allow(clippy::needless_borrows_for_generic_args)]
             struct_ser.serialize_field("maxRowGroupSize", ToString::to_string(&self.max_row_group_size).as_str())?;
         }
+        if self.max_in_list_size != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("maxInListSize", ToString::to_string(&self.max_in_list_size).as_str())?;
+        }
         if !self.created_by.is_empty() {
             struct_ser.serialize_field("createdBy", &self.created_by)?;
         }
@@ -6606,15 +6611,6 @@ impl serde::Serialize for ParquetOptions {
                     #[allow(clippy::needless_borrow)]
                     #[allow(clippy::needless_borrows_for_generic_args)]
                     struct_ser.serialize_field("bloomFilterNdv", ToString::to_string(&v).as_str())?;
-                }
-            }
-        }
-        if let Some(v) = self.max_in_list_size_opt.as_ref() {
-            match v {
-                parquet_options::MaxInListSizeOpt::MaxInListSize(v) => {
-                    #[allow(clippy::needless_borrow)]
-                    #[allow(clippy::needless_borrows_for_generic_args)]
-                    struct_ser.serialize_field("maxInListSize", ToString::to_string(&v).as_str())?;
                 }
             }
         }
@@ -6699,6 +6695,8 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             "dataPageRowCountLimit",
             "max_row_group_size",
             "maxRowGroupSize",
+            "max_in_list_size",
+            "maxInListSize",
             "created_by",
             "createdBy",
             "content_defined_chunking",
@@ -6719,8 +6717,6 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             "bloomFilterFpp",
             "bloom_filter_ndv",
             "bloomFilterNdv",
-            "max_in_list_size",
-            "maxInListSize",
             "coerce_int96",
             "coerceInt96",
             "max_predicate_cache_size",
@@ -6753,6 +6749,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             DictionaryPageSizeLimit,
             DataPageRowCountLimit,
             MaxRowGroupSize,
+            MaxInListSize,
             CreatedBy,
             ContentDefinedChunking,
             MetadataSizeHint,
@@ -6764,7 +6761,6 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             Encoding,
             BloomFilterFpp,
             BloomFilterNdv,
-            MaxInListSize,
             CoerceInt96,
             MaxPredicateCacheSize,
             MaxRowGroupBytes,
@@ -6810,6 +6806,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             "dictionaryPageSizeLimit" | "dictionary_page_size_limit" => Ok(GeneratedField::DictionaryPageSizeLimit),
                             "dataPageRowCountLimit" | "data_page_row_count_limit" => Ok(GeneratedField::DataPageRowCountLimit),
                             "maxRowGroupSize" | "max_row_group_size" => Ok(GeneratedField::MaxRowGroupSize),
+                            "maxInListSize" | "max_in_list_size" => Ok(GeneratedField::MaxInListSize),
                             "createdBy" | "created_by" => Ok(GeneratedField::CreatedBy),
                             "contentDefinedChunking" | "content_defined_chunking" => Ok(GeneratedField::ContentDefinedChunking),
                             "metadataSizeHint" | "metadata_size_hint" => Ok(GeneratedField::MetadataSizeHint),
@@ -6821,7 +6818,6 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             "encoding" => Ok(GeneratedField::Encoding),
                             "bloomFilterFpp" | "bloom_filter_fpp" => Ok(GeneratedField::BloomFilterFpp),
                             "bloomFilterNdv" | "bloom_filter_ndv" => Ok(GeneratedField::BloomFilterNdv),
-                            "maxInListSize" | "max_in_list_size" => Ok(GeneratedField::MaxInListSize),
                             "coerceInt96" | "coerce_int96" => Ok(GeneratedField::CoerceInt96),
                             "maxPredicateCacheSize" | "max_predicate_cache_size" => Ok(GeneratedField::MaxPredicateCacheSize),
                             "maxRowGroupBytes" | "max_row_group_bytes" => Ok(GeneratedField::MaxRowGroupBytes),
@@ -6865,6 +6861,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                 let mut dictionary_page_size_limit__ = None;
                 let mut data_page_row_count_limit__ = None;
                 let mut max_row_group_size__ = None;
+                let mut max_in_list_size__ = None;
                 let mut created_by__ = None;
                 let mut content_defined_chunking__ = None;
                 let mut metadata_size_hint_opt__ = None;
@@ -6876,7 +6873,6 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                 let mut encoding_opt__ = None;
                 let mut bloom_filter_fpp_opt__ = None;
                 let mut bloom_filter_ndv_opt__ = None;
-                let mut max_in_list_size_opt__ = None;
                 let mut coerce_int96_opt__ = None;
                 let mut max_predicate_cache_size_opt__ = None;
                 let mut max_row_group_bytes_opt__ = None;
@@ -7017,6 +7013,14 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
+                        GeneratedField::MaxInListSize => {
+                            if max_in_list_size__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("maxInListSize"));
+                            }
+                            max_in_list_size__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
                         GeneratedField::CreatedBy => {
                             if created_by__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("createdBy"));
@@ -7083,12 +7087,6 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             }
                             bloom_filter_ndv_opt__ = map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| parquet_options::BloomFilterNdvOpt::BloomFilterNdv(x.0));
                         }
-                        GeneratedField::MaxInListSize => {
-                            if max_in_list_size_opt__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("maxInListSize"));
-                            }
-                            max_in_list_size_opt__ = map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| parquet_options::MaxInListSizeOpt::MaxInListSize(x.0));
-                        }
                         GeneratedField::CoerceInt96 => {
                             if coerce_int96_opt__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("coerceInt96"));
@@ -7136,6 +7134,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                     dictionary_page_size_limit: dictionary_page_size_limit__.unwrap_or_default(),
                     data_page_row_count_limit: data_page_row_count_limit__.unwrap_or_default(),
                     max_row_group_size: max_row_group_size__.unwrap_or_default(),
+                    max_in_list_size: max_in_list_size__.unwrap_or_default(),
                     created_by: created_by__.unwrap_or_default(),
                     content_defined_chunking: content_defined_chunking__,
                     metadata_size_hint_opt: metadata_size_hint_opt__,
@@ -7147,7 +7146,6 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                     encoding_opt: encoding_opt__,
                     bloom_filter_fpp_opt: bloom_filter_fpp_opt__,
                     bloom_filter_ndv_opt: bloom_filter_ndv_opt__,
-                    max_in_list_size_opt: max_in_list_size_opt__,
                     coerce_int96_opt: coerce_int96_opt__,
                     max_predicate_cache_size_opt: max_predicate_cache_size_opt__,
                     max_row_group_bytes_opt: max_row_group_bytes_opt__,

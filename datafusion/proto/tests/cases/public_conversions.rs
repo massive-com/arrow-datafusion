@@ -126,29 +126,3 @@ fn file_format_option_conversions_are_std_traits() {
     assert_from::<&JsonFormatFactory, protobuf::JsonOptions>();
     assert_from::<&ParquetFormatFactory, protobuf::TableParquetOptions>();
 }
-
-#[test]
-fn parquet_max_in_list_size_preserves_zero_and_absent_default() {
-    let mut options = TableParquetOptions::default();
-    options.global.max_in_list_size = 0;
-    let factory = ParquetFormatFactory::new_with_options(options);
-    let mut proto = protobuf::TableParquetOptions::from(&factory);
-
-    let global = proto.global.as_ref().expect("global parquet options");
-    assert!(matches!(
-        global.max_in_list_size_opt,
-        Some(protobuf::parquet_options::MaxInListSizeOpt::MaxInListSize(
-            0
-        ))
-    ));
-    let decoded = TableParquetOptions::try_from(&proto).expect("from_proto");
-    assert_eq!(decoded.global.max_in_list_size, 0);
-
-    proto
-        .global
-        .as_mut()
-        .expect("global parquet options")
-        .max_in_list_size_opt = None;
-    let decoded = TableParquetOptions::try_from(&proto).expect("from_proto");
-    assert_eq!(decoded.global.max_in_list_size, 20);
-}

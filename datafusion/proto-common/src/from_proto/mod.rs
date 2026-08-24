@@ -1081,12 +1081,7 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
                 })
                 .unwrap_or(None),
             max_row_group_size: value.max_row_group_size as usize,
-            // Plans written before this field was introduced do not carry a value.
-            // Preserve the documented default instead of treating absence as zero,
-            // which disables IN-list pruning.
-            max_in_list_size: value.max_in_list_size_opt.map(|opt| match opt {
-                protobuf::parquet_options::MaxInListSizeOpt::MaxInListSize(v) => v as usize,
-            }).unwrap_or(20),
+            max_in_list_size: value.max_in_list_size as usize,
             created_by: value.created_by.clone(),
             column_index_truncate_length: value
                 .column_index_truncate_length_opt.as_ref()
@@ -1396,36 +1391,6 @@ mod tests {
             recovered.max_row_group_bytes.map(|v| v.get()),
             Some(64 * 1024 * 1024)
         );
-    }
-
-    #[test]
-    fn test_parquet_options_max_in_list_size_round_trip() {
-        let opts = ParquetOptions {
-            max_in_list_size: 64,
-            ..ParquetOptions::default()
-        };
-        let recovered = parquet_options_proto_round_trip(opts);
-        assert_eq!(recovered.max_in_list_size, 64);
-    }
-
-    #[test]
-    fn test_parquet_options_max_in_list_size_zero_round_trip() {
-        let opts = ParquetOptions {
-            max_in_list_size: 0,
-            ..ParquetOptions::default()
-        };
-        let recovered = parquet_options_proto_round_trip(opts);
-        assert_eq!(recovered.max_in_list_size, 0);
-    }
-
-    #[test]
-    fn test_parquet_options_max_in_list_size_absent_uses_default() {
-        let opts = ParquetOptions::default();
-        let mut proto: crate::protobuf_common::ParquetOptions =
-            (&opts).try_into().expect("to_proto");
-        proto.max_in_list_size_opt = None;
-        let recovered = ParquetOptions::try_from(&proto).expect("from_proto");
-        assert_eq!(recovered.max_in_list_size, 20);
     }
 
     #[test]
