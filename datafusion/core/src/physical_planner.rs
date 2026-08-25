@@ -57,7 +57,6 @@ use crate::physical_plan::{
 use crate::schema_equivalence::schema_satisfied_by;
 
 use arrow::array::{RecordBatch, builder::StringBuilder};
-use arrow::compute::SortOptions;
 use arrow::datatypes::Schema;
 use arrow_schema::Field;
 use datafusion_catalog::ScanArgs;
@@ -1708,15 +1707,27 @@ impl DefaultPhysicalPlanner {
                 // implement null-aware anti-join semantics and would return wrong
                 // results when the right side contains a null join key.
                 {
-                    // Use SortMergeJoin if hash join is not preferred
-                    let join_on_len = join_on.len();
+                    let sort_options = join_on
+                        .iter()
+                        .map(|(left_col, _)| {
+                            physical_left
+                                .output_ordering()
+                                .and_then(|ordering| {
+                                    ordering
+                                        .iter()
+                                        .find(|sort_expr| sort_expr.expr.eq(left_col))
+                                        .map(|sort_expr| sort_expr.options)
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect();
                     Arc::new(SortMergeJoinExec::try_new(
                         physical_left,
                         physical_right,
                         join_on,
                         join_filter,
                         *join_type,
-                        vec![SortOptions::default(); join_on_len],
+                        sort_options,
                         *null_equality,
                     )?)
                 } else if session_state.config().target_partitions() > 1
@@ -3316,8 +3327,8 @@ mod tests {
     use datafusion_expr::{
         Accumulator, AggregateUDF, AggregateUDFImpl, ExprFunctionExt, HigherOrderUDF,
         LogicalPlanBuilder, Partitioning as LogicalPartitioning, RangePartitioning,
-        ScalarUDF, Signature, TableSource, UserDefinedLogicalNodeCore, Volatility,
-        WindowFunctionDefinition, WindowUDF, col, lit, scalar_subquery,
+        ScalarUDF, Signature, SortExpr, TableSource, UserDefinedLogicalNodeCore,
+        Volatility, WindowFunctionDefinition, WindowUDF, col, lit, scalar_subquery,
     };
     use datafusion_functions_aggregate::count::{count_all, count_udaf};
     use datafusion_functions_aggregate::expr_fn::sum;
@@ -3818,6 +3829,134 @@ mod tests {
     async fn collect_sql(query: &str) -> Result<Vec<RecordBatch>> {
         let ctx = SessionContext::new();
         ctx.sql(query).await?.collect().await
+    }
+
+    fn smj_test_context(
+        left_ordering: Option<Vec<SortExpr>>,
+        right_ordering: Option<Vec<SortExpr>>,
+    ) -> Result<SessionContext> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 2, 1])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )?;
+
+        let table = |batch, ordering| -> Result<MemTable> {
+            let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])?;
+            Ok(match ordering {
+                Some(ordering) => table.with_sort_order(vec![ordering]),
+                None => table,
+            })
+        };
+        let left = table(batch.clone(), left_ordering)?;
+        let right = table(batch, right_ordering)?;
+
+        let config = SessionConfig::new()
+            .with_target_partitions(4)
+            .set_bool("datafusion.optimizer.prefer_hash_join", false)
+            .set_bool("datafusion.optimizer.skip_failed_rules", false);
+        let state = SessionStateBuilder::new()
+            .with_config(config)
+            .with_runtime_env(Arc::new(RuntimeEnv::default()))
+            .with_default_features()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table("left_table", Arc::new(left))?;
+        ctx.register_table("right_table", Arc::new(right))?;
+        Ok(ctx)
+    }
+
+    async fn smj_plan(ctx: &SessionContext, sql: &str) -> Result<String> {
+        let state = ctx.state();
+        let logical_plan = state.create_logical_plan(sql).await?;
+        let logical_plan = state.optimize(&logical_plan)?;
+        let plan = DefaultPhysicalPlanner::default()
+            .create_physical_plan(&logical_plan, &state)
+            .await?;
+        Ok(format!("{}", displayable(plan.as_ref()).indent(false)))
+    }
+
+    #[tokio::test]
+    async fn smj_uses_left_descending_sort_options() -> Result<()> {
+        let descending = vec![col("a").sort(false, false)];
+        let ctx = smj_test_context(Some(descending), None)?;
+        let plan = smj_plan(
+            &ctx,
+            "SELECT * FROM left_table JOIN right_table ON left_table.a = right_table.a",
+        )
+        .await?;
+
+        insta::assert_snapshot!(plan, @r"
+        SortMergeJoinExec: join_type=Inner, on=[(a@0, a@0)]
+          DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 DESC NULLS LAST
+          SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
+            DataSourceExec: partitions=1, partition_sizes=[1]
+        ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn smj_defaults_to_ascending_when_left_is_unsorted() -> Result<()> {
+        let ctx = smj_test_context(None, None)?;
+        let plan = smj_plan(
+            &ctx,
+            "SELECT * FROM left_table JOIN right_table ON left_table.a = right_table.a",
+        )
+        .await?;
+
+        insta::assert_snapshot!(plan, @r"
+        SortMergeJoinExec: join_type=Inner, on=[(a@0, a@0)]
+          SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
+            DataSourceExec: partitions=1, partition_sizes=[1]
+          SortExec: expr=[a@0 ASC], preserve_partitioning=[false]
+            DataSourceExec: partitions=1, partition_sizes=[1]
+        ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn smj_defaults_only_unmatched_join_columns_to_ascending() -> Result<()> {
+        let descending = vec![col("a").sort(false, false)];
+        let ctx = smj_test_context(Some(descending), None)?;
+        let plan = smj_plan(
+            &ctx,
+            "SELECT * FROM left_table JOIN right_table \
+             ON left_table.a = right_table.a AND left_table.b = right_table.b",
+        )
+        .await?;
+
+        insta::assert_snapshot!(plan, @r"
+        SortMergeJoinExec: join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
+          SortExec: expr=[a@0 DESC NULLS LAST, b@1 ASC], preserve_partitioning=[false]
+            DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 DESC NULLS LAST
+          SortExec: expr=[a@0 DESC NULLS LAST, b@1 ASC], preserve_partitioning=[false]
+            DataSourceExec: partitions=1, partition_sizes=[1]
+        ");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn smj_reuses_matching_descending_order_on_both_sides() -> Result<()> {
+        let descending = vec![col("a").sort(false, false)];
+        let ctx = smj_test_context(Some(descending.clone()), Some(descending))?;
+        let plan = smj_plan(
+            &ctx,
+            "SELECT * FROM left_table JOIN right_table ON left_table.a = right_table.a",
+        )
+        .await?;
+
+        insta::assert_snapshot!(plan, @r"
+        SortMergeJoinExec: join_type=Inner, on=[(a@0, a@0)]
+          DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 DESC NULLS LAST
+          DataSourceExec: partitions=1, partition_sizes=[1], output_ordering=a@0 DESC NULLS LAST
+        ");
+        Ok(())
     }
 
     #[tokio::test]

@@ -746,12 +746,14 @@ impl ExecutionPlan for InterleaveExec {
                 ..Self::clone(&*self)
             })),
             ChildrenPropertiesMode::Recompute => {
-                // New children are no longer interleavable, which might be a bug of optimization rewrite.
-                assert_or_internal_err!(
-                    can_interleave(children.iter()),
-                    "Can not create InterleaveExec: new children can not be interleaved"
-                );
-                Ok(Arc::new(InterleaveExec::try_new(children)?))
+                if can_interleave(children.iter()) {
+                    Ok(Arc::new(InterleaveExec::try_new(children)?))
+                } else {
+                    // An optimizer can legitimately change child partitioning after
+                    // introducing InterleaveExec. UnionExec preserves correctness when
+                    // the rewritten children can no longer share output partitions.
+                    UnionExec::try_new(children)
+                }
             }
         }
     }
@@ -1761,6 +1763,40 @@ mod tests {
                 case.label
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn interleave_child_rewrite_falls_back_to_union() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+        let interleave: Arc<dyn ExecutionPlan> =
+            Arc::new(InterleaveExec::try_new(vec![
+                make_hash_exec(&schema, vec!["a"], 3)?,
+                make_hash_exec(&schema, vec!["a"], 3)?,
+            ])?);
+
+        let compatible = Arc::clone(&interleave).replace_children(
+            vec![
+                make_hash_exec(&schema, vec!["b"], 3)?,
+                make_hash_exec(&schema, vec!["b"], 3)?,
+            ],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
+        assert!(compatible.downcast_ref::<InterleaveExec>().is_some());
+        assert_eq!(compatible.output_partitioning().partition_count(), 3);
+
+        let incompatible = interleave.replace_children(
+            vec![
+                make_hash_exec(&schema, vec!["a"], 3)?,
+                make_hash_exec(&schema, vec!["b"], 3)?,
+            ],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
+        assert!(incompatible.downcast_ref::<UnionExec>().is_some());
+        assert_eq!(incompatible.output_partitioning().partition_count(), 6);
         Ok(())
     }
 
