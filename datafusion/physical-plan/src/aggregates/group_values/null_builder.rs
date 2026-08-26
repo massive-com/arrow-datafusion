@@ -78,16 +78,15 @@ impl MaybeNullBufferBuilder {
     pub fn build_preserving(
         &self,
         selection: GroupSelection<'_>,
-        total_num_values: usize,
     ) -> Result<Option<NullBuffer>> {
-        let selected_len = selection.len(total_num_values);
+        let selected_len = selection.len();
         if self.nulls.as_slice().is_none() {
             return Ok(None);
         }
 
-        debug_assert_eq!(self.nulls.len(), total_num_values);
+        debug_assert_eq!(self.nulls.len(), selection.total_num_groups());
         let mut selected = NullBufferBuilder::new(selected_len);
-        for index in selection.iter(total_num_values) {
+        for index in selection.iter() {
             selected.append(self.nulls.is_valid(index));
         }
         Ok(selected.finish())

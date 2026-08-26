@@ -266,10 +266,8 @@ impl GroupValues for GroupValuesRows {
             empty_rows = self.row_converter.empty_rows(0, 0);
             &empty_rows
         };
-        debug_assert!(selection.validate(group_values.num_rows()).is_ok());
-        let rows = selection
-            .iter(group_values.num_rows())
-            .map(|index| group_values.row(index));
+        selection.validate_num_groups(group_values.num_rows())?;
+        let rows = selection.iter().map(|index| group_values.row(index));
         let mut output = self.row_converter.convert_rows(rows)?;
 
         // TODO: Materialize dictionaries in group keys
@@ -467,7 +465,7 @@ mod tests {
         group_values.intern(&[input], &mut groups)?;
         assert_eq!(groups, vec![0, 1, 2, 0]);
 
-        let selection = GroupSelection::Indices(&[2, 0, 1, 2]);
+        let selection = GroupSelection::try_from_indices(&[2, 0, 1, 2], 3)?;
         let expected = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
             Some(vec![Some(3)]),
             Some(vec![Some(1), Some(2)]),

@@ -109,9 +109,9 @@ where
         &mut self,
         selection: GroupSelection<'_>,
     ) -> datafusion_common::Result<ArrayRef> {
-        debug_assert!(selection.validate(self.counts.len()).is_ok());
+        selection.validate_num_groups(self.counts.len())?;
         let counts = selection
-            .iter(self.counts.len())
+            .iter()
             .map(|index| self.counts[index])
             .collect::<Vec<_>>();
         Ok(Arc::new(Int64Array::from(counts)))

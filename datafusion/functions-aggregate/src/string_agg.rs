@@ -406,10 +406,8 @@ impl GroupsAccumulator for StringAggGroupsAccumulator {
     }
 
     fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        debug_assert!(selection.validate(self.values.len()).is_ok());
-        let values = selection
-            .iter(self.values.len())
-            .map(|index| self.values[index].as_deref());
+        selection.validate_num_groups(self.values.len())?;
+        let values = selection.iter().map(|index| self.values[index].as_deref());
         Ok(Arc::new(LargeStringArray::from_iter(values)))
     }
 

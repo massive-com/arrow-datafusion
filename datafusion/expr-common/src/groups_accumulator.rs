@@ -53,49 +53,83 @@ impl EmitTo {
 /// Selects groups for a non-destructive grouped aggregation read.
 ///
 /// Unlike [`EmitTo`], this selection does not remove groups or change their
-/// indices. [`Self::Indices`] preserves the requested order and supports
-/// duplicate indices.
+/// indices. Selections created by [`Self::try_from_indices`] preserve the
+/// requested order and support duplicate indices.
 ///
-/// Indices are trusted to be valid by preserving read APIs. Call
-/// [`Self::validate`] first when they do not come from a source that guarantees
-/// they are in bounds.
+/// A selection is validated once when it is constructed and can then be reused
+/// for the group values and accumulators participating in the same snapshot.
+/// Construct a new selection if the number or indexing of those groups changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupSelection<'a> {
-    /// Select all groups in group-index order.
-    All,
-    /// Select groups in the order specified by their group indices.
-    Indices(&'a [usize]),
+pub struct GroupSelection<'a> {
+    total_num_groups: usize,
+    indices: Option<&'a [usize]>,
 }
 
 impl<'a> GroupSelection<'a> {
-    /// Validates that every selected index is less than `total_num_groups`.
+    /// Selects all `total_num_groups` groups in group-index order.
+    pub fn all(total_num_groups: usize) -> Self {
+        Self {
+            total_num_groups,
+            indices: None,
+        }
+    }
+
+    /// Selects groups in the order specified by `indices`.
     ///
-    /// [`Self::len`] and [`Self::iter`] do not call this method implicitly.
-    pub fn validate(&self, total_num_groups: usize) -> Result<()> {
-        if let Self::Indices(indices) = self
-            && let Some(index) = indices.iter().find(|&&index| index >= total_num_groups)
-        {
+    /// Returns an error if an index is not less than `total_num_groups`. Empty
+    /// selections are valid, and duplicate indices are preserved.
+    pub fn try_from_indices(
+        indices: &'a [usize],
+        total_num_groups: usize,
+    ) -> Result<Self> {
+        if let Some(index) = indices.iter().find(|&&index| index >= total_num_groups) {
             return exec_err!(
                 "Group index {index} is out of bounds for {total_num_groups} groups"
+            );
+        }
+        Ok(Self {
+            total_num_groups,
+            indices: Some(indices),
+        })
+    }
+
+    /// Returns the group count against which this selection was constructed.
+    pub fn total_num_groups(self) -> usize {
+        self.total_num_groups
+    }
+
+    /// Ensures this selection is being applied to the same number of groups
+    /// against which it was constructed.
+    ///
+    /// Preserving-read implementations should call this method with their
+    /// stored group count before using [`Self::iter`]. This check is `O(1)`;
+    /// the selected indices were already checked by [`Self::try_from_indices`].
+    pub fn validate_num_groups(self, actual_num_groups: usize) -> Result<()> {
+        if actual_num_groups != self.total_num_groups {
+            return exec_err!(
+                "Group selection was constructed for {} groups but applied to {actual_num_groups} groups",
+                self.total_num_groups
             );
         }
         Ok(())
     }
 
-    /// Returns the number of selected groups without validating the selection.
-    pub fn len(&self, total_num_groups: usize) -> usize {
-        match self {
-            Self::All => total_num_groups,
-            Self::Indices(indices) => indices.len(),
-        }
+    /// Returns the number of selected groups.
+    pub fn len(self) -> usize {
+        self.indices
+            .map_or(self.total_num_groups, |indices| indices.len())
     }
 
-    /// Returns the selected group indices in output order without validating
-    /// the selection.
-    pub fn iter(self, total_num_groups: usize) -> impl Iterator<Item = usize> + 'a {
-        let (all, indices): (_, &'a [usize]) = match self {
-            Self::All => (0..total_num_groups, &[]),
-            Self::Indices(indices) => (0..0, indices),
+    /// Returns `true` if no groups are selected.
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the selected group indices in output order.
+    pub fn iter(self) -> impl Iterator<Item = usize> + 'a {
+        let (all, indices): (_, &'a [usize]) = match self.indices {
+            None => (0..self.total_num_groups, &[]),
+            Some(indices) => (0..0, indices),
         };
         all.chain(indices.iter().copied())
     }
@@ -208,13 +242,12 @@ pub trait GroupsAccumulator: Send + std::any::Any {
     /// Returns final aggregate values without changing the logical state or
     /// group indices.
     ///
-    /// Rows are returned in the order specified by `selection`. Implementations
-    /// may mutate internal caches or builders, but repeated calls and later
-    /// updates must observe the same logical accumulator state.
+    /// Rows are returned in the order specified by `selection`. An empty
+    /// selection returns a correctly typed array with no rows.
     ///
-    /// Every index in [`GroupSelection::Indices`] must refer to an existing
-    /// group. Call [`GroupSelection::validate`] first if this is not guaranteed
-    /// by the source of the indices. Invalid indices may cause a panic.
+    /// This method requires exclusive access because implementations may mutate
+    /// internal caches or builders. However, repeated calls and later updates
+    /// must observe the same logical accumulator state.
     fn evaluate_preserving(
         &mut self,
         _selection: GroupSelection<'_>,
@@ -249,11 +282,12 @@ pub trait GroupsAccumulator: Send + std::any::Any {
     /// or group indices.
     ///
     /// Each returned array has one row per selected group, in the order
-    /// specified by `selection`.
+    /// specified by `selection`. An empty selection returns the normal number
+    /// of correctly typed state arrays, each with no rows.
     ///
-    /// Every index in [`GroupSelection::Indices`] must refer to an existing
-    /// group. Call [`GroupSelection::validate`] first if this is not guaranteed
-    /// by the source of the indices. Invalid indices may cause a panic.
+    /// This method requires exclusive access because implementations may mutate
+    /// internal caches or builders. However, repeated calls and later updates
+    /// must observe the same logical accumulator state.
     fn state_preserving(
         &mut self,
         _selection: GroupSelection<'_>,
@@ -389,24 +423,34 @@ mod tests {
     }
 
     #[test]
-    fn group_selection_order_duplicates_and_explicit_validation() {
+    fn group_selection_is_validated_once_and_reusable() {
         let values = [10, 20, 30, 40];
-        let selected = GroupSelection::Indices(&[3, 1, 3])
-            .iter(values.len())
-            .map(|index| values[index])
-            .collect::<Vec<_>>();
-        assert_eq!(selected, vec![40, 20, 40]);
+        let selected =
+            GroupSelection::try_from_indices(&[3, 1, 3], values.len()).unwrap();
+        assert_eq!(selected.total_num_groups(), values.len());
+        assert_eq!(selected.len(), 3);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|index| values[index])
+                .collect::<Vec<_>>(),
+            vec![40, 20, 40]
+        );
+        selected.validate_num_groups(values.len()).unwrap();
+        let error = selected.validate_num_groups(values.len() - 1).unwrap_err();
+        assert!(error.to_string().contains("constructed for 4 groups"));
 
-        let selected = GroupSelection::All
-            .iter(values.len())
-            .map(|index| values[index])
-            .collect::<Vec<_>>();
-        assert_eq!(selected, values);
+        let all = GroupSelection::all(values.len());
+        assert_eq!(
+            all.iter().map(|index| values[index]).collect::<Vec<_>>(),
+            values
+        );
 
-        let invalid = GroupSelection::Indices(&[4]);
-        assert_eq!(invalid.len(values.len()), 1);
-        assert_eq!(invalid.iter(values.len()).collect::<Vec<_>>(), vec![4]);
-        let error = invalid.validate(values.len()).unwrap_err();
+        let empty = GroupSelection::try_from_indices(&[], values.len()).unwrap();
+        assert!(empty.is_empty());
+        assert!(empty.iter().next().is_none());
+
+        let error = GroupSelection::try_from_indices(&[4], values.len()).unwrap_err();
         assert!(error.to_string().contains("out of bounds"));
     }
 }

@@ -127,14 +127,12 @@ where
     }
 
     fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        debug_assert!(selection.validate(self.values.len()).is_ok());
-        let mut values = BooleanBufferBuilder::new(selection.len(self.values.len()));
-        for index in selection.iter(self.values.len()) {
+        selection.validate_num_groups(self.values.len())?;
+        let mut values = BooleanBufferBuilder::new(selection.len());
+        for index in selection.iter() {
             values.append(self.values.get_bit(index));
         }
-        let nulls = self
-            .null_state
-            .build_preserving(selection, self.values.len())?;
+        let nulls = self.null_state.build_preserving(selection)?;
         Ok(Arc::new(BooleanArray::new(values.finish(), nulls)))
     }
 

@@ -137,10 +137,10 @@ impl GroupsAccumulator for MinMaxStructAccumulator {
 
     fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
         let num_groups = self.inner.min_max.len();
-        debug_assert!(selection.validate(num_groups).is_ok());
-        let num_values = selection.len(num_groups);
+        selection.validate_num_groups(num_groups)?;
+        let num_values = selection.len();
         let min_maxes = selection
-            .iter(num_groups)
+            .iter()
             .map(|index| self.inner.min_max[index].as_ref());
         self.build_array(min_maxes, num_values)
     }

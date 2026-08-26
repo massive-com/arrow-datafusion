@@ -150,10 +150,10 @@ impl GroupValues for GroupValuesBoolean {
         selection: GroupSelection<'_>,
     ) -> Result<Vec<ArrayRef>> {
         let num_groups = self.len();
-        debug_assert!(selection.validate(num_groups).is_ok());
-        let mut values = BooleanBufferBuilder::new(selection.len(num_groups));
-        let mut nulls = NullBufferBuilder::new(selection.len(num_groups));
-        for index in selection.iter(num_groups) {
+        selection.validate_num_groups(num_groups)?;
+        let mut values = BooleanBufferBuilder::new(selection.len());
+        let mut nulls = NullBufferBuilder::new(selection.len());
+        for index in selection.iter() {
             if self.null_group == Some(index) {
                 values.append(false);
                 nulls.append_null();

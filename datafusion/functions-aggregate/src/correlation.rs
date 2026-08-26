@@ -306,10 +306,8 @@ pub struct CorrelationGroupsAccumulator {
 }
 
 fn copy_selected<T: Copy>(selection: GroupSelection<'_>, values: &[T]) -> Vec<T> {
-    selection
-        .iter(values.len())
-        .map(|index| values[index])
-        .collect()
+    debug_assert_eq!(selection.total_num_groups(), values.len());
+    selection.iter().map(|index| values[index]).collect()
 }
 
 impl CorrelationGroupsAccumulator {
@@ -477,7 +475,7 @@ impl GroupsAccumulator for CorrelationGroupsAccumulator {
     }
 
     fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        debug_assert!(selection.validate(self.count.len()).is_ok());
+        selection.validate_num_groups(self.count.len())?;
         Ok(Self::evaluate_values(
             &copy_selected(selection, &self.count),
             &copy_selected(selection, &self.sum_x),
@@ -565,7 +563,7 @@ impl GroupsAccumulator for CorrelationGroupsAccumulator {
         &mut self,
         selection: GroupSelection<'_>,
     ) -> Result<Vec<ArrayRef>> {
-        debug_assert!(selection.validate(self.count.len()).is_ok());
+        selection.validate_num_groups(self.count.len())?;
         Ok(vec![
             Arc::new(UInt64Array::from(copy_selected(selection, &self.count))),
             Arc::new(Float64Array::from(copy_selected(selection, &self.sum_x))),

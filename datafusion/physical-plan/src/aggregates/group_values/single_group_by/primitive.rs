@@ -243,14 +243,12 @@ where
         &mut self,
         selection: GroupSelection<'_>,
     ) -> Result<Vec<ArrayRef>> {
-        debug_assert!(selection.validate(self.values.len()).is_ok());
-        let values: Vec<T::Native> = selection
-            .iter(self.values.len())
-            .map(|index| self.values[index])
-            .collect();
+        selection.validate_num_groups(self.values.len())?;
+        let values: Vec<T::Native> =
+            selection.iter().map(|index| self.values[index]).collect();
         let nulls = if let Some(null_group) = self.null_group {
             let mut nulls = NullBufferBuilder::new(values.len());
-            for index in selection.iter(self.values.len()) {
+            for index in selection.iter() {
                 if index == null_group {
                     nulls.append_null();
                 } else {

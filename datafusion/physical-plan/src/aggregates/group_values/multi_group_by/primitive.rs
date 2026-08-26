@@ -280,13 +280,12 @@ where
     }
 
     fn values_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        selection.validate_num_groups(self.group_values.len())?;
         let values: Vec<T::Native> = selection
-            .iter(self.group_values.len())
+            .iter()
             .map(|index| self.group_values[index])
             .collect();
-        let nulls = self
-            .nulls
-            .build_preserving(selection, self.group_values.len())?;
+        let nulls = self.nulls.build_preserving(selection)?;
         Ok(Arc::new(
             PrimitiveArray::<T>::new(ScalarBuffer::from(values), nulls)
                 .with_data_type(self.data_type.clone()),

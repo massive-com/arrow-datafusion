@@ -226,11 +226,11 @@ impl GroupColumn for FixedSizeBinaryGroupValueBuilder {
     }
 
     fn values_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        debug_assert!(selection.validate(self.len).is_ok());
-        let len = selection.len(self.len);
+        selection.validate_num_groups(self.len)?;
+        let len = selection.len();
         let mut values = Vec::with_capacity(len * self.byte_width);
         let mut nulls = MaybeNullBufferBuilder::new();
-        for index in selection.iter(self.len) {
+        for index in selection.iter() {
             nulls.append(self.nulls.is_null(index));
             values.extend_from_slice(self.value(index));
         }
@@ -503,7 +503,9 @@ mod tests {
         builder.vectorized_append(&input, &[0, 1, 2]).unwrap();
 
         let output = builder
-            .values_preserving(GroupSelection::Indices(&[2, 0, 1, 2]))
+            .values_preserving(
+                GroupSelection::try_from_indices(&[2, 0, 1, 2], 3).unwrap(),
+            )
             .unwrap();
         let expected = make_array(
             vec![

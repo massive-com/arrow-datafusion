@@ -116,11 +116,11 @@ pub trait GroupValues: Send {
     /// Materializes selected group values without changing the stored values or
     /// their group indices.
     ///
-    /// Rows are returned in the order specified by `selection`.
+    /// Rows are returned in the order specified by `selection`. An empty
+    /// selection returns one correctly typed empty array per group-value column.
     ///
-    /// Every index in [`GroupSelection::Indices`] must refer to an existing
-    /// group. Call [`GroupSelection::validate`] first if this is not guaranteed
-    /// by the source of the indices. Invalid indices may cause a panic.
+    /// This method requires exclusive access because implementations may mutate
+    /// internal caches or builders, even though stored values are unchanged.
     fn values_preserving(
         &mut self,
         _selection: GroupSelection<'_>,
@@ -265,12 +265,22 @@ mod tests {
         group_values.intern(&[input], &mut groups).unwrap();
         assert_eq!(groups, vec![0, 1, 0, 2, 3]);
 
-        let selection = GroupSelection::Indices(&[3, 0, 2, 0]);
+        let selection =
+            GroupSelection::try_from_indices(&[3, 0, 2, 0], group_values.len()).unwrap();
         let expected = Int32Array::from(vec![Some(30), Some(10), None, Some(10)]);
         for _ in 0..2 {
             let actual = group_values.values_preserving(selection).unwrap();
             assert_eq!(actual[0].as_primitive::<Int32Type>(), &expected);
         }
+
+        let empty = group_values
+            .values_preserving(
+                GroupSelection::try_from_indices(&[], group_values.len()).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].data_type(), &DataType::Int32);
+        assert!(empty[0].is_empty());
 
         let input =
             Arc::new(Int32Array::from(vec![Some(20), Some(40), None])) as ArrayRef;
@@ -279,12 +289,13 @@ mod tests {
 
         let expected =
             Int32Array::from(vec![Some(10), Some(20), None, Some(30), Some(40)]);
-        let actual = group_values.values_preserving(GroupSelection::All).unwrap();
+        let actual = group_values
+            .values_preserving(GroupSelection::all(group_values.len()))
+            .unwrap();
         assert_eq!(actual[0].as_primitive::<Int32Type>(), &expected);
 
-        let error = GroupSelection::Indices(&[5])
-            .validate(group_values.len())
-            .unwrap_err();
+        let error =
+            GroupSelection::try_from_indices(&[5], group_values.len()).unwrap_err();
         assert!(error.to_string().contains("out of bounds"));
 
         let actual = group_values.emit(EmitTo::All).unwrap();
@@ -321,7 +332,9 @@ mod tests {
             assert_eq!(groups, vec![0, 1, 2, 0]);
 
             let selected = group_values
-                .values_preserving(GroupSelection::Indices(&[2, 1, 0, 2]))
+                .values_preserving(
+                    GroupSelection::try_from_indices(&[2, 1, 0, 2], 3).unwrap(),
+                )
                 .unwrap();
             let expected = vec![
                 Some("a long value that is not inline"),

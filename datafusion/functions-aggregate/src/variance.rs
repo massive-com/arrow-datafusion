@@ -511,15 +511,11 @@ impl VarianceGroupsAccumulator {
         &self,
         selection: GroupSelection<'_>,
     ) -> Result<(Vec<f64>, NullBuffer)> {
-        debug_assert!(selection.validate(self.counts.len()).is_ok());
-        let counts = selection
-            .iter(self.counts.len())
-            .map(|index| self.counts[index])
-            .collect();
-        let m2s = selection
-            .iter(self.m2s.len())
-            .map(|index| self.m2s[index])
-            .collect();
+        debug_assert_eq!(self.counts.len(), self.means.len());
+        debug_assert_eq!(self.counts.len(), self.m2s.len());
+        selection.validate_num_groups(self.counts.len())?;
+        let counts = selection.iter().map(|index| self.counts[index]).collect();
+        let m2s = selection.iter().map(|index| self.m2s[index]).collect();
         Ok(self.variance_values(counts, m2s))
     }
 }
@@ -653,17 +649,19 @@ impl GroupsAccumulator for VarianceGroupsAccumulator {
         &mut self,
         selection: GroupSelection<'_>,
     ) -> Result<Vec<ArrayRef>> {
-        debug_assert!(selection.validate(self.counts.len()).is_ok());
+        debug_assert_eq!(self.counts.len(), self.means.len());
+        debug_assert_eq!(self.counts.len(), self.m2s.len());
+        selection.validate_num_groups(self.counts.len())?;
         let counts = selection
-            .iter(self.counts.len())
+            .iter()
             .map(|index| self.counts[index])
             .collect::<Vec<_>>();
         let means = selection
-            .iter(self.means.len())
+            .iter()
             .map(|index| self.means[index])
             .collect::<Vec<_>>();
         let m2s = selection
-            .iter(self.m2s.len())
+            .iter()
             .map(|index| self.m2s[index])
             .collect::<Vec<_>>();
         Ok(vec![

@@ -1060,18 +1060,11 @@ where
     }
 
     fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        debug_assert!(selection.validate(self.counts.len()).is_ok());
-        let counts = selection
-            .iter(self.counts.len())
-            .map(|index| self.counts[index])
-            .collect();
-        let sums = selection
-            .iter(self.sums.len())
-            .map(|index| self.sums[index])
-            .collect();
-        let nulls = self
-            .null_state
-            .build_preserving(selection, self.sums.len())?;
+        debug_assert_eq!(self.counts.len(), self.sums.len());
+        selection.validate_num_groups(self.counts.len())?;
+        let counts = selection.iter().map(|index| self.counts[index]).collect();
+        let sums = selection.iter().map(|index| self.sums[index]).collect();
+        let nulls = self.null_state.build_preserving(selection)?;
         self.evaluate_values(counts, sums, nulls)
     }
 
@@ -1091,18 +1084,11 @@ where
         &mut self,
         selection: GroupSelection<'_>,
     ) -> Result<Vec<ArrayRef>> {
-        debug_assert!(selection.validate(self.counts.len()).is_ok());
-        let counts = selection
-            .iter(self.counts.len())
-            .map(|index| self.counts[index])
-            .collect();
-        let sums = selection
-            .iter(self.sums.len())
-            .map(|index| self.sums[index])
-            .collect();
-        let nulls = self
-            .null_state
-            .build_preserving(selection, self.sums.len())?;
+        debug_assert_eq!(self.counts.len(), self.sums.len());
+        selection.validate_num_groups(self.counts.len())?;
+        let counts = selection.iter().map(|index| self.counts[index]).collect();
+        let sums = selection.iter().map(|index| self.sums[index]).collect();
+        let nulls = self.null_state.build_preserving(selection)?;
         Ok(self.state_values(counts, sums, nulls))
     }
 
@@ -1464,7 +1450,7 @@ mod tests {
         ]));
         accumulator.update_batch(&[values], &[0, 0, 1, 2], None, 4)?;
 
-        let selection = GroupSelection::Indices(&[2, 0, 3, 2]);
+        let selection = GroupSelection::try_from_indices(&[2, 0, 3, 2], 4)?;
         let expected = Float64Array::from(vec![Some(8.0), Some(3.0), None, Some(8.0)]);
         for _ in 0..2 {
             assert_eq!(
@@ -1491,7 +1477,7 @@ mod tests {
             Float64Array::from(vec![Some(3.0), Some(10.0), Some(8.0), Some(6.0)]);
         assert_eq!(
             accumulator
-                .evaluate_preserving(GroupSelection::All)?
+                .evaluate_preserving(GroupSelection::all(4))?
                 .as_primitive::<Float64Type>(),
             &expected
         );

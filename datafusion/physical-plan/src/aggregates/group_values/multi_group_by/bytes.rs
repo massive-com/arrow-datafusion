@@ -375,13 +375,13 @@ where
     }
 
     fn values_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        let selected_len = selection.len(self.len());
+        selection.validate_num_groups(self.len())?;
         let mut buffer = BufferBuilder::<u8>::new(0);
-        let mut offsets = Vec::with_capacity(selected_len + 1);
+        let mut offsets = Vec::with_capacity(selection.len() + 1);
         let mut nulls = MaybeNullBufferBuilder::new();
         offsets.push(O::default());
 
-        for index in selection.iter(self.len()) {
+        for index in selection.iter() {
             let is_null = self.nulls.is_null(index);
             nulls.append(is_null);
             if !is_null {

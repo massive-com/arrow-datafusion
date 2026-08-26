@@ -179,11 +179,12 @@ impl<const NULLABLE: bool> GroupColumn for BooleanGroupValueBuilder<NULLABLE> {
     }
 
     fn values_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        let mut values = BooleanBufferBuilder::new(selection.len(self.buffer.len()));
-        for index in selection.iter(self.buffer.len()) {
+        selection.validate_num_groups(self.buffer.len())?;
+        let mut values = BooleanBufferBuilder::new(selection.len());
+        for index in selection.iter() {
             values.append(self.buffer.get_bit(index));
         }
-        let nulls = self.nulls.build_preserving(selection, self.buffer.len())?;
+        let nulls = self.nulls.build_preserving(selection)?;
         Ok(Arc::new(BooleanArray::new(values.finish(), nulls)))
     }
 

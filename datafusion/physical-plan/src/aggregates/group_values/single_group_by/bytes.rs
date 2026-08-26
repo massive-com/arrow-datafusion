@@ -124,8 +124,8 @@ impl<O: OffsetSizeTrait> GroupValues for GroupValuesBytes<O> {
         &mut self,
         selection: GroupSelection<'_>,
     ) -> Result<Vec<ArrayRef>> {
-        debug_assert!(selection.validate(self.len()).is_ok());
-        Ok(vec![self.map.keys(selection.iter(self.len()))?])
+        selection.validate_num_groups(self.len())?;
+        Ok(vec![self.map.keys(selection.iter())?])
     }
 
     fn supports_values_preserving(&self) -> bool {

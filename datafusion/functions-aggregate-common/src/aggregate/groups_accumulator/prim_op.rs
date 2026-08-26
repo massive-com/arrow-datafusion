@@ -126,14 +126,10 @@ where
     }
 
     fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        debug_assert!(selection.validate(self.values.len()).is_ok());
-        let values: Vec<T::Native> = selection
-            .iter(self.values.len())
-            .map(|index| self.values[index])
-            .collect();
-        let nulls = self
-            .null_state
-            .build_preserving(selection, self.values.len())?;
+        selection.validate_num_groups(self.values.len())?;
+        let values: Vec<T::Native> =
+            selection.iter().map(|index| self.values[index]).collect();
+        let nulls = self.null_state.build_preserving(selection)?;
         let values = PrimitiveArray::<T>::new(values.into(), nulls)
             .with_data_type(self.data_type.clone());
         Ok(Arc::new(values))
@@ -240,7 +236,7 @@ mod tests {
         let values = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
         accumulator.update_batch(&[values], &[0, 1, 2], None, 4)?;
 
-        let selection = GroupSelection::Indices(&[3, 0, 1, 1]);
+        let selection = GroupSelection::try_from_indices(&[3, 0, 1, 1], 4)?;
         let expected = Int64Array::from(vec![None, Some(1), None, None]);
         for _ in 0..2 {
             let actual = accumulator.evaluate_preserving(selection)?;
@@ -253,7 +249,7 @@ mod tests {
         let values = Arc::new(Int64Array::from(vec![5, 7]));
         accumulator.update_batch(&[values], &[1, 3], None, 4)?;
         let expected = Int64Array::from(vec![Some(1), Some(5), Some(3), Some(7)]);
-        let actual = accumulator.evaluate_preserving(GroupSelection::All)?;
+        let actual = accumulator.evaluate_preserving(GroupSelection::all(4))?;
         assert_eq!(actual.as_primitive::<Int64Type>(), &expected);
 
         // A destructive read still sees all state after preserving reads.

@@ -110,8 +110,7 @@ pub trait GroupColumn: Send + Sync {
     fn build(self: Box<Self>) -> ArrayRef;
 
     /// Builds a new array from selected stored rows without changing this
-    /// column. Rows are returned in selection order. The caller must ensure all
-    /// selected indices are in bounds.
+    /// column. Rows are returned in selection order.
     fn values_preserving(&self, _selection: GroupSelection<'_>) -> Result<ArrayRef> {
         not_impl_err!("Preserving group column values are not implemented")
     }
@@ -1296,7 +1295,7 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         &mut self,
         selection: GroupSelection<'_>,
     ) -> Result<Vec<ArrayRef>> {
-        debug_assert!(selection.validate(self.len()).is_ok());
+        selection.validate_num_groups(self.len())?;
         if self.group_values.is_empty() {
             return Ok(self
                 .schema
@@ -2032,9 +2031,9 @@ mod tests {
         data_set.load_to_group_values(&mut group_values);
 
         let selection = [16, 0, 4, 0];
-        let actual = group_values
-            .values_preserving(GroupSelection::Indices(&selection))
-            .unwrap();
+        let group_selection =
+            GroupSelection::try_from_indices(&selection, group_values.len()).unwrap();
+        let actual = group_values.values_preserving(group_selection).unwrap();
         let indices = UInt32Array::from_iter_values(selection.map(|index| index as u32));
         let mut destructive_group_values =
             GroupValuesColumn::<false>::try_new(data_set.schema()).unwrap();
@@ -2049,9 +2048,7 @@ mod tests {
         assert_eq!(actual, expected);
 
         // A repeated preserving read returns the same rows and leaves all groups.
-        let repeated = group_values
-            .values_preserving(GroupSelection::Indices(&selection))
-            .unwrap();
+        let repeated = group_values.values_preserving(group_selection).unwrap();
         assert_eq!(
             RecordBatch::try_new(data_set.schema(), repeated).unwrap(),
             expected

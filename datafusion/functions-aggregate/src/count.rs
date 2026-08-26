@@ -708,9 +708,9 @@ impl GroupsAccumulator for CountGroupsAccumulator {
     }
 
     fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        debug_assert!(selection.validate(self.counts.len()).is_ok());
+        selection.validate_num_groups(self.counts.len())?;
         let counts = selection
-            .iter(self.counts.len())
+            .iter()
             .map(|index| self.counts[index])
             .collect::<Vec<_>>();
         Ok(Arc::new(Int64Array::from(counts)))
@@ -988,7 +988,7 @@ mod tests {
         let values = Arc::new(Int32Array::from(vec![Some(1), None, Some(2), Some(3)]));
         accumulator.update_batch(&[values], &[0, 1, 0, 2], None, 4)?;
 
-        let selection = GroupSelection::Indices(&[2, 0, 3, 2]);
+        let selection = GroupSelection::try_from_indices(&[2, 0, 3, 2], 4)?;
         let expected = Int64Array::from(vec![1, 2, 0, 1]);
         assert_eq!(
             accumulator
@@ -1006,7 +1006,9 @@ mod tests {
         let expected = Int64Array::from(vec![2, 0, 1, 1]);
         assert_eq!(
             accumulator
-                .evaluate_preserving(GroupSelection::Indices(&[0, 1, 2, 3]))?
+                .evaluate_preserving(
+                    GroupSelection::try_from_indices(&[0, 1, 2, 3], 4,)?
+                )?
                 .as_primitive::<Int64Type>(),
             &expected
         );

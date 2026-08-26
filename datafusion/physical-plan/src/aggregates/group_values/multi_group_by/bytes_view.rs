@@ -349,8 +349,9 @@ impl<B: ByteViewType> ByteViewGroupValueBuilder<B> {
     }
 
     fn values_preserving_inner(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        selection.validate_num_groups(self.len())?;
         let mut selected = Self::new().with_max_block_size(self.max_block_size);
-        for index in selection.iter(self.len()) {
+        for index in selection.iter() {
             let is_null = self.nulls.is_null(index);
             selected.nulls.append(is_null);
             if is_null {

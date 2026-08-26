@@ -306,14 +306,14 @@ impl GroupsAccumulator for MinMaxBytesAccumulator {
 
     fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
         let num_groups = self.inner.min_max.len();
-        debug_assert!(selection.validate(num_groups).is_ok());
-        let num_values = selection.len(num_groups);
+        selection.validate_num_groups(num_groups)?;
+        let num_values = selection.len();
         let data_capacity = selection
-            .iter(num_groups)
+            .iter()
             .filter_map(|index| self.inner.min_max[index].as_ref().map(Vec::len))
             .sum();
         let min_maxes = selection
-            .iter(num_groups)
+            .iter()
             .map(|index| self.inner.min_max[index].as_deref());
         self.build_array(min_maxes, num_values, data_capacity)
     }
@@ -556,7 +556,7 @@ mod tests {
         ]));
         accumulator.update_batch(&[values], &[0, 0, 1, 2, 2, 3], None, 4)?;
 
-        let selection = GroupSelection::Indices(&[3, 0, 1, 2, 3]);
+        let selection = GroupSelection::try_from_indices(&[3, 0, 1, 2, 3], 4)?;
         let expected =
             StringArray::from(vec![Some("x"), Some("b"), None, Some("a"), Some("x")]);
         for _ in 0..2 {
@@ -573,7 +573,7 @@ mod tests {
         let expected = StringArray::from(vec![Some("aa"), None, Some("a"), Some("w")]);
         assert_eq!(
             accumulator
-                .evaluate_preserving(GroupSelection::All)?
+                .evaluate_preserving(GroupSelection::all(4))?
                 .as_string::<i32>(),
             &expected
         );

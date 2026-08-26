@@ -338,8 +338,8 @@ impl GroupsAccumulator for GroupsAccumulatorAdapter {
     }
 
     fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        debug_assert!(selection.validate(self.states.len()).is_ok());
-        let selected_len = selection.len(self.states.len());
+        selection.validate_num_groups(self.states.len())?;
+        let selected_len = selection.len();
         if selected_len == 0 {
             // ScalarValue::iter_to_array needs at least one value to infer the
             // output type, so evaluate a temporary empty accumulator.
@@ -348,7 +348,7 @@ impl GroupsAccumulator for GroupsAccumulatorAdapter {
         }
 
         let mut results = Vec::with_capacity(selected_len);
-        for group_index in selection.iter(self.states.len()) {
+        for group_index in selection.iter() {
             let (result, size_pre, size_post) = {
                 let state = &mut self.states[group_index];
                 let size_pre = state.size();

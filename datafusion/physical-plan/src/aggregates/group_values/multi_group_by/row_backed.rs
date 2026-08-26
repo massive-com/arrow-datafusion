@@ -296,10 +296,8 @@ impl GroupColumn for RowsGroupColumn {
     }
 
     fn values_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        debug_assert!(selection.validate(self.group_values.num_rows()).is_ok());
-        let rows = selection
-            .iter(self.group_values.num_rows())
-            .map(|index| self.group_values.row(index));
+        selection.validate_num_groups(self.group_values.num_rows())?;
+        let rows = selection.iter().map(|index| self.group_values.row(index));
         Ok(self.rows_to_array(rows))
     }
 
@@ -575,7 +573,7 @@ mod tests {
         col.vectorized_append(&input, &[0, 1]).unwrap();
 
         let output = col
-            .values_preserving(GroupSelection::Indices(&[1, 0, 1]))
+            .values_preserving(GroupSelection::try_from_indices(&[1, 0, 1], 2).unwrap())
             .unwrap();
         let output = output.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(
