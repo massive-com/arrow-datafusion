@@ -111,9 +111,7 @@ pub trait GroupColumn: Send + Sync {
 
     /// Builds a new array from selected stored rows without changing this
     /// column. Rows are returned in selection order.
-    fn values_preserving(&self, _selection: GroupSelection<'_>) -> Result<ArrayRef> {
-        not_impl_err!("Preserving group column values are not implemented")
-    }
+    fn values_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef>;
 
     /// Builds a new array from the first `n` stored rows, shifting the
     /// remaining rows to the start of the builder
