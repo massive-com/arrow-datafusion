@@ -529,3 +529,51 @@ pub(crate) fn slice_and_maybe_filter(
         Ok(sliced_arrays)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::min_max::MaxAccumulator;
+    use arrow::array::{AsArray, Int64Array};
+    use arrow::datatypes::{DataType, Int64Type};
+
+    #[test]
+    fn adapter_preserving_evaluation_uses_accumulator_contract() -> Result<()> {
+        let mut accumulator = GroupsAccumulatorAdapter::new(|| {
+            Ok(Box::new(MaxAccumulator::try_new(&DataType::Int64)?)
+                as Box<dyn Accumulator>)
+        });
+        let values = Arc::new(Int64Array::from(vec![Some(1), Some(5), Some(2), None]));
+        accumulator.update_batch(&[values], &[0, 0, 1, 2], None, 4)?;
+
+        let selection = GroupSelection::try_from_indices(&[1, 0, 3, 1], 4)?;
+        let expected = Int64Array::from(vec![Some(2), Some(5), None, Some(2)]);
+        for _ in 0..2 {
+            assert_eq!(
+                accumulator
+                    .evaluate_preserving(selection)?
+                    .as_primitive::<Int64Type>(),
+                &expected
+            );
+        }
+
+        let empty =
+            accumulator.evaluate_preserving(GroupSelection::try_from_indices(&[], 4)?)?;
+        assert_eq!(empty.data_type(), &DataType::Int64);
+        assert!(empty.is_empty());
+
+        let values = Arc::new(Int64Array::from(vec![7, 4, 9]));
+        accumulator.update_batch(&[values], &[0, 2, 3], None, 4)?;
+        assert_eq!(
+            accumulator
+                .evaluate_preserving(GroupSelection::all(4))?
+                .as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![Some(7), Some(2), Some(4), Some(9)])
+        );
+        assert!(accumulator.supports_evaluate_preserving());
+        assert!(!accumulator.supports_state_preserving());
+        Ok(())
+    }
+}

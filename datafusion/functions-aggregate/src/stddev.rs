@@ -387,6 +387,38 @@ mod tests {
     use datafusion_physical_expr::expressions::col;
 
     #[test]
+    fn stddev_groups_preserving_reads() -> Result<()> {
+        let mut accumulator = StddevGroupsAccumulator::new(StatsType::Population);
+        let values = Arc::new(Float64Array::from(vec![1.0, 3.0, 2.0, 2.0, 6.0]));
+        accumulator.update_batch(&[values], &[0, 0, 1, 2, 2], None, 4)?;
+
+        let selection = GroupSelection::try_from_indices(&[2, 0, 3, 2], 4)?;
+        let expected = Float64Array::from(vec![Some(2.0), Some(1.0), None, Some(2.0)]);
+        for _ in 0..2 {
+            assert_eq!(
+                accumulator
+                    .evaluate_preserving(selection)?
+                    .as_primitive::<Float64Type>(),
+                &expected
+            );
+            assert_eq!(
+                accumulator.state_preserving(selection)?[0].as_primitive::<UInt64Type>(),
+                &UInt64Array::from(vec![2, 2, 0, 2])
+            );
+        }
+
+        let values = Arc::new(Float64Array::from(vec![4.0, 5.0, 7.0]));
+        accumulator.update_batch(&[values], &[1, 3, 3], None, 4)?;
+        assert_eq!(
+            accumulator
+                .evaluate_preserving(GroupSelection::all(4))?
+                .as_primitive::<Float64Type>(),
+            &Float64Array::from(vec![1.0, 1.0, 2.0, 1.0])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn stddev_f64_merge_1() -> Result<()> {
         let a = Arc::new(Float64Array::from(vec![1_f64, 2_f64, 3_f64]));
         let b = Arc::new(Float64Array::from(vec![4_f64, 5_f64]));

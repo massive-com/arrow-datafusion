@@ -819,6 +819,48 @@ mod tests {
     }
 
     #[test]
+    fn groups_preserving_reads() -> Result<()> {
+        let mut acc = make_groups_acc(",");
+        let values: ArrayRef = Arc::new(LargeStringArray::from(vec![
+            Some("a"),
+            Some("b"),
+            None,
+            Some("c"),
+        ]));
+        acc.update_batch(&[values], &[0, 1, 2, 0], None, 4)?;
+
+        let selection = GroupSelection::try_from_indices(&[1, 0, 3, 1], 4)?;
+        let expected =
+            LargeStringArray::from(vec![Some("b"), Some("a,c"), None, Some("b")]);
+        let bytes_before = acc.total_data_bytes;
+        for _ in 0..2 {
+            assert_eq!(
+                acc.evaluate_preserving(selection)?.as_string::<i64>(),
+                &expected
+            );
+            assert_eq!(
+                acc.state_preserving(selection)?[0].as_string::<i64>(),
+                &expected
+            );
+            assert_eq!(acc.total_data_bytes, bytes_before);
+        }
+
+        assert!(
+            acc.evaluate_preserving(GroupSelection::try_from_indices(&[], 4)?)?
+                .is_empty()
+        );
+
+        let values: ArrayRef = Arc::new(LargeStringArray::from(vec!["d", "e"]));
+        acc.update_batch(&[values], &[2, 3], None, 4)?;
+        assert_eq!(
+            acc.evaluate_preserving(GroupSelection::all(4))?
+                .as_string::<i64>(),
+            &LargeStringArray::from(vec!["a,c", "b", "d", "e"])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn groups_basic() -> Result<()> {
         let mut acc = make_groups_acc(",");
 

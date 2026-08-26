@@ -684,6 +684,71 @@ mod tests {
     }
 
     #[test]
+    fn correlation_groups_preserving_reads() -> Result<()> {
+        let mut accumulator = CorrelationGroupsAccumulator::new();
+        let x = Arc::new(Float64Array::from(vec![1.0, 2.0, 1.0, 1.0, 2.0]));
+        let y = Arc::new(Float64Array::from(vec![2.0, 4.0, 2.0, 3.0, 1.0]));
+        accumulator.update_batch(&[x, y], &[0, 0, 1, 2, 2], None, 4)?;
+
+        let selection = GroupSelection::try_from_indices(&[2, 0, 3, 2], 4)?;
+        let expected = Float64Array::from(vec![Some(-1.0), Some(1.0), None, Some(-1.0)]);
+        for _ in 0..2 {
+            assert_eq!(
+                accumulator
+                    .evaluate_preserving(selection)?
+                    .as_primitive::<Float64Type>(),
+                &expected
+            );
+            let state = accumulator.state_preserving(selection)?;
+            assert_eq!(state.len(), 6);
+            assert_eq!(
+                state[0].as_primitive::<UInt64Type>(),
+                &UInt64Array::from(vec![2, 2, 0, 2])
+            );
+            assert_eq!(
+                state[1].as_primitive::<Float64Type>(),
+                &Float64Array::from(vec![3.0, 3.0, 0.0, 3.0])
+            );
+            assert_eq!(
+                state[2].as_primitive::<Float64Type>(),
+                &Float64Array::from(vec![4.0, 6.0, 0.0, 4.0])
+            );
+            assert_eq!(
+                state[3].as_primitive::<Float64Type>(),
+                &Float64Array::from(vec![5.0, 10.0, 0.0, 5.0])
+            );
+            assert_eq!(
+                state[4].as_primitive::<Float64Type>(),
+                &Float64Array::from(vec![5.0, 5.0, 0.0, 5.0])
+            );
+            assert_eq!(
+                state[5].as_primitive::<Float64Type>(),
+                &Float64Array::from(vec![10.0, 20.0, 0.0, 10.0])
+            );
+        }
+
+        let empty_selection = GroupSelection::try_from_indices(&[], 4)?;
+        assert!(accumulator.evaluate_preserving(empty_selection)?.is_empty());
+        assert!(
+            accumulator
+                .state_preserving(empty_selection)?
+                .iter()
+                .all(|array| array.is_empty())
+        );
+
+        let x = Arc::new(Float64Array::from(vec![2.0, 1.0, 4.0]));
+        let y = Arc::new(Float64Array::from(vec![4.0, 2.0, 8.0]));
+        accumulator.update_batch(&[x, y], &[1, 3, 3], None, 4)?;
+        assert_eq!(
+            accumulator
+                .evaluate_preserving(GroupSelection::all(4))?
+                .as_primitive::<Float64Type>(),
+            &Float64Array::from(vec![1.0, 1.0, -1.0, 1.0])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn convert_to_state_roundtrips_through_merge() -> Result<()> {
         let x = Arc::new(Float64Array::from(vec![
             Some(1.0),
