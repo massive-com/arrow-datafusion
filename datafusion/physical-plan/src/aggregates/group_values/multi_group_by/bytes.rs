@@ -34,6 +34,16 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::vec;
 
+fn checked_output_offset<O: OffsetSizeTrait>(
+    current_len: usize,
+    additional_len: usize,
+) -> Result<O> {
+    current_len
+        .checked_add(additional_len)
+        .and_then(O::from_usize)
+        .ok_or_else(|| exec_datafusion_err!("Offset overflow while copying group values"))
+}
+
 /// An implementation of [`GroupColumn`] for binary and utf8 types.
 ///
 /// Stores a collection of binary or utf8 group values in a single buffer
@@ -383,14 +393,16 @@ where
 
         for index in selection.iter() {
             let is_null = self.nulls.is_null(index);
+            let value = if is_null { &[] } else { self.value(index) };
+            let offset = checked_output_offset::<O>(buffer.len(), value.len())?;
+
             nulls.append(is_null);
-            if !is_null {
-                buffer.append_slice(self.value(index));
-            }
-            offsets.push(O::usize_as(buffer.len()));
+            buffer.append_slice(value);
+            offsets.push(offset);
         }
 
-        // SAFETY: offsets are constructed from the length of `buffer`.
+        // SAFETY: every offset was checked for representability and is the
+        // monotonically increasing length of `buffer` after an append.
         let offsets = unsafe { OffsetBuffer::new_unchecked(ScalarBuffer::from(offsets)) };
         let values = buffer.finish();
         let nulls = nulls.build();
@@ -465,7 +477,7 @@ mod tests {
     use datafusion_common::DataFusionError;
     use datafusion_physical_expr::binary_map::OutputType;
 
-    use super::GroupColumn;
+    use super::{GroupColumn, checked_output_offset};
 
     fn make_true_buffer(n: usize) -> BooleanBufferBuilder {
         let mut buf = BooleanBufferBuilder::new(n);
@@ -475,6 +487,19 @@ mod tests {
 
     fn to_vec(buf: &BooleanBufferBuilder) -> Vec<bool> {
         (0..buf.len()).map(|i| buf.get_bit(i)).collect()
+    }
+
+    #[test]
+    fn test_selected_copy_offset_overflow_is_checked() {
+        assert_eq!(
+            checked_output_offset::<i32>(i32::MAX as usize, 0).unwrap(),
+            i32::MAX
+        );
+        assert!(matches!(
+            checked_output_offset::<i32>(i32::MAX as usize, 1),
+            Err(DataFusionError::Execution(e)) if e.contains("Offset overflow")
+        ));
+        assert!(checked_output_offset::<i64>(usize::MAX, 1).is_err());
     }
 
     #[test]
