@@ -4442,7 +4442,7 @@ fn test_replace_order_preserving_variants_with_fetch() -> Result<()> {
     );
 
     // Apply the function
-    let result = replace_order_preserving_variants(dist_context)?;
+    let result = replace_order_preserving_variants(dist_context, false)?.0;
 
     // Verify the plan was transformed to CoalescePartitionsExec
     result
@@ -4456,6 +4456,53 @@ fn test_replace_order_preserving_variants_with_fetch() -> Result<()> {
         Some(5),
         "Fetch value was not preserved after transformation"
     );
+
+    Ok(())
+}
+
+#[test]
+fn preserve_fetch_when_reoptimizing_ordered_merge() -> Result<()> {
+    let schema = schema();
+    let sort_key: LexOrdering =
+        [PhysicalSortExpr::new_default(col("c", &schema)?)].into();
+    let input = parquet_exec_multiple_sorted(vec![sort_key.clone()]);
+    let plan: Arc<dyn ExecutionPlan> =
+        Arc::new(SortPreservingMergeExec::new(sort_key, input).with_fetch(Some(5)));
+
+    let optimized =
+        EnsureRequirements::new().optimize(plan, &test_suite_default_config_options())?;
+    let plan = displayable(optimized.as_ref()).indent(true).to_string();
+
+    assert!(
+        plan.contains("SortPreservingMergeExec: [c@2 ASC], fetch=5"),
+        "expected the optimizer to preserve fetch:\n{plan}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn move_fetch_to_replacement_sort() -> Result<()> {
+    let schema = schema();
+    let sort_key: LexOrdering =
+        [PhysicalSortExpr::new_default(col("c", &schema)?)].into();
+    let input = parquet_exec_multiple_sorted(vec![sort_key.clone()]);
+    let merge: Arc<dyn ExecutionPlan> = Arc::new(
+        SortPreservingMergeExec::new(sort_key, input.clone()).with_fetch(Some(5)),
+    );
+    let context = DistributionContext::new(
+        merge,
+        true,
+        vec![DistributionContext::new(input, false, vec![])],
+    );
+    let (context, fetch) = replace_order_preserving_variants(context, true)?;
+
+    context
+        .plan
+        .downcast_ref::<CoalescePartitionsExec>()
+        .expect("expected CoalescePartitionsExec");
+    assert_eq!(context.plan.fetch(), None);
+    assert_eq!(fetch, Some(5));
 
     Ok(())
 }
