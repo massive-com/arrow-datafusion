@@ -26,12 +26,12 @@ use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
 };
 use datafusion_common::{
-    Column, DFSchemaRef, Diagnostic, HashMap, Result, ScalarValue,
+    Column, DFSchemaRef, Diagnostic, HashMap, Result, ScalarValue, TableReference,
     assert_or_internal_err, exec_datafusion_err, exec_err, internal_err, plan_err,
 };
 use datafusion_expr::builder::get_struct_unnested_columns;
 use datafusion_expr::expr::{
-    Alias, GroupingSet, Unnest, WindowFunction, WindowFunctionParams,
+    Alias, Cast, GroupingSet, TryCast, Unnest, WindowFunction, WindowFunctionParams,
 };
 use datafusion_expr::utils::{expr_as_column_expr, find_column_exprs};
 use datafusion_expr::{
@@ -664,12 +664,75 @@ impl TreeNodeRewriter for RecursiveUnnestRewriter<'_> {
     }
 }
 
+/// A key that compares equal exactly when two expressions would produce the
+/// same [`Expr::schema_name`], built without formatting or allocating.
+///
+/// The rules mirror the `SchemaDisplay` rendering of an [`Expr`]:
+/// - [`Expr::Alias`] renders as `[relation.]name`, hiding the aliased expr
+/// - [`Expr::Column`] renders as `[relation.]name`
+/// - [`Expr::Cast`] / [`Expr::TryCast`] render as their input expression
+/// - anything else renders structurally, so structural equality is used
+///
+/// The only divergence from comparing formatted names is when two
+/// *structurally different* expressions happen to render identically (e.g.
+/// `foo(a)` and `foo(CAST(a AS BIGINT))`). Such expressions are kept here,
+/// whereas the string comparison silently dropped the second one. Projections
+/// containing them are rejected by `validate_unique_names` either way.
+#[derive(Debug)]
+enum SchemaNameKey<'a> {
+    /// Alias and Column both render as `[relation.]name`
+    Named {
+        relation: Option<&'a TableReference>,
+        name: &'a str,
+    },
+    /// Any other expr renders structurally, so compare structurally
+    Other(&'a Expr),
+}
+
+impl<'a> SchemaNameKey<'a> {
+    fn new(mut expr: &'a Expr) -> Self {
+        loop {
+            match expr {
+                // The schema name of a cast is the schema name of its input
+                Expr::Cast(Cast { expr: inner, .. })
+                | Expr::TryCast(TryCast { expr: inner, .. }) => expr = inner,
+                Expr::Column(Column { relation, name, .. })
+                | Expr::Alias(Alias { relation, name, .. }) => {
+                    return Self::Named {
+                        relation: relation.as_ref(),
+                        name,
+                    };
+                }
+                other => return Self::Other(other),
+            }
+        }
+    }
+}
+
+impl PartialEq for SchemaNameKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Named {
+                    relation: l_relation,
+                    name: l_name,
+                },
+                Self::Named {
+                    relation: r_relation,
+                    name: r_name,
+                },
+            ) => l_name == r_name && l_relation == r_relation,
+            (Self::Other(l), Self::Other(r)) => l == r,
+            _ => false,
+        }
+    }
+}
+
+/// Pushes `expr` onto `projection` unless an expression with the same schema
+/// name is already present, so the resulting projection has unique field names.
 fn push_projection_dedupl(projection: &mut Vec<Expr>, expr: Expr) {
-    let schema_name = expr.schema_name().to_string();
-    if !projection
-        .iter()
-        .any(|e| e.schema_name().to_string() == schema_name)
-    {
+    let key = SchemaNameKey::new(&expr);
+    if !projection.iter().any(|e| SchemaNameKey::new(e) == key) {
         projection.push(expr);
     }
 }
@@ -743,13 +806,76 @@ mod tests {
     use arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema};
     use datafusion_common::{Column, DFSchema, Result};
     use datafusion_expr::{
-        ColumnUnnestList, EmptyRelation, LogicalPlan, col, lit, unnest,
+        ColumnUnnestList, EmptyRelation, Expr, LogicalPlan, cast, col, lit, try_cast,
+        unnest,
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;
     use datafusion_functions_aggregate::expr_fn::count;
 
-    use crate::utils::{resolve_positions_to_exprs, rewrite_recursive_unnest_bottom_up};
+    use crate::utils::{
+        SchemaNameKey, push_projection_dedupl, resolve_positions_to_exprs,
+        rewrite_recursive_unnest_bottom_up,
+    };
     use indexmap::IndexMap;
+
+    /// `SchemaNameKey` must agree with comparing formatted schema names for
+    /// every kind of expression the unnest rewrite pushes into the inner
+    /// projection.
+    #[test]
+    fn test_schema_name_key_matches_schema_name() {
+        let exprs: Vec<Expr> = vec![
+            col("a"),
+            col("a"),
+            col("t.a"),
+            col("b"),
+            col("x").alias("n"),
+            col("y").alias("n"),
+            col("n"),
+            cast(col("a"), ArrowDataType::Int64),
+            try_cast(col("a"), ArrowDataType::Int64),
+            cast(col("b"), ArrowDataType::Int64),
+            col("a").add(lit(1)),
+            col("a").add(lit(1)),
+            col("a").add(lit(2)),
+            count(col("a")),
+            count(col("a")),
+            lit(1),
+            col("__unnest_placeholder(arr)").alias("__unnest_placeholder(arr)"),
+        ];
+
+        for l in &exprs {
+            for r in &exprs {
+                let by_key = SchemaNameKey::new(l) == SchemaNameKey::new(r);
+                let by_name = l.schema_name().to_string() == r.schema_name().to_string();
+                assert_eq!(
+                    by_key, by_name,
+                    "key comparison disagrees with schema_name for `{l}` vs `{r}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_push_projection_dedupl() {
+        let mut projection = vec![];
+        push_projection_dedupl(&mut projection, col("a"));
+        push_projection_dedupl(&mut projection, col("a"));
+        push_projection_dedupl(&mut projection, col("t.a"));
+        push_projection_dedupl(&mut projection, col("x").alias("n"));
+        // same alias name as the previous alias, different inner expr
+        push_projection_dedupl(&mut projection, col("y").alias("n"));
+        // cast renders as its input, which is already present
+        push_projection_dedupl(&mut projection, cast(col("a"), ArrowDataType::Int64));
+        push_projection_dedupl(&mut projection, col("a").add(lit(1)));
+        push_projection_dedupl(&mut projection, col("a").add(lit(1)));
+        push_projection_dedupl(&mut projection, col("a").add(lit(2)));
+
+        let names: Vec<String> = projection
+            .iter()
+            .map(|e| e.schema_name().to_string())
+            .collect();
+        assert_eq!(names, vec!["a", "t.a", "n", "a + Int32(1)", "a + Int32(2)"]);
+    }
 
     fn column_unnests_eq(
         l: Vec<&str>,
