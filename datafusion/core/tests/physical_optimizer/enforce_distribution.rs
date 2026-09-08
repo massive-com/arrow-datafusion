@@ -18,6 +18,7 @@
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::physical_optimizer::test_utils::{
     RequirementsTestExec, bounded_window_exec_with_can_repartition, check_integrity,
@@ -38,6 +39,7 @@ use datafusion::datasource::physical_plan::{CsvSource, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_common::ScalarValue;
+use datafusion_common::Statistics;
 use datafusion_common::config::CsvOptions;
 use datafusion_common::error::Result;
 use datafusion_common::tree_node::{
@@ -636,7 +638,12 @@ fn ensure_distribution_helper(
     config.optimizer.repartition_file_scans = false;
     config.optimizer.repartition_file_min_size = 1024;
     config.optimizer.prefer_existing_sort = prefer_existing_sort;
-    ensure_distribution(distribution_context, &config).map(|item| item.data.plan)
+    ensure_distribution_with_stats(
+        distribution_context,
+        &config,
+        &datafusion_physical_plan::statistics::StatisticsContext::new(),
+    )
+    .map(|item| item.data.plan)
 }
 
 fn test_suite_default_config_options() -> ConfigOptions {
@@ -753,7 +760,11 @@ impl TestConfig {
             // Then run ensure_distribution rule
             DistributionContext::new_default(adjusted)
                 .transform_up(|distribution_context| {
-                    ensure_distribution(distribution_context, &self.config)
+                    ensure_distribution_with_stats(
+                        distribution_context,
+                        &self.config,
+                        &datafusion_physical_plan::statistics::StatisticsContext::new(),
+                    )
                 })
                 .data()
                 .and_then(check_integrity)?;
@@ -4642,5 +4653,190 @@ fn ensure_distribution_reuses_plan_arc_when_no_redistribution_needed() -> Result
         Arc::ptr_eq(&result, &plan),
         "ensure_distribution must reuse the input Arc when no children require redistribution"
     );
+    Ok(())
+}
+
+/// Single-child pass-through whose `statistics_from_inputs` increments a counter
+/// every time it is actually computed (i.e. on a statistics-cache miss). Used to
+/// observe how often `ensure_distribution` recomputes a node's statistics.
+#[derive(Debug)]
+struct CountingStatsExec {
+    input: Arc<dyn ExecutionPlan>,
+    cache: Arc<PlanProperties>,
+    calls: Arc<AtomicUsize>,
+}
+
+impl CountingStatsExec {
+    fn new(input: Arc<dyn ExecutionPlan>, calls: Arc<AtomicUsize>) -> Self {
+        let cache = PlanProperties::new(
+            input.equivalence_properties().clone(),
+            input.output_partitioning().clone(),
+            input.pipeline_behavior(),
+            input.boundedness(),
+        );
+        Self {
+            input,
+            cache: Arc::new(cache),
+            calls,
+        }
+    }
+}
+
+impl DisplayAs for CountingStatsExec {
+    fn fmt_as(
+        &self,
+        _t: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "CountingStatsExec")
+    }
+}
+
+impl ExecutionPlan for CountingStatsExec {
+    fn name(&self) -> &'static str {
+        "CountingStatsExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.cache
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+        _: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        assert_eq!(children.len(), 1);
+        Ok(Arc::new(Self::new(
+            children.pop().unwrap(),
+            Arc::clone(&self.calls),
+        )))
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> Result<datafusion_physical_plan::SendableRecordBatchStream> {
+        unreachable!();
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &datafusion_physical_plan::statistics::StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Arc::new(Statistics::new_unknown(
+            self.input.schema().as_ref(),
+        )))
+    }
+}
+
+/// Regression test for the shared statistics cache in `ensure_distribution`.
+///
+/// A deep stack of pass-through operators sits over a counting leaf. Each
+/// ancestor's distribution enforcement inspects its child's statistics, which
+/// recurse to the leaf. With one `StatisticsContext` shared across the pass the
+/// leaf is computed once; with a fresh context per node it is recomputed once
+/// per ancestor. This directly detects a regression where the cache is not
+/// actually shared (e.g. reset on every node), which no plan-output assertion
+/// can catch because the optimized plan is identical either way.
+#[test]
+fn ensure_distribution_shares_statistics_cache() -> Result<()> {
+    // Count how many times a leaf's statistics are computed over a stack of
+    // `depth` pass-through operators sitting on top of it. Each ancestor's
+    // distribution enforcement inspects its child's statistics, which recurse to
+    // the leaf.
+    //
+    // The measured arm drives the real `EnsureRequirements` rule, so the sharing
+    // and the cache-reset condition under test are the ones the rule actually
+    // uses — reimplementing them here would keep passing even if the rule
+    // stopped sharing. The baseline arm allocates a fresh `StatisticsContext`
+    // per node, reproducing the behavior before this change.
+    fn deep_plan(depth: usize, calls: &Arc<AtomicUsize>) -> Arc<dyn ExecutionPlan> {
+        let mut plan: Arc<dyn ExecutionPlan> =
+            Arc::new(CountingStatsExec::new(parquet_exec(), Arc::clone(calls)));
+        for _ in 0..depth {
+            plan = filter_exec(plan);
+        }
+        plan
+    }
+
+    fn config() -> ConfigOptions {
+        let mut config = ConfigOptions::new();
+        config.execution.target_partitions = 10;
+        // Keep the plan a fixpoint so no node is rebuilt and the shared cache is
+        // never reset; statistics are still computed for the round-robin decision.
+        config.optimizer.enable_round_robin_repartition = false;
+        config
+    }
+
+    /// Leaf statistics computations performed by the real rule.
+    fn via_rule(depth: usize) -> Result<usize> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        EnsureRequirements::new().optimize(deep_plan(depth, &calls), &config())?;
+        Ok(calls.load(Ordering::Relaxed))
+    }
+
+    /// Leaf statistics computations with a fresh context per node.
+    fn per_node_context(depth: usize) -> Result<usize> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let config = config();
+        DistributionContext::new_default(deep_plan(depth, &calls)).transform_up(
+            |ctx| {
+                ensure_distribution_with_stats(
+                    ctx,
+                    &config,
+                    &datafusion_physical_plan::statistics::StatisticsContext::new(),
+                )
+            },
+        )?;
+        Ok(calls.load(Ordering::Relaxed))
+    }
+
+    let (shared_shallow, fresh_shallow) = (via_rule(4)?, per_node_context(4)?);
+    let (shared_deep, fresh_deep) = (via_rule(12)?, per_node_context(12)?);
+
+    // Sharing strictly reduces statistics recomputation at any depth. A rule that
+    // stopped sharing (or reset the cache on every node) would make these equal.
+    assert!(
+        shared_shallow < fresh_shallow && shared_deep < fresh_deep,
+        "shared cache must recompute less: shallow {shared_shallow} vs {fresh_shallow}, \
+         deep {shared_deep} vs {fresh_deep}"
+    );
+
+    // Without sharing, each extra ancestor recomputes the leaf's subtree, so the
+    // gap widens as the plan gets deeper. That is the depth-scaling recomputation
+    // the shared cache removes.
+    let saved_shallow = fresh_shallow - shared_shallow;
+    let saved_deep = fresh_deep - shared_deep;
+    assert!(
+        saved_deep > saved_shallow,
+        "the shared cache should save more on deeper plans: \
+         saved {saved_shallow} at depth 4, {saved_deep} at depth 12"
+    );
+
     Ok(())
 }
