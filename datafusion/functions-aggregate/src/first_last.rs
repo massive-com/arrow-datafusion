@@ -43,7 +43,7 @@ use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::{AggregateOrderSensitivity, format_state_name};
 use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Documentation, EmitTo, Expr, ExprFunctionExt,
-    GroupsAccumulator, ReversedUDAF, Signature, SortExpr, Volatility,
+    GroupSelection, GroupsAccumulator, ReversedUDAF, Signature, SortExpr, Volatility,
 };
 use datafusion_functions_aggregate_common::utils::get_sort_options;
 use datafusion_macros::user_doc;
@@ -518,6 +518,12 @@ impl<S: ValueState> FirstLastGroupsAccumulator<S> {
         Ok(())
     }
 
+    fn validate_selection(&self, selection: GroupSelection<'_>) -> Result<()> {
+        selection.validate_num_groups(self.state.num_groups())?;
+        selection.validate_num_groups(self.orderings.len())?;
+        selection.validate_num_groups(self.is_sets.len())
+    }
+
     fn take_state(
         &mut self,
         emit_to: EmitTo,
@@ -669,6 +675,15 @@ impl<S: ValueState + 'static> GroupsAccumulator for FirstLastGroupsAccumulator<S
         Ok(self.take_state(emit_to)?.0)
     }
 
+    fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        self.validate_selection(selection)?;
+        self.state.build_preserving(selection)
+    }
+
+    fn supports_evaluate_preserving(&self) -> bool {
+        true
+    }
+
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         let (val_arr, orderings, is_sets) = self.take_state(emit_to)?;
         let mut result = Vec::with_capacity(self.orderings.len() + 2);
@@ -696,6 +711,41 @@ impl<S: ValueState + 'static> GroupsAccumulator for FirstLastGroupsAccumulator<S
         result.push(Arc::new(BooleanArray::new(is_sets, None)));
 
         Ok(result)
+    }
+
+    fn state_preserving(
+        &mut self,
+        selection: GroupSelection<'_>,
+    ) -> Result<Vec<ArrayRef>> {
+        self.validate_selection(selection)?;
+        let mut result = Vec::with_capacity(self.ordering_req.len() + 2);
+        result.push(self.state.build_preserving(selection)?);
+
+        for column_index in 0..self.ordering_req.len() {
+            let array = if selection.is_empty() {
+                self.default_orderings[column_index].to_array_of_size(0)?
+            } else {
+                ScalarValue::iter_to_array(selection.iter().map(|group_index| {
+                    debug_assert_eq!(
+                        self.orderings[group_index].len(),
+                        self.ordering_req.len()
+                    );
+                    self.orderings[group_index][column_index].clone()
+                }))?
+            };
+            result.push(array);
+        }
+
+        let mut is_sets = BooleanBufferBuilder::new(selection.len());
+        for index in selection.iter() {
+            is_sets.append(self.is_sets.get_bit(index));
+        }
+        result.push(Arc::new(BooleanArray::new(is_sets.finish(), None)));
+        Ok(result)
+    }
+
+    fn supports_state_preserving(&self) -> bool {
+        true
     }
 
     fn merge_batch(
@@ -1564,6 +1614,206 @@ mod tests {
 
         acc.merge_batch(&states)?;
         assert_eq!(acc.evaluate()?, ScalarValue::Int64(None));
+        Ok(())
+    }
+
+    #[test]
+    fn first_groups_preserving_reads_keep_all_state() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ordering",
+            DataType::Int64,
+            true,
+        )]));
+        let sort_keys = [PhysicalSortExpr {
+            expr: col("ordering", &schema).unwrap(),
+            options: SortOptions::default(),
+        }];
+        let new_accumulator = || {
+            FirstLastGroupsAccumulator::try_new(
+                PrimitiveValueState::<Int64Type>::new(DataType::Int64),
+                sort_keys.clone().into(),
+                false,
+                &[DataType::Int64],
+                true,
+            )
+        };
+        let mut acc = new_accumulator()?;
+
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![10, 20, 30, 40]));
+        let ordering: ArrayRef = Arc::new(Int64Array::from(vec![4, 1, 3, 2]));
+        acc.update_batch(&[values, ordering], &[0, 0, 1, 2], None, 4)?;
+
+        let selection = GroupSelection::try_from_indices(&[2, 0, 2, 3], 4)?;
+        let expected = Int64Array::from(vec![Some(40), Some(20), Some(40), None]);
+        for _ in 0..2 {
+            assert_eq!(
+                acc.evaluate_preserving(selection)?
+                    .as_primitive::<Int64Type>(),
+                &expected
+            );
+        }
+
+        let state = acc.state_preserving(selection)?;
+        assert_eq!(state.len(), 3);
+        assert_eq!(state[0].as_primitive::<Int64Type>(), &expected);
+        assert_eq!(
+            state[1].as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![Some(2), Some(1), Some(2), None])
+        );
+        assert_eq!(
+            state[2].as_boolean(),
+            &BooleanArray::from(vec![true, true, true, false])
+        );
+
+        let mut merged = new_accumulator()?;
+        merged.merge_batch(&state, &[0, 1, 2, 3], 4)?;
+        assert_eq!(
+            merged
+                .evaluate_preserving(GroupSelection::all(4))?
+                .as_primitive::<Int64Type>(),
+            &expected
+        );
+
+        let empty = GroupSelection::try_from_indices(&[], 4)?;
+        let result = acc.evaluate_preserving(empty)?;
+        assert_eq!(result.data_type(), &DataType::Int64);
+        assert!(result.is_empty());
+        let state = acc.state_preserving(empty)?;
+        assert_eq!(state.len(), 3);
+        assert!(state.iter().all(|array| array.is_empty()));
+        assert_eq!(state[0].data_type(), &DataType::Int64);
+        assert_eq!(state[1].data_type(), &DataType::Int64);
+        assert_eq!(state[2].data_type(), &DataType::Boolean);
+
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![15, 50]));
+        let ordering: ArrayRef = Arc::new(Int64Array::from(vec![0, 5]));
+        acc.update_batch(&[values, ordering], &[0, 3], None, 4)?;
+        assert_eq!(
+            acc.evaluate_preserving(GroupSelection::all(4))?
+                .as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![15, 30, 40, 50])
+        );
+        assert!(acc.supports_evaluate_preserving());
+        assert!(acc.supports_state_preserving());
+        Ok(())
+    }
+
+    #[test]
+    fn first_groups_preserving_reads_support_utf8_values() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ordering",
+            DataType::Utf8,
+            true,
+        )]));
+        let sort_keys = [PhysicalSortExpr {
+            expr: col("ordering", &schema)?,
+            options: SortOptions::default(),
+        }];
+        let mut acc = FirstLastGroupsAccumulator::try_new(
+            BytesValueState::try_new(DataType::Utf8)?,
+            sort_keys.into(),
+            false,
+            &[DataType::Utf8],
+            true,
+        )?;
+
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            "late",
+            "first",
+            "group-one",
+            "group-two",
+        ]));
+        let ordering: ArrayRef = Arc::new(StringArray::from(vec!["z", "a", "m", "b"]));
+        acc.update_batch(&[values, ordering], &[0, 0, 1, 2], None, 4)?;
+
+        let selection = GroupSelection::try_from_indices(&[2, 0, 2, 3], 4)?;
+        let expected_values = StringArray::from(vec![
+            Some("group-two"),
+            Some("first"),
+            Some("group-two"),
+            None,
+        ]);
+        for _ in 0..2 {
+            assert_eq!(
+                acc.evaluate_preserving(selection)?.as_string::<i32>(),
+                &expected_values
+            );
+        }
+
+        let state = acc.state_preserving(selection)?;
+        assert_eq!(state.len(), 3);
+        assert_eq!(state[0].as_string::<i32>(), &expected_values);
+        assert_eq!(
+            state[1].as_string::<i32>(),
+            &StringArray::from(vec![Some("b"), Some("a"), Some("b"), None])
+        );
+        assert_eq!(
+            state[2].as_boolean(),
+            &BooleanArray::from(vec![true, true, true, false])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn first_groups_preserving_reads_support_list_values() -> Result<()> {
+        let value_type =
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ordering",
+            DataType::Int64,
+            true,
+        )]));
+        let sort_keys = [PhysicalSortExpr {
+            expr: col("ordering", &schema)?,
+            options: SortOptions::default(),
+        }];
+        let mut acc = FirstLastGroupsAccumulator::try_new(
+            GenericValueState::new(value_type),
+            sort_keys.into(),
+            false,
+            &[DataType::Int64],
+            true,
+        )?;
+
+        let values = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(9)]),
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(3)]),
+            Some(vec![Some(4), Some(5)]),
+        ]);
+        let ordering = Int64Array::from(vec![9, 1, 3, 2]);
+        acc.update_batch(
+            &[Arc::new(values), Arc::new(ordering)],
+            &[0, 0, 1, 2],
+            None,
+            4,
+        )?;
+
+        let selection = GroupSelection::try_from_indices(&[2, 0, 2, 3], 4)?;
+        let expected_values = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(4), Some(5)]),
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(4), Some(5)]),
+            None,
+        ]);
+        for _ in 0..2 {
+            assert_eq!(
+                acc.evaluate_preserving(selection)?.as_list::<i32>(),
+                &expected_values
+            );
+        }
+
+        let state = acc.state_preserving(selection)?;
+        assert_eq!(state.len(), 3);
+        assert_eq!(state[0].as_list::<i32>(), &expected_values);
+        assert_eq!(
+            state[1].as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![Some(2), Some(1), Some(2), None])
+        );
+        assert_eq!(
+            state[2].as_boolean(),
+            &BooleanArray::from(vec![true, true, true, false])
+        );
         Ok(())
     }
 

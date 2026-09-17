@@ -20,15 +20,33 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, ArrowPrimitiveType, AsArray, BinaryBuilder, BinaryViewBuilder,
-    BooleanBufferBuilder, LargeBinaryBuilder, LargeStringBuilder, PrimitiveArray,
-    StringBuilder, StringViewBuilder,
+    BooleanBufferBuilder, LargeBinaryBuilder, LargeStringBuilder, OffsetSizeTrait,
+    PrimitiveArray, StringBuilder, StringViewBuilder,
 };
 use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::datatypes::DataType;
-use datafusion_common::{Result, ScalarValue, internal_err};
-use datafusion_expr::EmitTo;
+use datafusion_common::{Result, ScalarValue, exec_datafusion_err, internal_err};
+use datafusion_expr::{EmitTo, GroupSelection};
+
+fn checked_selected_value_length(current: usize, additional: usize) -> Result<usize> {
+    current
+        .checked_add(additional)
+        .ok_or_else(|| exec_datafusion_err!("First/last selected value length overflow"))
+}
+
+fn validate_selected_value_offset<O: OffsetSizeTrait>(total_len: usize) -> Result<()> {
+    if total_len > O::MAX_OFFSET {
+        let offset_type = if O::IS_LARGE { "i64" } else { "i32" };
+        return Err(exec_datafusion_err!(
+            "First/last selected value data exceeds {offset_type} offset capacity"
+        ));
+    }
+    Ok(())
+}
 
 pub(crate) trait ValueState: Send + Sync {
+    /// Returns the number of stored groups.
+    fn num_groups(&self) -> usize;
     /// Resizes the state to accommodate `new_size` groups.
     fn resize(&mut self, new_size: usize);
     /// Updates the state for the specified `group_idx` using the value at `idx` from the provided `array`.
@@ -50,6 +68,8 @@ pub(crate) trait ValueState: Send + Sync {
     fn update(&mut self, group_idx: usize, array: &ArrayRef, idx: usize) -> Result<()>;
     /// Takes the accumulated state and returns it as an [`ArrayRef`], respecting the `emit_to` strategy.
     fn take(&mut self, emit_to: EmitTo) -> Result<ArrayRef>;
+    /// Materializes selected values without changing the stored state.
+    fn build_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef>;
     /// Returns the estimated memory size of the state in bytes.
     fn size(&self) -> usize;
 }
@@ -72,6 +92,10 @@ impl<T: ArrowPrimitiveType + Send> PrimitiveValueState<T> {
 }
 
 impl<T: ArrowPrimitiveType + Send> ValueState for PrimitiveValueState<T> {
+    fn num_groups(&self) -> usize {
+        self.vals.len()
+    }
+
     fn resize(&mut self, new_size: usize) {
         self.vals.resize(new_size, T::default_value());
         self.nulls.resize(new_size);
@@ -90,6 +114,25 @@ impl<T: ArrowPrimitiveType + Send> ValueState for PrimitiveValueState<T> {
         let array: PrimitiveArray<T> =
             PrimitiveArray::<T>::new(values.into(), Some(null_buf))
                 .with_data_type(self.data_type.clone());
+        Ok(Arc::new(array))
+    }
+
+    fn build_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        selection.validate_num_groups(self.vals.len())?;
+        debug_assert_eq!(self.vals.len(), self.nulls.len());
+        let values = selection
+            .iter()
+            .map(|index| self.vals[index])
+            .collect::<Vec<_>>();
+        let mut valid = BooleanBufferBuilder::new(selection.len());
+        for index in selection.iter() {
+            valid.append(self.nulls.get_bit(index));
+        }
+        let array = PrimitiveArray::<T>::new(
+            values.into(),
+            Some(NullBuffer::new(valid.finish())),
+        )
+        .with_data_type(self.data_type.clone());
         Ok(Arc::new(array))
     }
 
@@ -140,6 +183,10 @@ impl BytesValueState {
 }
 
 impl ValueState for BytesValueState {
+    fn num_groups(&self) -> usize {
+        self.vals.len()
+    }
+
     fn resize(&mut self, new_size: usize) {
         if new_size < self.vals.len() {
             for v in self.vals[new_size..].iter().flatten() {
@@ -277,6 +324,103 @@ impl ValueState for BytesValueState {
         }
     }
 
+    fn build_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        selection.validate_num_groups(self.vals.len())?;
+        let total_len = selection.iter().try_fold(0usize, |total, index| {
+            let len = self.vals[index].as_ref().map_or(0, Vec::len);
+            checked_selected_value_length(total, len)
+        })?;
+        match self.data_type {
+            DataType::Utf8 | DataType::Binary => {
+                validate_selected_value_offset::<i32>(total_len)?;
+            }
+            DataType::LargeUtf8 | DataType::LargeBinary => {
+                validate_selected_value_offset::<i64>(total_len)?;
+            }
+            _ => {}
+        }
+
+        match self.data_type {
+            DataType::Utf8 => {
+                let mut builder =
+                    StringBuilder::with_capacity(selection.len(), total_len);
+                for index in selection.iter() {
+                    match self.vals[index].as_deref() {
+                        Some(value) => builder.append_value(
+                            // SAFETY: values came from validated UTF-8 arrays.
+                            unsafe { std::str::from_utf8_unchecked(value) },
+                        ),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            DataType::LargeUtf8 => {
+                let mut builder =
+                    LargeStringBuilder::with_capacity(selection.len(), total_len);
+                for index in selection.iter() {
+                    match self.vals[index].as_deref() {
+                        Some(value) => builder.append_value(
+                            // SAFETY: values came from validated UTF-8 arrays.
+                            unsafe { std::str::from_utf8_unchecked(value) },
+                        ),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            DataType::Utf8View => {
+                let mut builder = StringViewBuilder::with_capacity(selection.len());
+                for index in selection.iter() {
+                    match self.vals[index].as_deref() {
+                        Some(value) => builder.append_value(
+                            // SAFETY: values came from validated UTF-8 arrays.
+                            unsafe { std::str::from_utf8_unchecked(value) },
+                        ),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            DataType::Binary => {
+                let mut builder =
+                    BinaryBuilder::with_capacity(selection.len(), total_len);
+                for index in selection.iter() {
+                    match self.vals[index].as_deref() {
+                        Some(value) => builder.append_value(value),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            DataType::LargeBinary => {
+                let mut builder =
+                    LargeBinaryBuilder::with_capacity(selection.len(), total_len);
+                for index in selection.iter() {
+                    match self.vals[index].as_deref() {
+                        Some(value) => builder.append_value(value),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            DataType::BinaryView => {
+                let mut builder = BinaryViewBuilder::with_capacity(selection.len());
+                for index in selection.iter() {
+                    match self.vals[index].as_deref() {
+                        Some(value) => builder.append_value(value),
+                        None => builder.append_null(),
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            _ => internal_err!(
+                "Unsupported data type for BytesValueState: {}",
+                self.data_type
+            ),
+        }
+    }
+
     fn size(&self) -> usize {
         self.vals.capacity() * size_of::<Option<Vec<u8>>>() + self.total_capacity
     }
@@ -317,6 +461,10 @@ impl GenericValueState {
 }
 
 impl ValueState for GenericValueState {
+    fn num_groups(&self) -> usize {
+        self.vals.len()
+    }
+
     fn resize(&mut self, new_size: usize) {
         if new_size < self.vals.len() {
             for v in self.vals[new_size..].iter().flatten() {
@@ -357,6 +505,20 @@ impl ValueState for GenericValueState {
         ScalarValue::iter_to_array(scalars)
     }
 
+    fn build_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        selection.validate_num_groups(self.vals.len())?;
+        if selection.is_empty() {
+            return Ok(arrow::array::new_empty_array(&self.data_type));
+        }
+
+        let default = ScalarValue::try_from(&self.data_type)?;
+        let scalars = selection
+            .iter()
+            .map(|index| self.vals[index].clone().unwrap_or_else(|| default.clone()))
+            .collect::<Vec<_>>();
+        ScalarValue::iter_to_array(scalars)
+    }
+
     fn size(&self) -> usize {
         self.vals.capacity() * size_of::<Option<ScalarValue>>() + self.total_size
     }
@@ -392,6 +554,37 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields};
 
     #[test]
+    fn selected_value_length_checks_offset_capacity() {
+        assert_eq!(
+            checked_selected_value_length(usize::MAX, 0).unwrap(),
+            usize::MAX
+        );
+        assert!(
+            checked_selected_value_length(usize::MAX, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("length overflow")
+        );
+
+        assert!(validate_selected_value_offset::<i32>(i32::MAX as usize).is_ok());
+        assert!(
+            validate_selected_value_offset::<i32>(i32::MAX as usize + 1)
+                .unwrap_err()
+                .to_string()
+                .contains("i32 offset capacity")
+        );
+        assert!(validate_selected_value_offset::<i64>(i64::MAX as usize).is_ok());
+        if let Some(too_large) = (i64::MAX as usize).checked_add(1) {
+            assert!(
+                validate_selected_value_offset::<i64>(too_large)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("i64 offset capacity")
+            );
+        }
+    }
+
+    #[test]
     fn test_bytes_value_state_utf8() -> Result<()> {
         let mut state = BytesValueState::try_new(DataType::Utf8)?;
         state.resize(2);
@@ -410,6 +603,21 @@ mod tests {
         // Overwrite group 0 with a longer string (checks capacity update logic)
         state.update(0, &array, 2)?;
         assert_eq!(state.total_capacity, state.total_capacity_calculated());
+
+        let selected = state.build_preserving(GroupSelection::try_from_indices(
+            &[1, 0, 1],
+            state.num_groups(),
+        )?)?;
+        assert_eq!(
+            selected.as_string::<i32>(),
+            &StringArray::from(vec!["world", "longer_string_than_hello", "world"])
+        );
+        let empty = state.build_preserving(GroupSelection::try_from_indices(
+            &[],
+            state.num_groups(),
+        )?)?;
+        assert_eq!(empty.data_type(), &DataType::Utf8);
+        assert!(empty.is_empty());
 
         let result = state.take(EmitTo::All)?;
         let result = result.as_string::<i32>();
@@ -430,6 +638,8 @@ mod tests {
         state.resize(1);
         let array: ArrayRef = Arc::new(LargeStringArray::from(vec!["large_utf8"]));
         state.update(0, &array, 0)?;
+        let selected = state.build_preserving(GroupSelection::all(1))?;
+        assert_eq!(selected.as_string::<i64>().value(0), "large_utf8");
         let result = state.take(EmitTo::All)?;
         assert_eq!(result.as_string::<i64>().value(0), "large_utf8");
         Ok(())
@@ -441,6 +651,8 @@ mod tests {
         state.resize(1);
         let array: ArrayRef = Arc::new(StringViewArray::from(vec!["Utf8View"]));
         state.update(0, &array, 0)?;
+        let selected = state.build_preserving(GroupSelection::all(1))?;
+        assert_eq!(selected.as_string_view().value(0), "Utf8View");
         let result = state.take(EmitTo::All)?;
         assert_eq!(result.as_string_view().value(0), "Utf8View");
         Ok(())
@@ -452,6 +664,8 @@ mod tests {
         state.resize(1);
         let array: ArrayRef = Arc::new(BinaryArray::from(vec![b"binary" as &[u8]]));
         state.update(0, &array, 0)?;
+        let selected = state.build_preserving(GroupSelection::all(1))?;
+        assert_eq!(selected.as_binary::<i32>().value(0), b"binary");
         let result = state.take(EmitTo::All)?;
         assert_eq!(result.as_binary::<i32>().value(0), b"binary");
         Ok(())
@@ -464,6 +678,8 @@ mod tests {
         let array: ArrayRef =
             Arc::new(LargeBinaryArray::from(vec![b"large_binary" as &[u8]]));
         state.update(0, &array, 0)?;
+        let selected = state.build_preserving(GroupSelection::all(1))?;
+        assert_eq!(selected.as_binary::<i64>().value(0), b"large_binary");
         let result = state.take(EmitTo::All)?;
         assert_eq!(result.as_binary::<i64>().value(0), b"large_binary");
         Ok(())
@@ -479,6 +695,11 @@ mod tests {
 
         state.update(0, &array, 0)?;
 
+        let selected = state.build_preserving(GroupSelection::all(1))?;
+        assert_eq!(
+            selected.as_binary_view().value(0),
+            b"long_binary_value_to_test_view"
+        );
         let result = state.take(EmitTo::All)?;
         let result = result.as_binary_view();
         assert_eq!(result.value(0), b"long_binary_value_to_test_view");
@@ -594,6 +815,37 @@ mod tests {
             state.total_size as isize - size_after_first as isize,
             expected_delta,
             "size accounting drifted after overwrite"
+        );
+
+        let selected = state.build_preserving(GroupSelection::try_from_indices(
+            &[1, 0, 1],
+            state.num_groups(),
+        )?)?;
+        let selected = selected.as_list::<i32>();
+        assert_eq!(selected.len(), 3);
+        assert_eq!(
+            selected
+                .value(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap(),
+            &StringArray::from(vec!["b", "c"])
+        );
+        assert_eq!(
+            selected
+                .value(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap(),
+            &StringArray::from(vec!["d", "e", "f"])
+        );
+        assert_eq!(
+            selected
+                .value(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap(),
+            &StringArray::from(vec!["b", "c"])
         );
 
         let result = state.take(EmitTo::All)?;

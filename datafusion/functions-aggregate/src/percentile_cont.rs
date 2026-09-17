@@ -48,7 +48,7 @@ use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Coercion, Documentation, Expr, Signature,
     TypeSignatureClass, Volatility,
 };
-use datafusion_expr::{EmitTo, GroupsAccumulator};
+use datafusion_expr::{EmitTo, GroupSelection, GroupsAccumulator};
 use datafusion_expr::{
     expr::{AggregateFunction, Sort},
     function::{AccumulatorArgs, AggregateFunctionSimplification, StateFieldsArgs},
@@ -523,6 +523,36 @@ impl<T: ArrowNumericType + Send> PercentileContGroupsAccumulator<T> {
             percentile,
         }
     }
+
+    fn build_state_preserving(&self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        selection.validate_num_groups(self.group_values.len())?;
+        let mut offsets = Vec::with_capacity(selection.len() + 1);
+        offsets.push(0);
+        let mut total_values = 0usize;
+        for index in selection.iter() {
+            total_values = total_values
+                .checked_add(self.group_values[index].len())
+                .ok_or_else(|| {
+                    exec_datafusion_err!("Percentile state length overflow")
+                })?;
+            offsets.push(i32::try_from(total_values).map_err(|_| {
+                exec_datafusion_err!("Percentile state exceeds i32 offset capacity")
+            })?);
+        }
+
+        let flattened = selection
+            .iter()
+            .flat_map(|index| self.group_values[index].iter().copied())
+            .collect::<Vec<_>>();
+        let values = PrimitiveArray::<T>::new(ScalarBuffer::from(flattened), None);
+        let array = ListArray::new(
+            Arc::new(Field::new_list_field(T::DATA_TYPE, true)),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(values),
+            None,
+        );
+        Ok(Arc::new(array))
+    }
 }
 
 impl<T> GroupsAccumulator for PercentileContGroupsAccumulator<T>
@@ -615,6 +645,17 @@ where
         Ok(vec![Arc::new(result_list_array)])
     }
 
+    fn state_preserving(
+        &mut self,
+        selection: GroupSelection<'_>,
+    ) -> Result<Vec<ArrayRef>> {
+        Ok(vec![self.build_state_preserving(selection)?])
+    }
+
+    fn supports_state_preserving(&self) -> bool {
+        true
+    }
+
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         // Emit values
         let mut emit_group_values = emit_to.take_needed(&mut self.group_values);
@@ -628,6 +669,21 @@ where
         }
 
         Ok(Arc::new(evaluate_result_builder.finish()))
+    }
+
+    fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        selection.validate_num_groups(self.group_values.len())?;
+        let mut builder = PrimitiveBuilder::<T>::with_capacity(selection.len());
+        for index in selection.iter() {
+            let mut values = self.group_values[index].clone();
+            builder
+                .append_option(calculate_percentile::<T>(&mut values, self.percentile));
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+
+    fn supports_evaluate_preserving(&self) -> bool {
+        true
     }
 
     fn convert_to_state(
@@ -901,6 +957,69 @@ mod tests {
     use super::*;
     use arrow::array::Float64Array;
     use half::f16;
+
+    #[test]
+    fn groups_preserving_reads_keep_percentile_state() -> Result<()> {
+        let mut acc = PercentileContGroupsAccumulator::<Float64Type>::new(0.25);
+        let values: ArrayRef =
+            Arc::new(Float64Array::from(vec![4.0, 8.0, 0.0, 20.0, 0.0, 10.0]));
+        acc.update_batch(&[values], &[0, 1, 0, 3, 3, 3], None, 4)?;
+
+        let selection = GroupSelection::try_from_indices(&[3, 0, 3, 2], 4)?;
+        let expected = Float64Array::from(vec![Some(5.0), Some(1.0), Some(5.0), None]);
+        for _ in 0..2 {
+            assert_eq!(
+                acc.evaluate_preserving(selection)?
+                    .as_primitive::<Float64Type>(),
+                &expected
+            );
+        }
+
+        let state = acc.state_preserving(selection)?;
+        let state = state[0].as_list::<i32>();
+        let state_values = state
+            .iter()
+            .map(|values| {
+                values
+                    .unwrap()
+                    .as_primitive::<Float64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state_values,
+            vec![
+                vec![20.0, 0.0, 10.0],
+                vec![4.0, 0.0],
+                vec![20.0, 0.0, 10.0],
+                vec![],
+            ]
+        );
+
+        let empty = GroupSelection::try_from_indices(&[], 4)?;
+        let result = acc.evaluate_preserving(empty)?;
+        assert_eq!(result.data_type(), &DataType::Float64);
+        assert!(result.is_empty());
+        let state = acc.state_preserving(empty)?;
+        assert_eq!(state.len(), 1);
+        assert_eq!(
+            state[0].data_type(),
+            &DataType::List(Arc::new(Field::new_list_field(DataType::Float64, true)))
+        );
+        assert!(state[0].is_empty());
+
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![4.0, 12.0]));
+        acc.update_batch(&[values], &[2, 2], None, 4)?;
+        assert_eq!(
+            acc.evaluate_preserving(GroupSelection::all(4))?
+                .as_primitive::<Float64Type>(),
+            &Float64Array::from(vec![1.0, 8.0, 6.0, 5.0])
+        );
+        assert!(acc.supports_evaluate_preserving());
+        assert!(acc.supports_state_preserving());
+        Ok(())
+    }
 
     #[test]
     fn retract_batch_errors_on_untracked_value() {

@@ -35,14 +35,14 @@ use arrow::datatypes::{
 use datafusion_common::ScalarValue;
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::{
-    DataFusionError, Result, downcast_value, internal_datafusion_err, internal_err,
-    not_impl_err,
+    DataFusionError, Result, downcast_value, exec_datafusion_err,
+    internal_datafusion_err, internal_err, not_impl_err,
 };
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
-    Accumulator, AggregateUDFImpl, Documentation, EmitTo, GroupsAccumulator, Signature,
-    Volatility,
+    Accumulator, AggregateUDFImpl, Documentation, EmitTo, GroupSelection,
+    GroupsAccumulator, Signature, Volatility,
 };
 use datafusion_functions_aggregate_common::aggregate::count_distinct::{
     Bitmap65536DistinctCountAccumulator, Bitmap65536DistinctCountAccumulatorI16,
@@ -435,6 +435,16 @@ impl GroupHll {
     }
 }
 
+fn checked_hll_state_data_length(current: usize, additional: usize) -> Result<usize> {
+    let total = current
+        .checked_add(additional)
+        .ok_or_else(|| exec_datafusion_err!("Approx distinct state length overflow"))?;
+    i32::try_from(total).map_err(|_| {
+        exec_datafusion_err!("Approx distinct state exceeds i32 offset capacity")
+    })?;
+    Ok(total)
+}
+
 /// A [`GroupsAccumulator`] for `approx_distinct` that keeps one adaptive
 /// (sparse → dense) HyperLogLog sketch per group.
 ///
@@ -568,6 +578,18 @@ impl GroupsAccumulator for HllGroupsAccumulator {
         Ok(Arc::new(counts))
     }
 
+    fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        selection.validate_num_groups(self.groups.len())?;
+        let counts = UInt64Array::from_iter_values(
+            selection.iter().map(|index| self.groups[index].count()),
+        );
+        Ok(Arc::new(counts))
+    }
+
+    fn supports_evaluate_preserving(&self) -> bool {
+        true
+    }
+
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         let mut groups = emit_to.take_needed(&mut self.groups);
         let mut builder = BinaryBuilder::new();
@@ -581,6 +603,26 @@ impl GroupsAccumulator for HllGroupsAccumulator {
         // The emitted groups have been removed; reclaim their tracked bytes.
         self.allocated_bytes = self.allocated_bytes.saturating_sub(freed);
         Ok(vec![Arc::new(builder.finish())])
+    }
+
+    fn state_preserving(
+        &mut self,
+        selection: GroupSelection<'_>,
+    ) -> Result<Vec<ArrayRef>> {
+        selection.validate_num_groups(self.groups.len())?;
+        let mut builder = BinaryBuilder::new();
+        let mut scratch = Vec::new();
+        let mut total_bytes = 0;
+        for index in selection.iter() {
+            self.groups[index].serialize(&mut scratch);
+            total_bytes = checked_hll_state_data_length(total_bytes, scratch.len())?;
+            builder.append_value(&scratch);
+        }
+        Ok(vec![Arc::new(builder.finish())])
+    }
+
+    fn supports_state_preserving(&self) -> bool {
+        true
     }
 
     fn convert_to_state(
@@ -1130,6 +1172,51 @@ mod tests {
         }
 
         #[test]
+        fn groups_preserving_reads_keep_hll_state() {
+            let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 2, 3, 10, 10]));
+            let group_indices = vec![0usize, 0, 0, 1, 2, 2];
+            let mut acc = HllGroupsAccumulator::new();
+            acc.update_batch(&[values], &group_indices, None, 4)
+                .unwrap();
+
+            let selection = GroupSelection::try_from_indices(&[2, 0, 2, 3], 4).unwrap();
+            let expected = UInt64Array::from(vec![1, 2, 1, 0]);
+            for _ in 0..2 {
+                let actual = acc.evaluate_preserving(selection).unwrap();
+                assert_eq!(actual.as_primitive::<UInt64Type>(), &expected);
+            }
+
+            let state = acc.state_preserving(selection).unwrap();
+            let mut merged = HllGroupsAccumulator::new();
+            merged.merge_batch(&state, &[0, 1, 2, 3], 4).unwrap();
+            assert_eq!(
+                merged
+                    .evaluate(EmitTo::All)
+                    .unwrap()
+                    .as_primitive::<UInt64Type>(),
+                &expected
+            );
+
+            let empty = GroupSelection::try_from_indices(&[], 4).unwrap();
+            assert!(acc.evaluate_preserving(empty).unwrap().is_empty());
+            let empty_state = acc.state_preserving(empty).unwrap();
+            assert_eq!(empty_state.len(), 1);
+            assert_eq!(empty_state[0].data_type(), &DataType::Binary);
+            assert!(empty_state[0].is_empty());
+
+            let values: ArrayRef = Arc::new(Int64Array::from(vec![4, 20]));
+            acc.update_batch(&[values], &[1, 3], None, 4).unwrap();
+            assert_eq!(
+                acc.evaluate_preserving(GroupSelection::all(4))
+                    .unwrap()
+                    .as_primitive::<UInt64Type>(),
+                &UInt64Array::from(vec![2, 2, 1, 1])
+            );
+            assert!(acc.supports_evaluate_preserving());
+            assert!(acc.supports_state_preserving());
+        }
+
+        #[test]
         fn groups_convert_to_state_roundtrips_through_merge() {
             let values: ArrayRef = Arc::new(Int64Array::from(vec![
                 Some(1),
@@ -1297,6 +1384,26 @@ mod tests {
         let mut buf = Vec::new();
         g.serialize(&mut buf);
         buf
+    }
+
+    #[test]
+    fn hll_state_data_length_checks_offset_capacity() {
+        assert_eq!(
+            checked_hll_state_data_length(i32::MAX as usize, 0).unwrap(),
+            i32::MAX as usize
+        );
+        assert!(
+            checked_hll_state_data_length(i32::MAX as usize, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("i32 offset capacity")
+        );
+        assert!(
+            checked_hll_state_data_length(usize::MAX, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("length overflow")
+        );
     }
 
     #[test]

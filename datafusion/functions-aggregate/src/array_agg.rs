@@ -38,13 +38,14 @@ use datafusion_common::utils::{
     SingleRowListArrayBuilder, compare_rows, get_row_at_idx, take_function_args,
 };
 use datafusion_common::{
-    Result, ScalarValue, assert_eq_or_internal_err, exec_err, internal_err,
+    Result, ScalarValue, assert_eq_or_internal_err, exec_datafusion_err, exec_err,
+    internal_err,
 };
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
 use datafusion_expr::{
-    Accumulator, AggregateUDFImpl, Documentation, EmitTo, GroupsAccumulator, Signature,
-    Volatility,
+    Accumulator, AggregateUDFImpl, Documentation, EmitTo, GroupSelection,
+    GroupsAccumulator, Signature, Volatility,
 };
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::nulls::filter_to_nulls;
 use datafusion_functions_aggregate_common::merge_arrays::merge_ordered_arrays;
@@ -52,7 +53,7 @@ use datafusion_functions_aggregate_common::order::AggregateOrderSensitivity;
 use datafusion_functions_aggregate_common::utils::ordering_fields;
 use datafusion_macros::user_doc;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
-use hashbrown::hash_table::HashTable;
+use hashbrown::{HashMap, hash_table::HashTable};
 
 make_udaf_expr_and_func!(
     ArrayAgg,
@@ -517,6 +518,95 @@ impl ArrayAggGroupsAccumulator {
         }
     }
 
+    /// Materializes arbitrary groups without changing the stored batches or
+    /// group indices.
+    fn build_selected_groups(&self, selected_groups: &[usize]) -> Result<ArrayRef> {
+        let mut selected_positions =
+            HashMap::<usize, Vec<usize>, RandomState>::with_capacity_and_hasher(
+                selected_groups.len(),
+                RandomState::default(),
+            );
+        for (output_index, &group_index) in selected_groups.iter().enumerate() {
+            selected_positions
+                .entry(group_index)
+                .or_default()
+                .push(output_index);
+        }
+
+        let mut counts = vec![0usize; selected_groups.len()];
+        for entries in &self.batch_entries {
+            for &(group_index, _) in entries {
+                if let Some(output_indices) =
+                    selected_positions.get(&(group_index as usize))
+                {
+                    for &output_index in output_indices {
+                        counts[output_index] =
+                            counts[output_index].checked_add(1).ok_or_else(|| {
+                                exec_datafusion_err!(
+                                    "Array aggregation output length overflow"
+                                )
+                            })?;
+                    }
+                }
+            }
+        }
+
+        let mut offsets = Vec::<i32>::with_capacity(selected_groups.len() + 1);
+        offsets.push(0);
+        let mut nulls_builder = NullBufferBuilder::new(selected_groups.len());
+        let mut write_positions = Vec::with_capacity(selected_groups.len());
+        let mut total_rows = 0usize;
+        for count in counts {
+            if count == 0 {
+                nulls_builder.append_null();
+            } else {
+                nulls_builder.append_non_null();
+            }
+            write_positions.push(total_rows);
+            total_rows = total_rows.checked_add(count).ok_or_else(|| {
+                exec_datafusion_err!("Array aggregation output length overflow")
+            })?;
+            offsets.push(i32::try_from(total_rows).map_err(|_| {
+                exec_datafusion_err!(
+                    "Array aggregation output exceeds i32 offset capacity"
+                )
+            })?);
+        }
+
+        let flat_values = if total_rows == 0 {
+            new_empty_array(&self.datatype)
+        } else {
+            let mut interleave_indices = vec![(0usize, 0usize); total_rows];
+            for (batch_index, entries) in self.batch_entries.iter().enumerate() {
+                for &(group_index, row_index) in entries {
+                    if let Some(output_indices) =
+                        selected_positions.get(&(group_index as usize))
+                    {
+                        for &output_index in output_indices {
+                            let write_position = write_positions[output_index];
+                            interleave_indices[write_position] =
+                                (batch_index, row_index as usize);
+                            write_positions[output_index] += 1;
+                        }
+                    }
+                }
+            }
+
+            let sources: Vec<&dyn Array> =
+                self.batches.iter().map(|batch| batch.as_ref()).collect();
+            arrow::compute::interleave(&sources, &interleave_indices)?
+        };
+
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
+        let field = Arc::new(Field::new_list_field(self.datatype.clone(), true));
+        Ok(Arc::new(ListArray::new(
+            field,
+            offsets,
+            flat_values,
+            nulls_builder.finish(),
+        )))
+    }
+
     fn clear_state(&mut self) {
         // `size()` measures Vec capacity rather than len, so allocate new
         // buffers instead of using `clear()`.
@@ -728,8 +818,29 @@ impl GroupsAccumulator for ArrayAggGroupsAccumulator {
         Ok(Arc::new(result))
     }
 
+    fn evaluate_preserving(&mut self, selection: GroupSelection<'_>) -> Result<ArrayRef> {
+        selection.validate_num_groups(self.num_groups)?;
+        let selected_groups = selection.iter().collect::<Vec<_>>();
+        self.build_selected_groups(&selected_groups)
+    }
+
+    fn supports_evaluate_preserving(&self) -> bool {
+        true
+    }
+
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
         Ok(vec![self.evaluate(emit_to)?])
+    }
+
+    fn state_preserving(
+        &mut self,
+        selection: GroupSelection<'_>,
+    ) -> Result<Vec<ArrayRef>> {
+        self.evaluate_preserving(selection).map(|array| vec![array])
+    }
+
+    fn supports_state_preserving(&self) -> bool {
+        true
     }
 
     fn merge_batch(
@@ -2155,6 +2266,56 @@ mod tests {
     ) -> Result<Vec<Option<Vec<Option<i32>>>>> {
         let result = acc.evaluate(emit_to)?;
         Ok(list_array_to_i32_vecs(result.as_list::<i32>()))
+    }
+
+    #[test]
+    fn groups_accumulator_preserving_reads() -> Result<()> {
+        let mut acc = ArrayAggGroupsAccumulator::new(DataType::Int32, false);
+        let values: ArrayRef =
+            Arc::new(Int32Array::from(vec![Some(10), None, Some(20), Some(30)]));
+        acc.update_batch(&[values], &[0, 1, 0, 2], None, 4)?;
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![40, 50]));
+        acc.update_batch(&[values], &[2, 0], None, 4)?;
+
+        let selection = GroupSelection::try_from_indices(&[2, 0, 2, 3, 1], 4)?;
+        let expected = vec![
+            Some(vec![Some(30), Some(40)]),
+            Some(vec![Some(10), Some(20), Some(50)]),
+            Some(vec![Some(30), Some(40)]),
+            None,
+            Some(vec![None]),
+        ];
+        for _ in 0..2 {
+            let result = acc.evaluate_preserving(selection)?;
+            assert_eq!(list_array_to_i32_vecs(result.as_list::<i32>()), expected);
+        }
+        let state = acc.state_preserving(selection)?;
+        assert_eq!(state.len(), 1);
+        assert_eq!(list_array_to_i32_vecs(state[0].as_list::<i32>()), expected);
+
+        let empty = GroupSelection::try_from_indices(&[], 4)?;
+        let result = acc.evaluate_preserving(empty)?;
+        assert_eq!(
+            result.data_type(),
+            &DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)))
+        );
+        assert!(result.is_empty());
+
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![60]));
+        acc.update_batch(&[values], &[3], None, 4)?;
+        let all = acc.evaluate_preserving(GroupSelection::all(4))?;
+        assert_eq!(
+            list_array_to_i32_vecs(all.as_list::<i32>()),
+            vec![
+                Some(vec![Some(10), Some(20), Some(50)]),
+                Some(vec![None]),
+                Some(vec![Some(30), Some(40)]),
+                Some(vec![Some(60)]),
+            ]
+        );
+        assert!(acc.supports_evaluate_preserving());
+        assert!(acc.supports_state_preserving());
+        Ok(())
     }
 
     #[test]
