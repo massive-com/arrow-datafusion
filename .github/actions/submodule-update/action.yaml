@@ -11,7 +11,7 @@ runs:
       shell: bash
       run: |
         # This avoids "fatal: detected dubious ownership in repository"
-        git config --system --add safe.directory "$GITHUB_WORKSPACE"
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
         # We disable submodule updates in .gitmodules so Cargo doesn't check them out
         # when this repo is used as a git dependency, but we need that data for tests. 
