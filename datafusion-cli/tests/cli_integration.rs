@@ -210,15 +210,15 @@ async fn provision_rustfs_container(
         ]),
     ];
 
-            for command in commands {
-                let command =
-                    command.with_cmd_ready_condition(CmdWaitFor::Exit { code: Some(0) });
+    for command in commands {
+        let command =
+            command.with_cmd_ready_condition(CmdWaitFor::Exit { code: Some(0) });
 
-                let cmd_ref = format!("{command:?}");
+        let cmd_ref = format!("{command:?}");
 
-                if let Err(e) = container.exec(command).await {
-                    let stdout = container.stdout_to_vec().await.unwrap_or_default();
-                    let stderr = container.stderr_to_vec().await.unwrap_or_default();
+        if let Err(e) = container.exec(command).await {
+            let stdout = container.stdout_to_vec().await.unwrap_or_default();
+            let stderr = container.stderr_to_vec().await.unwrap_or_default();
 
             return Err(format!(
                 "Failed to execute command: {}\nError: {}\nStdout: {:?}\nStderr: {:?}",
@@ -691,15 +691,6 @@ fn test_cli_wide_result_set_no_crash() {
 async fn test_cli() {
     let Some(container) = start_rustfs_or_skip().await else {
         return;
-    }
-
-    let container = match setup_minio_container().await {
-        Ok(c) => c,
-        Err(e) if e.contains("toomanyrequests") => {
-            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
-            return;
-        }
-        e @ Err(_) => e.unwrap(),
     };
 
     let settings = make_settings();
@@ -727,19 +718,11 @@ async fn test_aws_options() {
 
     let Some(container) = start_rustfs_or_skip().await else {
         return;
-    }
+    };
 
     let settings = make_settings();
     let _bound = settings.bind_to_scope();
 
-    let container = match setup_minio_container().await {
-        Ok(c) => c,
-        Err(e) if e.contains("toomanyrequests") => {
-            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
-            return;
-        }
-        e @ Err(_) => e.unwrap(),
-    };
     let port = container.get_host_port_ipv4(9000).await.unwrap();
 
     let input = format!(
@@ -825,15 +808,6 @@ fn test_backtrace_output(#[case] query: &str) {
 async fn test_s3_url_fallback() {
     let Some(container) = start_rustfs_or_skip().await else {
         return;
-    }
-
-    let container = match setup_minio_container().await {
-        Ok(c) => c,
-        Err(e) if e.contains("toomanyrequests") => {
-            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
-            return;
-        }
-        e @ Err(_) => e.unwrap(),
     };
 
     let mut settings = make_settings();
@@ -861,16 +835,8 @@ SELECT * FROM partitioned_data ORDER BY column_1, column_2 LIMIT 5;
 async fn test_object_store_profiling() {
     let Some(container) = start_rustfs_or_skip().await else {
         return;
-    }
-
-    let container = match setup_minio_container().await {
-        Ok(c) => c,
-        Err(e) if e.contains("toomanyrequests") => {
-            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
-            return;
-        }
-        e @ Err(_) => e.unwrap(),
     };
+
     let mut settings = make_settings();
 
     // as the object store profiling contains timestamps and durations, we must
