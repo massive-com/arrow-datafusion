@@ -55,6 +55,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Fetch test data
         run: |
+          # This avoids "fatal: detected dubious ownership in repository"
+          git config --system --add safe.directory "$GITHUB_WORKSPACE"
+
           # We disable submodule updates in .gitmodules so Cargo doesn't check them out
           # when this repo is used as a git dependency, but we need that data for tests. 
           # "--checkout" acquires it for us normally.
