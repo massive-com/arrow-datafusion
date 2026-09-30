@@ -17,4 +17,4 @@ runs:
         # We disable submodule updates in .gitmodules so Cargo doesn't check them out
         # when this repo is used as a git dependency, but we need that data for tests. 
         # "--checkout" acquires it for us normally.
-        git -c protocol.version=2 submodule update --init --checkout --force --depth=${{ inputs.fetch-depth }}
+        git -c protocol.version=2 submodule update --init --checkout --force --depth="${{ inputs.fetch-depth }}""
