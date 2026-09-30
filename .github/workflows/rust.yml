@@ -298,7 +298,8 @@ jobs:
         - /usr/local:/host/usr/local
     steps:
       - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2.3.0
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/submodule-update
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -356,7 +357,8 @@ jobs:
     runs-on: ${{ vars.USE_RUNS_ON == 'true' && format('runs-on={0},family=m8a+m7a+c8a,cpu=16,image=ubuntu24-full-x64,extras=s3-cache,disk=large,tag=datafusion', github.run_id) || 'ubuntu-latest' }}
     steps:
       - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2.3.0
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/submodule-update
       - name: Setup Rust toolchain
         run: rustup toolchain install stable
       - name: Rust Dependency Cache
@@ -385,7 +387,8 @@ jobs:
       image: amd64/rust
     steps:
       - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2.3.0
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/submodule-update
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -413,7 +416,8 @@ jobs:
       image: amd64/rust
     steps:
       - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2.3.0
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/submodule-update
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -474,7 +478,8 @@ jobs:
       image: amd64/rust
     steps:
       - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2.3.0
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/submodule-update
       - parallel:
           - name: Setup Rust toolchain
             uses: ./.github/actions/setup-builder
@@ -520,7 +525,8 @@ jobs:
           --health-retries 5
     steps:
       - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2.3.0
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/submodule-update
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -542,7 +548,8 @@ jobs:
       image: amd64/rust
     steps:
       - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2.3.0
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/submodule-update
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -582,7 +589,8 @@ jobs:
     name: cargo test (macos-aarch64)
     runs-on: macos-15
     steps:
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/submodule-update
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-macos-aarch64-builder
       - name: Run datafusion-ffi tests
@@ -638,7 +646,8 @@ jobs:
       image: amd64/rust
     steps:
       - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2.3.0
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/submodule-update
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -661,7 +670,8 @@ jobs:
     container:
       image: amd64/rust
     steps:
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/submodule-update
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -682,7 +692,8 @@ jobs:
       image: amd64/rust
     steps:
       - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2.3.0
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/submodule-update
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
         with:
@@ -714,7 +725,8 @@ jobs:
       image: amd64/rust
 
     steps:
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: ./.github/actions/submodule-update
 
       - parallel:
           - name: Mark repository as safe for git

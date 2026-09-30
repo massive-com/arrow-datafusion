@@ -1,25 +1,14 @@
-name: Checkout
+name: Update submodules (with checkout)
 description: ''
 inputs:
   with:
-    submodules: 
-      required: false
-      default: true
     fetch-depth:
       required: false
       default: 1
-    ref:
-      required: false
-      default: ''
 runs:
   using: "composite"
   steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      with:
-        ref: ${{ inputs.ref }}
-
     - name: Fetch test data
-      if: ${{ inputs.submodules }}
       shell: bash
       run: |
         # This avoids "fatal: detected dubious ownership in repository"

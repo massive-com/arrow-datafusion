@@ -64,9 +64,10 @@ jobs:
     # note: do not use amd/rust container to preserve disk space
     steps:
       - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a  # v2.3.0
-      - uses: ./.github/actions/checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.inputs.pr_head_sha }} # will be empty if triggered by push
+      - uses: ./.github/actions/submodule-update
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be  # v1.3.1
       - parallel:
