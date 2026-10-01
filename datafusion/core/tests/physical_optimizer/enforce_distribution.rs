@@ -4676,7 +4676,11 @@ async fn assert_reoptimized_fetch_values(
             if iteration > 0 {
                 let distribution =
                     DistributionContext::new_default(Arc::clone(&optimized))
-                        .transform_up(|context| ensure_distribution(context, &config))?
+                        .transform_up(|context| {
+                            let stats =
+                        datafusion_physical_plan::statistics::StatisticsContext::new();
+                            ensure_distribution_with_stats(context, &config, &stats)
+                        })?
                         .data;
                 check_integrity(distribution)?;
                 optimized = EnsureRequirements::new().optimize(optimized, &config)?;
@@ -4751,7 +4755,11 @@ async fn check_fetch_below_filter(
     for iteration in 0..3 {
         if iteration > 0 {
             let distribution = DistributionContext::new_default(Arc::clone(&plan))
-                .transform_up(|context| ensure_distribution(context, &config))?
+                .transform_up(|context| {
+                    let stats =
+                        datafusion_physical_plan::statistics::StatisticsContext::new();
+                    ensure_distribution_with_stats(context, &config, &stats)
+                })?
                 .data;
             check_integrity(distribution)?;
             plan = EnsureRequirements::new().optimize(plan, &config)?;
