@@ -48,6 +48,7 @@ datafusion-datasource = { workspace = true }
 datafusion-execution = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-physical-expr-common = { workspace = true }
+datafusion-physical-expr-adapter = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 datafusion-proto-models = { workspace = true, optional = true }
 datafusion-session = { workspace = true }
