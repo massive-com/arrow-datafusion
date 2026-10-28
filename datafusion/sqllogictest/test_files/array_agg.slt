@@ -618,3 +618,120 @@ List(Dictionary(Int32, Utf8))
 
 statement ok
 drop table array_agg_distinct_dict_table;
+
+#######
+# array_agg(DISTINCT ...) with GROUP BY, which runs through the groups accumulator.
+# Without ORDER BY the element order depends on partitioning, so results are sorted.
+
+statement ok
+create table distinct_groups(g int, s varchar, n bigint) as values
+  (1, 'b', 10), (1, 'a', 20), (1, 'b', 10), (1, NULL, NULL),
+  (2, 'c', 30), (2, 'c', 30), (2, 'a', 10),
+  (3, NULL, NULL);
+
+query I??
+select g, array_sort(array_agg(distinct s)), array_sort(array_agg(distinct n))
+from distinct_groups group by g order by g;
+----
+1 [NULL, a, b] [NULL, 10, 20]
+2 [a, c] [10, 30]
+3 [NULL] [NULL]
+
+query I??
+select g, array_agg(distinct s order by s), array_agg(distinct n order by n desc)
+from distinct_groups group by g order by g;
+----
+1 [a, b, NULL] [NULL, 20, 10]
+2 [a, c] [30, 10]
+3 [NULL] [NULL]
+
+query I??
+select g, array_agg(distinct s order by s) ignore nulls, array_agg(distinct n order by n) ignore nulls
+from distinct_groups group by g order by g;
+----
+1 [a, b] [10, 20]
+2 [a, c] [10, 30]
+3 NULL NULL
+
+# FILTER with CARDINALITY, the shape used to count distinct values per group
+query III
+select g,
+  coalesce(cardinality(array_agg(distinct s) filter (where s is not null)), arrow_cast(0, 'UInt64')),
+  coalesce(cardinality(array_agg(distinct n) filter (where n > 10)), arrow_cast(0, 'UInt64'))
+from distinct_groups group by g order by g;
+----
+1 2 1
+2 2 1
+3 0 0
+
+# every string flavour, and a dictionary input keeps its type
+query I???T
+select g,
+  array_agg(distinct arrow_cast(s, 'Utf8View') order by arrow_cast(s, 'Utf8View')),
+  array_agg(distinct arrow_cast(s, 'LargeUtf8') order by arrow_cast(s, 'LargeUtf8')),
+  array_agg(distinct arrow_cast(s, 'Dictionary(Int32, Utf8)') order by arrow_cast(s, 'Dictionary(Int32, Utf8)')),
+  arrow_typeof(array_agg(distinct arrow_cast(s, 'Dictionary(Int32, Utf8)')))
+from distinct_groups group by g order by g;
+----
+1 [a, b, NULL] [a, b, NULL] [a, b, NULL] List(Dictionary(Int32, Utf8))
+2 [a, c] [a, c] [a, c] List(Dictionary(Int32, Utf8))
+3 [NULL] [NULL] [NULL] List(Dictionary(Int32, Utf8))
+
+# ORDER BY must still be the aggregated expression
+query error Execution error: In an aggregate with DISTINCT, ORDER BY expressions must appear in argument list
+select g, array_agg(distinct s order by n) from distinct_groups group by g;
+
+statement ok
+drop table distinct_groups;
+
+# many groups, each seeing every residue of 7 twice across partitions
+query II
+select count(*), count(*) filter (where k = 7)
+from (
+  select v % 1000 as g, array_length(array_agg(distinct v % 7)) as k
+  from (select unnest(range(0, 14000)) as v) group by v % 1000
+);
+----
+1000 1000
+
+# the Partial phase can hand rows straight to the Final phase
+statement ok
+set datafusion.execution.skip_partial_aggregation_probe_rows_threshold = 0;
+
+statement ok
+set datafusion.execution.skip_partial_aggregation_probe_ratio_threshold = 0.0;
+
+query II
+select count(*), count(*) filter (where k = 7)
+from (
+  select v % 1000 as g, array_length(array_agg(distinct v % 7)) as k
+  from (select unnest(range(0, 14000)) as v) group by v % 1000
+);
+----
+1000 1000
+
+statement ok
+reset datafusion.execution.skip_partial_aggregation_probe_rows_threshold;
+
+statement ok
+reset datafusion.execution.skip_partial_aggregation_probe_ratio_threshold;
+
+# input ordered by the group key, so groups are emitted as they complete
+statement ok
+create external table distinct_ordered(a0 int, a int, b int, c int, d int)
+stored as csv
+with order (a asc, b asc)
+location '../core/tests/data/window_2.csv'
+options ('format.has_header' 'true');
+
+query II?
+select a, b, array_agg(distinct d order by d)
+from distinct_ordered group by a, b order by a, b;
+----
+0 0 [0, 1, 2, 3, 4]
+0 1 [0, 1, 2, 3, 4]
+1 2 [0, 1, 2, 3, 4]
+1 3 [0, 1, 2, 3, 4]
+
+statement ok
+drop table distinct_ordered;

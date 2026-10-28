@@ -55,6 +55,10 @@ use datafusion_macros::user_doc;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use hashbrown::{HashMap, hash_table::HashTable};
 
+mod distinct_groups;
+
+pub use distinct_groups::DistinctArrayAggGroupsAccumulator;
+
 make_udaf_expr_and_func!(
     ArrayAgg,
     array_agg,
@@ -178,29 +182,7 @@ impl AggregateUDFImpl for ArrayAgg {
         let ignore_nulls = acc_args.ignore_nulls && field.is_nullable();
 
         if acc_args.is_distinct {
-            // Limitation similar to Postgres. The aggregation function can only mix
-            // DISTINCT and ORDER BY if all the expressions in the ORDER BY appear
-            // also in the arguments of the function. This implies that if the
-            // aggregation function only accepts one argument, only one argument
-            // can be used in the ORDER BY, For example:
-            //
-            // ARRAY_AGG(DISTINCT col)
-            //
-            // can only be mixed with an ORDER BY if the order expression is "col".
-            //
-            // ARRAY_AGG(DISTINCT col ORDER BY col)                         <- Valid
-            // ARRAY_AGG(DISTINCT concat(col, '') ORDER BY concat(col, '')) <- Valid
-            // ARRAY_AGG(DISTINCT col ORDER BY other_col)                   <- Invalid
-            // ARRAY_AGG(DISTINCT col ORDER BY concat(col, ''))             <- Invalid
-            let sort_option = match acc_args.order_bys {
-                [single] if single.expr.eq(&acc_args.exprs[0]) => Some(single.options),
-                [] => None,
-                _ => {
-                    return exec_err!(
-                        "In an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
-                    );
-                }
-            };
+            let sort_option = distinct_sort_options(&acc_args)?;
             return Ok(Box::new(DistinctArrayAggAccumulator::try_new(
                 data_type,
                 sort_option,
@@ -236,7 +218,13 @@ impl AggregateUDFImpl for ArrayAgg {
     }
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
-        !args.is_distinct && args.order_bys.is_empty()
+        if args.is_distinct {
+            return distinct_sort_options(&args).is_ok()
+                && DistinctArrayAggGroupsAccumulator::supports_type(
+                    args.expr_fields[0].data_type(),
+                );
+        }
+        args.order_bys.is_empty()
     }
 
     fn create_groups_accumulator(
@@ -244,10 +232,18 @@ impl AggregateUDFImpl for ArrayAgg {
         args: AccumulatorArgs,
     ) -> Result<Box<dyn GroupsAccumulator>> {
         let field = &args.expr_fields[0];
-        let data_type = field.data_type().clone();
+        let data_type = field.data_type();
         let ignore_nulls = args.ignore_nulls && field.is_nullable();
+        if args.is_distinct {
+            let sort_options = distinct_sort_options(&args)?;
+            return Ok(Box::new(DistinctArrayAggGroupsAccumulator::try_new(
+                data_type,
+                sort_options,
+                ignore_nulls,
+            )?));
+        }
         Ok(Box::new(ArrayAggGroupsAccumulator::new(
-            data_type,
+            data_type.clone(),
             ignore_nulls,
         )))
     }
@@ -258,6 +254,32 @@ impl AggregateUDFImpl for ArrayAgg {
 
     fn documentation(&self) -> Option<&Documentation> {
         self.doc()
+    }
+}
+
+/// Sort direction of a `DISTINCT` aggregate's `ORDER BY`, or `None` without one.
+///
+/// Limitation similar to Postgres. The aggregation function can only mix
+/// DISTINCT and ORDER BY if all the expressions in the ORDER BY appear
+/// also in the arguments of the function. This implies that if the
+/// aggregation function only accepts one argument, only one argument
+/// can be used in the ORDER BY, For example:
+///
+/// ARRAY_AGG(DISTINCT col)
+///
+/// can only be mixed with an ORDER BY if the order expression is "col".
+///
+/// ARRAY_AGG(DISTINCT col ORDER BY col)                         <- Valid
+/// ARRAY_AGG(DISTINCT concat(col, '') ORDER BY concat(col, '')) <- Valid
+/// ARRAY_AGG(DISTINCT col ORDER BY other_col)                   <- Invalid
+/// ARRAY_AGG(DISTINCT col ORDER BY concat(col, ''))             <- Invalid
+fn distinct_sort_options(args: &AccumulatorArgs) -> Result<Option<SortOptions>> {
+    match args.order_bys {
+        [single] if single.expr.eq(&args.exprs[0]) => Ok(Some(single.options)),
+        [] => Ok(None),
+        _ => exec_err!(
+            "In an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+        ),
     }
 }
 

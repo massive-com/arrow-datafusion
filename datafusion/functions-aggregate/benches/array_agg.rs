@@ -24,10 +24,12 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Int64Type};
 use criterion::{Criterion, criterion_group, criterion_main};
-use datafusion_expr::Accumulator;
+use datafusion_common::Result;
+use datafusion_expr::{Accumulator, EmitTo, GroupsAccumulator};
 use datafusion_functions_aggregate::array_agg::{
-    ArrayAggAccumulator, DistinctArrayAggAccumulator,
+    ArrayAggAccumulator, DistinctArrayAggAccumulator, DistinctArrayAggGroupsAccumulator,
 };
+use datafusion_functions_aggregate_common::aggregate::groups_accumulator::GroupsAccumulatorAdapter;
 
 use arrow::buffer::OffsetBuffer;
 use arrow::util::bench_util::create_primitive_array;
@@ -290,5 +292,104 @@ fn distinct_array_agg_benchmark(c: &mut Criterion) {
     );
 }
 
-criterion_group!(benches, array_agg_benchmark, distinct_array_agg_benchmark);
+/// Batches for a grouped aggregation: every row of a batch belongs to a
+/// different group, and values are drawn from `cardinality` distinct strings.
+fn distinct_groups_batches(
+    num_groups: usize,
+    cardinality: usize,
+    num_batches: usize,
+) -> Vec<(ArrayRef, Vec<usize>)> {
+    let mut rng = seedable_rng();
+    (0..num_batches)
+        .map(|_| {
+            let values = StringArray::from_iter_values(
+                (0..num_groups)
+                    .map(|_| format!("T{:05}", rng.random_range(0..cardinality))),
+            );
+            (Arc::new(values) as ArrayRef, (0..num_groups).collect())
+        })
+        .collect()
+}
+
+type MakeGroupsAccumulator = fn() -> Box<dyn GroupsAccumulator>;
+
+/// The pre-existing path: one `DistinctArrayAggAccumulator` per group.
+fn distinct_adapter() -> Box<dyn GroupsAccumulator> {
+    Box::new(GroupsAccumulatorAdapter::new(|| {
+        Ok(Box::new(DistinctArrayAggAccumulator::try_new(
+            &DataType::Utf8,
+            None,
+            false,
+        )?))
+    }))
+}
+
+fn distinct_groups() -> Box<dyn GroupsAccumulator> {
+    Box::new(
+        DistinctArrayAggGroupsAccumulator::try_new(&DataType::Utf8, None, false).unwrap(),
+    )
+}
+
+fn update_all(
+    acc: &mut dyn GroupsAccumulator,
+    batches: &[(ArrayRef, Vec<usize>)],
+    num_groups: usize,
+) -> Result<()> {
+    for (values, groups) in batches {
+        acc.update_batch(std::slice::from_ref(values), groups, None, num_groups)?;
+    }
+    Ok(())
+}
+
+fn distinct_groups_benchmark(c: &mut Criterion) {
+    // 4 096 groups, 32 rows each from 1 024 values: ~31 distinct values per group.
+    let num_groups = 4096;
+    let batches = distinct_groups_batches(num_groups, 1024, 32);
+    let all_groups: Vec<usize> = (0..num_groups).collect();
+
+    let implementations: [(&str, MakeGroupsAccumulator); 2] =
+        [("adapter", distinct_adapter), ("groups", distinct_groups)];
+    for (name, make) in implementations {
+        c.bench_function(
+            &format!("distinct_array_agg grouped update + state ({name})"),
+            |b| {
+                b.iter(|| {
+                    let mut acc = make();
+                    update_all(acc.as_mut(), &batches, num_groups).unwrap();
+                    black_box(acc.state(EmitTo::All).unwrap())
+                })
+            },
+        );
+
+        // Four partial states over disjoint slices of the input, merged as a
+        // final aggregation would.
+        let states: Vec<Vec<ArrayRef>> = batches
+            .chunks(8)
+            .map(|chunk| {
+                let mut acc = make();
+                update_all(acc.as_mut(), chunk, num_groups).unwrap();
+                acc.state(EmitTo::All).unwrap()
+            })
+            .collect();
+        c.bench_function(
+            &format!("distinct_array_agg grouped merge + evaluate ({name})"),
+            |b| {
+                b.iter(|| {
+                    let mut acc = make();
+                    for state in &states {
+                        acc.merge_batch(state, &all_groups, num_groups).unwrap();
+                    }
+                    black_box(acc.evaluate(EmitTo::All).unwrap())
+                })
+            },
+        );
+    }
+}
+
+criterion_group!(
+    benches,
+    array_agg_benchmark,
+    distinct_array_agg_benchmark,
+    distinct_groups_benchmark
+);
 criterion_main!(benches);
