@@ -23,11 +23,11 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, ArrowPrimitiveType, AsArray, BooleanArray, ListArray,
-    NullBufferBuilder, PrimitiveArray,
+    Array, ArrayRef, ArrowPrimitiveType, AsArray, BooleanArray, BooleanBufferBuilder,
+    ListArray, NullBufferBuilder, PrimitiveArray,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow::compute::{SortOptions, cast, sort_to_indices};
+use arrow::compute::{SortOptions, cast, filter, sort_to_indices};
 use arrow::datatypes::{
     DataType, Date32Type, Date64Type, Decimal32Type, Decimal64Type, Decimal128Type,
     Decimal256Type, DurationMicrosecondType, DurationMillisecondType,
@@ -264,28 +264,46 @@ impl DistinctArrayAggGroupsAccumulator {
     /// The dictionary is rebuilt from the retained pairs so that it only holds
     /// values the retained groups still reference.
     fn retain_groups_from(&mut self, n: usize) -> Result<()> {
+        if n == self.num_groups() {
+            self.reset();
+            return Ok(());
+        }
+        if n == 0 {
+            return Ok(());
+        }
         let retained: Vec<u64> = self
             .pairs
             .iter()
             .copied()
             .filter(|&key| unpack(key).0 >= n)
             .collect();
-        let retained_ids: Vec<u32> = retained.iter().map(|&key| unpack(key).1).collect();
+        // Copy each surviving value once, even when many groups reference it.
+        // Expanding shared strings per pair here can dwarf the stored state.
+        let mut remap = vec![u32::MAX; self.dictionary.len()];
+        let mut retained_ids = Vec::new();
+        for &key in &retained {
+            let id = unpack(key).1;
+            if remap[id as usize] == u32::MAX {
+                remap[id as usize] = retained_ids.len() as u32;
+                retained_ids.push(id);
+            }
+        }
         let retained_values = self.dictionary.keys(&retained_ids)?;
         self.dictionary.clear();
         self.dictionary.intern(&retained_values, &mut self.ids)?;
 
-        self.pairs = Vec::with_capacity(retained.len());
-        self.pair_set = HashTable::with_capacity(retained.len());
+        self.pairs = retained;
+        self.pair_set = HashTable::with_capacity(self.pairs.len());
         self.pair_set_size = self.pair_set.capacity() * size_of::<u64>();
         let random_state = &self.random_state;
-        for (&key, &id) in retained.iter().zip(&self.ids) {
-            let key = pack(unpack(key).0 - n, id);
+        for key in &mut self.pairs {
+            let (group, old_id) = unpack(*key);
+            let id = self.ids[remap[old_id as usize] as usize];
+            *key = pack(group - n, id);
             self.pair_set
-                .insert_unique(random_state.hash_one(key), key, |&key| {
+                .insert_unique(random_state.hash_one(*key), *key, |&key| {
                     random_state.hash_one(key)
                 });
-            self.pairs.push(key);
         }
         split_vec_min_alloc(&mut self.counts, n);
         Ok(())
@@ -306,16 +324,23 @@ impl GroupsAccumulator for DistinctArrayAggGroupsAccumulator {
             return internal_err!("ARRAY_AGG(DISTINCT) expects an argument");
         };
         self.grow_groups(total_num_groups)?;
-        self.intern(values)?;
+        // Rejected values must not accumulate in the shared dictionary.
+        if let Some(predicate) = opt_filter {
+            self.intern(&filter(values.as_ref(), predicate)?)?;
+        } else {
+            self.intern(values)?;
+        }
         let skipped_null_id = self.skipped_null_id();
 
+        let mut position = 0;
         for (row, &group) in group_indices.iter().enumerate() {
             if let Some(filter) = opt_filter
                 && !(filter.is_valid(row) && filter.value(row))
             {
                 continue;
             }
-            let id = self.ids[row];
+            let id = self.ids[position];
+            position += 1;
             if Some(id) == skipped_null_id {
                 continue;
             }
@@ -409,15 +434,27 @@ impl GroupsAccumulator for DistinctArrayAggGroupsAccumulator {
         let offsets = lists.offsets();
         let first = offsets[0] as usize;
         let last = offsets[offsets.len() - 1] as usize;
-        self.intern(&lists.values().slice(first, last - first))?;
+        let mut values = lists.values().slice(first, last - first);
+        if lists.null_count() > 0 {
+            // Null lists from convert_to_state can still reference rejected
+            // input values. Exclude their children before interning them.
+            let mut valid = BooleanBufferBuilder::new(values.len());
+            for (row, offsets) in offsets.windows(2).enumerate() {
+                valid.append_n((offsets[1] - offsets[0]) as usize, lists.is_valid(row));
+            }
+            values = filter(values.as_ref(), &BooleanArray::new(valid.finish(), None))?;
+        }
+        self.intern(&values)?;
         let skipped_null_id = self.skipped_null_id();
 
+        let mut position = 0;
         for (row, &group) in group_indices.iter().enumerate() {
             if lists.is_null(row) {
                 continue;
             }
-            for position in offsets[row] as usize..offsets[row + 1] as usize {
-                let id = self.ids[position - first];
+            for _ in offsets[row]..offsets[row + 1] {
+                let id = self.ids[position];
+                position += 1;
                 if Some(id) == skipped_null_id {
                     continue;
                 }
@@ -879,6 +916,63 @@ mod tests {
     }
 
     #[test]
+    fn filtered_values_do_not_accumulate_in_dictionary() -> Result<()> {
+        for data_type in [
+            DataType::Utf8,
+            DataType::Utf8View,
+            DataType::Binary,
+            DataType::Int64,
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        ] {
+            for merge in [false, true] {
+                for reject_all in [false, true] {
+                    let mut acc = accumulator(data_type.clone(), None, false);
+                    let filter = BooleanArray::from_iter((0..32).map(|row| {
+                        if row % 2 == 0 {
+                            Some(row == 0 && !reject_all)
+                        } else {
+                            None
+                        }
+                    }));
+                    let groups: Vec<usize> = (0..32).map(|row| row % 2).collect();
+                    let mut initial_size = 0;
+                    for batch in 0..100 {
+                        let values = StringArray::from_iter_values((0..32).map(|row| {
+                            if row == 0 {
+                                "0".to_string()
+                            } else {
+                                (batch * 32 + row).to_string()
+                            }
+                        }));
+                        let values = cast(&values, &data_type)?;
+                        if merge {
+                            let state = acc.convert_to_state(&[values], Some(&filter))?;
+                            acc.merge_batch(&state, &groups, 3)?;
+                        } else {
+                            acc.update_batch(&[values], &groups, Some(&filter), 3)?;
+                        }
+                        if batch == 0 {
+                            initial_size = acc.size();
+                        }
+                        assert_eq!(
+                            acc.size(),
+                            initial_size,
+                            "{data_type}, merge={merge}, reject_all={reject_all}"
+                        );
+                    }
+                    assert_eq!(acc.dictionary.len(), usize::from(!reject_all));
+                    let expected = if reject_all { None } else { list(&[Some("0")]) };
+                    assert_eq!(
+                        lists(&acc.evaluate(EmitTo::All)?),
+                        vec![expected, None, None]
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn order_by_sorts_each_group() -> Result<()> {
         let desc_nulls_first = SortOptions {
             descending: true,
@@ -953,6 +1047,42 @@ mod tests {
     }
 
     #[test]
+    fn merge_sliced_state_skips_children_of_null_lists() -> Result<()> {
+        // Null lists can reference nonempty, variable-length child ranges.
+        let state = ListArray::try_new(
+            Arc::new(Field::new_list_field(DataType::Utf8, true)),
+            OffsetBuffer::new(vec![0, 1, 3, 5, 5, 8, 9].into()),
+            strings(&[
+                Some("before slice"),
+                Some("discard 1"),
+                Some("discard 2"),
+                Some("a"),
+                None,
+                Some("discard 3"),
+                Some("discard 4"),
+                Some("discard 5"),
+                Some("after slice"),
+            ]),
+            Some(NullBuffer::from(vec![true, false, true, true, false, true])),
+        )?;
+        for ignore_nulls in [false, true] {
+            let mut acc = accumulator(DataType::Utf8, None, ignore_nulls);
+            acc.merge_batch(&[Arc::new(state.slice(1, 4))], &[0, 1, 2, 0], 3)?;
+            assert_eq!(acc.dictionary.len(), 2);
+            let expected = if ignore_nulls {
+                list(&[Some("a")])
+            } else {
+                list(&[Some("a"), None])
+            };
+            assert_eq!(
+                lists(&acc.evaluate(EmitTo::All)?),
+                vec![None, expected, None]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn convert_to_state_nulls_filtered_and_ignored_rows() -> Result<()> {
         let filter = BooleanArray::from(vec![true, false, true]);
         let input = strings(&[Some("a"), Some("b"), None]);
@@ -1006,6 +1136,40 @@ mod tests {
         assert_eq!(
             lists(&acc.evaluate(EmitTo::All)?),
             vec![list(&[Some("c"), Some("d")]), list(&[Some("e")])]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn emit_first_keeps_shared_values_compact() -> Result<()> {
+        let mut acc = accumulator(DataType::Utf8, None, false);
+        acc.update_batch(&[strings(&[Some("discarded")])], &[0], None, 1)?;
+        let value = "x".repeat(16 * 1024);
+        let batch = strings(&vec![Some(value.as_str()); 64]);
+        for start in (0..4096).step_by(64) {
+            let groups: Vec<usize> = (start..start + 64).collect();
+            acc.update_batch(&[Arc::clone(&batch)], &groups, None, start + 64)?;
+        }
+        let size_before = acc.size();
+        let first = acc.evaluate(EmitTo::First(1))?;
+        assert_eq!(
+            lists(&first),
+            vec![list(&[Some("discarded"), Some(&value)])]
+        );
+        assert_eq!(acc.dictionary.len(), 1);
+        assert_eq!(acc.num_groups(), 4095);
+        // Compaction must not grow scratch buffers to one entry per pair.
+        assert!(
+            acc.size() <= size_before + 4096,
+            "state grew from {size_before} to {} while emitting a group",
+            acc.size()
+        );
+        acc.update_batch(&[strings(&[Some(&value)])], &[0], None, 4095)?;
+        let remaining =
+            acc.evaluate_preserving(GroupSelection::try_from_indices(&[0, 4094], 4095)?)?;
+        assert_eq!(
+            lists(&remaining),
+            vec![list(&[Some(&value)]), list(&[Some(&value)])]
         );
         Ok(())
     }
