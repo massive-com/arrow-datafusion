@@ -1,0 +1,19 @@
+name: Update submodules (with checkout)
+description: ''
+inputs:
+  with:
+    fetch-depth:
+      required: false
+runs:
+  using: "composite"
+  steps:
+    - name: Fetch test data
+      shell: bash
+      run: |
+        # This avoids "fatal: detected dubious ownership in repository"
+        git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+        # We disable submodule updates in .gitmodules so Cargo doesn't check them out
+        # when this repo is used as a git dependency, but we need that data for tests. 
+        # "--checkout" acquires it for us normally.
+        git -c protocol.version=2 submodule update --init --checkout --force --depth=${{ inputs.fetch-depth || 1 }}
