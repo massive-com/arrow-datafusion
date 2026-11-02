@@ -289,6 +289,11 @@ impl From<&CsvOptionsProto> for CsvOptions {
             } else {
                 Some(proto.ignore_trailing_whitespace[0] != 0)
             },
+            match_columns_by_header: if proto.match_columns_by_header.is_empty() {
+                None
+            } else {
+                Some(proto.match_columns_by_header[0] != 0)
+            },
         }
     }
 }

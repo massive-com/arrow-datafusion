@@ -305,6 +305,14 @@ impl CsvFormat {
         self
     }
 
+    /// Set whether file columns are matched to the table schema by header name
+    /// instead of by position
+    /// - defaults to false
+    pub fn with_match_columns_by_header(mut self, match_by_header: bool) -> Self {
+        self.options.match_columns_by_header = Some(match_by_header);
+        self
+    }
+
     /// The delimiter character.
     pub fn delimiter(&self) -> u8 {
         self.options.delimiter
@@ -966,6 +974,9 @@ impl From<&CsvFormatFactory> for datafusion_proto_models::protobuf::CsvOptions {
                     .map_or(vec![], |v| vec![v as u8]),
                 ignore_trailing_whitespace: options
                     .ignore_trailing_whitespace
+                    .map_or(vec![], |v| vec![v as u8]),
+                match_columns_by_header: options
+                    .match_columns_by_header
                     .map_or(vec![], |v| vec![v as u8]),
             }
         } else {
