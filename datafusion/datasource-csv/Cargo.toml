@@ -53,6 +53,7 @@ datafusion-physical-plan = { workspace = true }
 datafusion-proto-models = { workspace = true, optional = true }
 datafusion-session = { workspace = true }
 futures = { workspace = true }
+log = { workspace = true }
 object_store = { workspace = true }
 regex = { workspace = true }
 tokio = { workspace = true }

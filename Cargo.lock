@@ -2026,6 +2026,7 @@ dependencies = [
  "datafusion-proto-models",
  "datafusion-session",
  "futures",
+ "log",
  "object_store",
  "regex",
  "tokio",

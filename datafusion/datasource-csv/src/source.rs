@@ -21,7 +21,8 @@ use datafusion_datasource::boundary_stream::AlignedBoundaryStream;
 use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
 use datafusion_physical_plan::projection::ProjectionExprs;
 use std::fmt;
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::io::Read;
+use std::ops::Range;
 use std::sync::Arc;
 
 use datafusion_datasource::decoder::{DecoderDeserializer, deserialize_stream};
@@ -254,6 +255,9 @@ impl CsvSource {
         if let Some(escape) = self.escape() {
             format = format.with_escape(escape);
         }
+        if let Some(comment) = self.comment() {
+            format = format.with_comment(comment);
+        }
         let (schema, _) = format.infer_schema(line, Some(0))?;
         Ok(schema.fields().iter().map(|f| f.name().clone()).collect())
     }
@@ -347,42 +351,73 @@ impl HeaderMapping {
     }
 }
 
-/// Reads the bytes of the first line of `input`, returning them together with
-/// a stream that still yields every byte of `input`.
+/// Returns the byte range of the header row in `buf`: the first line that is
+/// not a comment line, matching how the CSV decoder skips comments. Returns
+/// `None` when that line is not yet complete and more input may follow.
+fn find_header_line(
+    buf: &[u8],
+    terminator: u8,
+    comment: Option<u8>,
+    eof: bool,
+) -> Option<Range<usize>> {
+    let is_comment = |line: &[u8]| comment.is_some_and(|c| line.first() == Some(&c));
+    let mut start = 0;
+    loop {
+        let rest = &buf[start..];
+        match rest.iter().position(|b| *b == terminator) {
+            Some(end) if is_comment(&rest[..end]) => start += end + 1,
+            Some(end) => return Some(start..start + end),
+            None if !eof => return None,
+            None if is_comment(rest) => return Some(buf.len()..buf.len()),
+            None => return Some(start..buf.len()),
+        }
+    }
+}
+
+/// Reads the header row of `input`, returning it together with a stream that
+/// still yields every byte of `input`.
 async fn peek_header_line(
     mut input: BoxStream<'static, Result<Bytes>>,
     terminator: u8,
+    comment: Option<u8>,
 ) -> Result<(Vec<u8>, BoxStream<'static, Result<Bytes>>)> {
-    let mut header = Vec::new();
+    let mut prefix = Vec::new();
     let mut buffered = Vec::new();
-    while let Some(chunk) = input.next().await.transpose()? {
-        let end = chunk.iter().position(|b| *b == terminator);
-        header.extend_from_slice(&chunk[..end.unwrap_or(chunk.len())]);
-        buffered.push(Ok(chunk));
-        if end.is_some() {
-            break;
+    loop {
+        let chunk = input.next().await.transpose()?;
+        let eof = chunk.is_none();
+        if let Some(chunk) = chunk {
+            prefix.extend_from_slice(&chunk);
+            buffered.push(Ok(chunk));
+        }
+        if let Some(header) = find_header_line(&prefix, terminator, comment, eof) {
+            let header = prefix[header].to_vec();
+            let buffered = futures::stream::iter(buffered);
+            let stream = if eof {
+                buffered.boxed()
+            } else {
+                buffered.chain(input).boxed()
+            };
+            return Ok((header, stream));
         }
     }
-    let stream = futures::stream::iter(buffered).chain(input).boxed();
-    Ok((header, stream))
 }
 
-/// Reads the first line of an uncompressed file, growing the requested range
-/// until a terminator is found.
+/// Reads the header row of an uncompressed file, growing the requested range
+/// until it is complete. Also returns the byte offset where the header starts.
 async fn fetch_header_line(
     store: &dyn ObjectStore,
     location: &Path,
     file_size: u64,
     terminator: u8,
-) -> Result<Vec<u8>> {
+    comment: Option<u8>,
+) -> Result<(Vec<u8>, u64)> {
     let mut len = file_size.min(64 * 1024);
     loop {
         let bytes = store.get_range(location, 0..len).await?;
-        if let Some(end) = bytes.iter().position(|b| *b == terminator) {
-            return Ok(bytes[..end].to_vec());
-        }
-        if len >= file_size {
-            return Ok(bytes.to_vec());
+        let eof = len >= file_size;
+        if let Some(header) = find_header_line(&bytes, terminator, comment, eof) {
+            return Ok((bytes[header.clone()].to_vec(), header.start as u64));
         }
         len = (len * 2).min(file_size);
     }
@@ -447,6 +482,11 @@ impl FileSource for CsvSource {
         base_config: &FileScanConfig,
         partition_index: usize,
     ) -> Result<Arc<dyn FileOpener>> {
+        if self.options.match_columns_by_header == Some(true) && !self.has_header() {
+            log::warn!(
+                "CSV option match_columns_by_header is ignored because has_header is false; columns are matched by position"
+            );
+        }
         let expr_adapter_factory = base_config
             .expr_adapter_factory
             .clone()
@@ -626,6 +666,7 @@ impl FileOpener for CsvOpener {
         let store = Arc::clone(&self.object_store);
         let terminator = self.config.terminator();
         let line_end = terminator.unwrap_or(b'\n');
+        let comment = self.config.comment();
 
         let baseline_metrics =
             BaselineMetrics::new(&self.config.metrics, self.partition_index);
@@ -649,11 +690,23 @@ impl FileOpener for CsvOpener {
                     )
                 })?;
 
-                // A partition may start mid-file, so the header is fetched separately
+                // A partition may start mid-file, so the header is fetched
+                // separately. Every byte-range partition of a file repeats this
+                // small request; cache per file if that becomes costly.
                 let mapping = if match_by_header {
-                    let header =
-                        fetch_header_line(store.as_ref(), &location, file_size, line_end)
-                            .await?;
+                    let (header, header_start) = fetch_header_line(
+                        store.as_ref(),
+                        &location,
+                        file_size,
+                        line_end,
+                        comment,
+                    )
+                    .await?;
+                    // A partition starting within leading comment lines owns
+                    // the header row, so it has to skip it.
+                    if raw_start <= header_start {
+                        config.options.has_header = Some(true);
+                    }
                     config.header_mapping(&header, Arc::clone(&expr_adapter_factory))?
                 } else {
                     None
@@ -688,19 +741,24 @@ impl FileOpener for CsvOpener {
             match result.payload {
                 #[cfg(not(target_arch = "wasm32"))]
                 GetResultPayload::File(file, _) => {
+                    use std::io::{BufRead, BufReader, Cursor};
+
                     let decoder = file_compression_type.convert_read(file)?;
                     let (decoder, mapping): (Box<dyn Read + Send>, _) = if match_by_header
                     {
                         let mut decoder = BufReader::new(decoder);
-                        let mut header = Vec::new();
-                        decoder.read_until(line_end, &mut header)?;
-                        let header_line =
-                            header.strip_suffix(&[line_end]).unwrap_or(&header);
-                        let mapping = config.header_mapping(
-                            header_line,
-                            Arc::clone(&expr_adapter_factory),
-                        )?;
-                        (Box::new(Cursor::new(header).chain(decoder)), mapping)
+                        let mut prefix = Vec::new();
+                        let header = loop {
+                            let eof = decoder.read_until(line_end, &mut prefix)? == 0;
+                            if let Some(header) =
+                                find_header_line(&prefix, line_end, comment, eof)
+                            {
+                                break prefix[header].to_vec();
+                            }
+                        };
+                        let mapping = config
+                            .header_mapping(&header, Arc::clone(&expr_adapter_factory))?;
+                        (Box::new(Cursor::new(prefix).chain(decoder)), mapping)
                     } else {
                         (decoder, None)
                     };
@@ -724,7 +782,8 @@ impl FileOpener for CsvOpener {
                     let mut input = file_compression_type.convert_stream(s.boxed())?;
                     let mut mapping = None;
                     if match_by_header {
-                        let (header, rest) = peek_header_line(input, line_end).await?;
+                        let (header, rest) =
+                            peek_header_line(input, line_end, comment).await?;
                         mapping = config
                             .header_mapping(&header, Arc::clone(&expr_adapter_factory))?;
                         input = rest;
@@ -1019,6 +1078,29 @@ mod tests {
             vec!["a,1".to_string(), "b".to_string()]
         );
         Ok(())
+    }
+
+    #[test]
+    fn find_header_line_skips_comments() {
+        let comment = Some(b'#');
+        assert_eq!(
+            find_header_line(b"# c1\n#c2\na,b\n1,2\n", b'\n', comment, false),
+            Some(9..12)
+        );
+        assert_eq!(
+            find_header_line(b"#c\na,b\n", b'\n', None, false),
+            Some(0..2)
+        );
+        assert_eq!(find_header_line(b"# c1\na,", b'\n', comment, false), None);
+        assert_eq!(
+            find_header_line(b"# c1\na,b", b'\n', comment, true),
+            Some(5..8)
+        );
+        assert_eq!(
+            find_header_line(b"# c1\n# c2", b'\n', comment, true),
+            Some(9..9)
+        );
+        assert_eq!(find_header_line(b"", b'\n', comment, true), Some(0..0));
     }
 
     #[test]

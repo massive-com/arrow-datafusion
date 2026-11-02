@@ -970,6 +970,59 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
+    #[case::local(HeaderLayoutRead::Local)]
+    #[case::chunked(HeaderLayoutRead::Chunked)]
+    #[case::repartitioned(HeaderLayoutRead::Repartitioned)]
+    #[tokio::test]
+    async fn csv_match_columns_by_header_with_comments(
+        #[case] read: HeaderLayoutRead,
+    ) -> Result<()> {
+        let tmp_dir = TempDir::new()?;
+        fs::write(
+            tmp_dir.path().join("a.csv"),
+            "# generated\n# by test\nd,c,a\nr,30,3\n# trailing\ns,40,4\n",
+        )?;
+
+        let ctx = match read {
+            HeaderLayoutRead::Local | HeaderLayoutRead::Chunked => SessionContext::new(),
+            HeaderLayoutRead::Repartitioned => SessionContext::new_with_config(
+                SessionConfig::new()
+                    .with_target_partitions(4)
+                    .with_repartition_file_min_size(1),
+            ),
+        };
+        if let HeaderLayoutRead::Chunked = read {
+            ctx.register_object_store(
+                &Url::parse("file://").unwrap(),
+                Arc::new(ChunkedStore::new(Arc::new(LocalFileSystem::new()), 3)),
+            );
+        }
+        header_layout_table(
+            &ctx,
+            &format!("{}/", tmp_dir.path().display()),
+            ", 'format.match_columns_by_header' 'true', 'format.comment' '#'",
+        )
+        .await?;
+
+        let batches = ctx
+            .sql("SELECT * FROM t ORDER BY a")
+            .await?
+            .collect()
+            .await?;
+        insta::allow_duplicates! {
+            assert_snapshot!(batches_to_string(&batches), @r"
+            +---+---+----+---+
+            | a | b | c  | d |
+            +---+---+----+---+
+            | 3 |   | 30 | r |
+            | 4 |   | 40 | s |
+            +---+---+----+---+
+            ");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn csv_match_columns_by_header_with_truncated_rows() -> Result<()> {
         let tmp_dir = TempDir::new()?;

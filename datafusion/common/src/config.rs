@@ -3664,8 +3664,9 @@ config_namespace! {
         ///
         /// Only applies when `has_header` is true. When enabled, each file's header row is read
         /// and columns are matched by name: table columns missing from a file are filled with
-        /// nulls, and file columns not declared in the table are ignored. Header names containing
-        /// quoted newlines are not supported.
+        /// nulls, and file columns not declared in the table are ignored. Names are matched exactly
+        /// (case-sensitive) and duplicate header names resolve to the first occurrence. Header
+        /// names containing quoted newlines are not supported.
         ///
         /// Defaults to `false` when `None`.
         pub match_columns_by_header: Option<bool>, default = None
