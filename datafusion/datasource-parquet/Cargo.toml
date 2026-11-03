@@ -53,7 +53,6 @@ futures = { workspace = true }
 itertools = { workspace = true }
 log = { workspace = true }
 object_store = { workspace = true }
-parking_lot = { workspace = true }
 parquet = { workspace = true }
 tokio = { workspace = true }
 
