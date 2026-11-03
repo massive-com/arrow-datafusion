@@ -27,7 +27,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion_common::config::TableParquetOptions;
-use datafusion_common::{DataFusionError, HashMap, Result, internal_datafusion_err};
+use datafusion_common::{DataFusionError, Result};
 use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_datasource::display::FileGroupDisplay;
 use datafusion_datasource::file_compression_type::FileCompressionType;
@@ -81,9 +81,6 @@ pub struct ParquetSink {
     config: FileSinkConfig,
     /// Underlying parquet options
     parquet_options: TableParquetOptions,
-    /// File metadata from successfully produced parquet files. The Mutex is only used
-    /// to allow inserting to HashMap from behind borrowed reference in DataSink::write_all.
-    written: Arc<parking_lot::Mutex<HashMap<Path, ParquetMetaData>>>,
     /// Optional sorting columns to write to Parquet metadata
     sorting_columns: Option<Vec<SortingColumn>>,
     /// Metrics for tracking write operations
@@ -118,7 +115,6 @@ impl ParquetSink {
         Self {
             config,
             parquet_options,
-            written: Default::default(),
             sorting_columns: None,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -131,12 +127,6 @@ impl ParquetSink {
     ) -> Self {
         self.sorting_columns = sorting_columns;
         self
-    }
-
-    /// Retrieve the file metadata for the written files, keyed to the path
-    /// which may be partitioned (in the case of hive style partitioning).
-    pub fn written(&self) -> HashMap<Path, ParquetMetaData> {
-        self.written.lock().clone()
     }
 
     /// Create writer properties based upon configuration settings,
@@ -280,9 +270,9 @@ impl FileSink for ParquetSink {
 
         let parquet_opts = &self.parquet_options;
 
-        let mut file_write_tasks: JoinSet<
-            std::result::Result<(Path, ParquetMetaData), DataFusionError>,
-        > = JoinSet::new();
+        // Each task reports only its file's row and byte counts; see
+        // `written_file_counts` for why the file's metadata itself stays in the task.
+        let mut file_write_tasks: JoinSet<Result<(usize, usize)>> = JoinSet::new();
 
         let runtime = context.runtime_env();
         let parallel_options = ParallelParquetWriterOptions {
@@ -319,7 +309,7 @@ impl FileSink for ParquetSink {
                             .close()
                             .await
                             .map_err(|e| DataFusionError::ParquetError(Box::new(e)))?;
-                        Ok((path, parquet_meta_data))
+                        Ok(written_file_counts(&parquet_meta_data))
                     }
                     .with_elapsed_compute(elapsed_compute.clone()),
                 );
@@ -355,7 +345,7 @@ impl FileSink for ParquetSink {
                         encoding_time,
                     )
                     .await?;
-                    Ok((path, parquet_meta_data))
+                    Ok(written_file_counts(&parquet_meta_data))
                 });
             }
         }
@@ -363,20 +353,9 @@ impl FileSink for ParquetSink {
         while let Some(result) = file_write_tasks.join_next().await {
             match result {
                 Ok(r) => {
-                    let (path, parquet_meta_data) = r?;
-                    let file_rows = parquet_meta_data.file_metadata().num_rows() as usize;
-                    let file_bytes: usize = parquet_meta_data
-                        .row_groups()
-                        .iter()
-                        .map(|rg| rg.compressed_size() as usize)
-                        .sum();
+                    let (file_rows, file_bytes) = r?;
                     rows_written_counter.add(file_rows);
                     bytes_written_counter.add(file_bytes);
-                    let mut written_files = self.written.lock();
-                    written_files
-                        .try_insert(path.clone(), parquet_meta_data)
-                        .map_err(|e| internal_datafusion_err!("duplicate entry detected for partitioned file {path}: {e}"))?;
-                    drop(written_files);
                 }
                 Err(e) => {
                     if e.is_panic() {
@@ -395,6 +374,23 @@ impl FileSink for ParquetSink {
 
         Ok(rows_written_counter.value() as u64)
     }
+}
+
+/// Reduces a finished file's metadata to its `(rows, compressed bytes)` for the
+/// `rows_written` and `bytes_written` metrics.
+///
+/// The writer task drops the [`ParquetMetaData`] right after this, so the sink
+/// holds no per-file state once a file is closed. The metadata carries every
+/// column chunk's statistics and page indexes, and keeping it for every file
+/// until the sink finished made memory grow with the number of files written.
+fn written_file_counts(parquet_meta_data: &ParquetMetaData) -> (usize, usize) {
+    let rows = parquet_meta_data.file_metadata().num_rows() as usize;
+    let bytes = parquet_meta_data
+        .row_groups()
+        .iter()
+        .map(|rg| rg.compressed_size() as usize)
+        .sum();
+    (rows, bytes)
 }
 
 #[async_trait]

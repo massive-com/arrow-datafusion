@@ -154,11 +154,11 @@ mod tests {
     use async_trait::async_trait;
     use datafusion_datasource::file_groups::FileGroup;
     use datafusion_datasource_parquet::metadata::DFParquetMetadata;
-    use futures::StreamExt;
     use futures::stream::BoxStream;
+    use futures::{StreamExt, TryStreamExt};
     use insta::assert_snapshot;
     use object_store::local::LocalFileSystem;
-    use object_store::{CopyOptions, ObjectMeta};
+    use object_store::{CopyOptions, ObjectMeta, ObjectStoreExt};
     use object_store::{
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectStore,
         PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
@@ -167,7 +167,7 @@ mod tests {
     use parquet::arrow::arrow_reader::ArrowReaderOptions;
     use parquet::file::metadata::{
         KeyValue, PageIndexPolicy, ParquetColumnIndex, ParquetMetaData,
-        ParquetOffsetIndex,
+        ParquetMetaDataReader, ParquetOffsetIndex,
     };
     use parquet::file::page_index::column_index::ColumnIndexMetaData;
     use tokio::fs::File;
@@ -1250,39 +1250,78 @@ mod tests {
         Ok(())
     }
 
-    fn build_ctx(store_url: &url::Url) -> Arc<TaskContext> {
-        let tmp_dir = tempfile::TempDir::new().unwrap();
-        let local = Arc::new(
-            LocalFileSystem::new_with_prefix(&tmp_dir)
-                .expect("should create object store"),
-        );
+    /// Temporary local object store for a test [`ParquetSink`] to write into.
+    /// The directory and the files written to it go away when this is dropped.
+    struct SinkTestStore {
+        store: Arc<dyn ObjectStore>,
+        _tmp_dir: tempfile::TempDir,
+    }
 
-        let mut session = SessionConfig::default();
-        let mut parquet_opts = ParquetOptions {
-            allow_single_file_parallelism: true,
-            ..Default::default()
-        };
-        parquet_opts.allow_single_file_parallelism = true;
-        session.options_mut().execution.parquet = parquet_opts;
+    impl SinkTestStore {
+        fn new() -> Self {
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+            let store: Arc<dyn ObjectStore> = Arc::new(
+                LocalFileSystem::new_with_prefix(&tmp_dir)
+                    .expect("should create object store"),
+            );
+            Self {
+                store,
+                _tmp_dir: tmp_dir,
+            }
+        }
 
-        let runtime = RuntimeEnv::default();
-        runtime
-            .object_store_registry
-            .register_store(store_url, local);
+        /// Task context with this store registered under `store_url`.
+        fn task_context(&self, store_url: &url::Url) -> Arc<TaskContext> {
+            let mut session = SessionConfig::default();
+            session.options_mut().execution.parquet = ParquetOptions {
+                allow_single_file_parallelism: true,
+                ..Default::default()
+            };
 
-        Arc::new(
-            TaskContext::default()
-                .with_session_config(session)
-                .with_runtime(Arc::new(runtime)),
-        )
+            let runtime = RuntimeEnv::default();
+            runtime
+                .object_store_registry
+                .register_store(store_url, Arc::clone(&self.store));
+
+            Arc::new(
+                TaskContext::default()
+                    .with_session_config(session)
+                    .with_runtime(Arc::new(runtime)),
+            )
+        }
+
+        /// The footer of every file in the store, keyed by the file's path within
+        /// the store (so including any hive partition directories).
+        async fn written(&self) -> Result<Vec<(Path, ParquetMetaData)>> {
+            let files: Vec<ObjectMeta> = self.store.list(None).try_collect().await?;
+            let mut written = Vec::with_capacity(files.len());
+            for file in files {
+                let bytes = self.store.get(&file.location).await?.bytes().await?;
+                let metadata = ParquetMetaDataReader::new().parse_and_finish(&bytes)?;
+                written.push((file.location, metadata));
+            }
+            Ok(written)
+        }
+
+        /// [`Self::written`] for a sink that is expected to have written one file.
+        async fn single_written(&self) -> Result<(Path, ParquetMetaData)> {
+            let mut written = self.written().await?;
+            assert_eq!(
+                written.len(),
+                1,
+                "expected a single parquet file to be written, instead found {}",
+                written.len()
+            );
+            Ok(written.remove(0))
+        }
     }
 
     #[tokio::test]
     async fn parquet_sink_write() -> Result<()> {
-        let parquet_sink = create_written_parquet_sink("file:///").await?;
+        let store = create_written_parquet_sink("file:///").await?;
 
         // assert written to proper path
-        let (path, file_metadata) = get_written(parquet_sink)?;
+        let (path, file_metadata) = store.single_written().await?;
         let path_parts = path.parts().collect::<Vec<_>>();
         assert_eq!(path_parts.len(), 1, "should not have path prefix");
 
@@ -1316,11 +1355,10 @@ mod tests {
             ..Default::default()
         };
 
-        let parquet_sink =
-            create_written_parquet_sink_using_config("file:///", opts).await?;
+        let store = create_written_parquet_sink_using_config("file:///", opts).await?;
 
         // assert written to proper path
-        let (path, file_metadata) = get_written(parquet_sink)?;
+        let (path, file_metadata) = store.single_written().await?;
         let path_parts = path.parts().collect::<Vec<_>>();
         assert_eq!(path_parts.len(), 1, "should not have path prefix");
 
@@ -1424,9 +1462,8 @@ mod tests {
             skip_arrow_metadata: true,
             ..Default::default()
         };
-        let parquet_sink =
-            create_written_parquet_sink_using_config("file:///", opts).await?;
-        let (_, file_metadata) = get_written(parquet_sink)?;
+        let store = create_written_parquet_sink_using_config("file:///", opts).await?;
+        let (_, file_metadata) = store.single_written().await?;
         assert_file_metadata(file_metadata, &expected_without);
 
         // single threaded write, do not skip insert
@@ -1435,9 +1472,8 @@ mod tests {
             skip_arrow_metadata: false,
             ..Default::default()
         };
-        let parquet_sink =
-            create_written_parquet_sink_using_config("file:///", opts).await?;
-        let (_, file_metadata) = get_written(parquet_sink)?;
+        let store = create_written_parquet_sink_using_config("file:///", opts).await?;
+        let (_, file_metadata) = store.single_written().await?;
         assert_file_metadata(file_metadata, &expected_with);
 
         // multithreaded write, skip insert
@@ -1448,9 +1484,8 @@ mod tests {
             skip_arrow_metadata: true,
             ..Default::default()
         };
-        let parquet_sink =
-            create_written_parquet_sink_using_config("file:///", opts).await?;
-        let (_, file_metadata) = get_written(parquet_sink)?;
+        let store = create_written_parquet_sink_using_config("file:///", opts).await?;
+        let (_, file_metadata) = store.single_written().await?;
         assert_file_metadata(file_metadata, &expected_without);
 
         // multithreaded write, do not skip insert
@@ -1461,9 +1496,8 @@ mod tests {
             skip_arrow_metadata: false,
             ..Default::default()
         };
-        let parquet_sink =
-            create_written_parquet_sink_using_config("file:///", opts).await?;
-        let (_, file_metadata) = get_written(parquet_sink)?;
+        let store = create_written_parquet_sink_using_config("file:///", opts).await?;
+        let (_, file_metadata) = store.single_written().await?;
         assert_file_metadata(file_metadata, &expected_with);
 
         Ok(())
@@ -1473,10 +1507,10 @@ mod tests {
     async fn parquet_sink_write_with_extension() -> Result<()> {
         let filename = "test_file.custom_ext";
         let file_path = format!("file:///path/to/{filename}");
-        let parquet_sink = create_written_parquet_sink(file_path.as_str()).await?;
+        let store = create_written_parquet_sink(file_path.as_str()).await?;
 
         // assert written to proper path
-        let (path, _) = get_written(parquet_sink)?;
+        let (path, _) = store.single_written().await?;
         let path_parts = path.parts().collect::<Vec<_>>();
         assert_eq!(
             path_parts.len(),
@@ -1492,10 +1526,10 @@ mod tests {
     #[tokio::test]
     async fn parquet_sink_write_with_directory_name() -> Result<()> {
         let file_path = "file:///path/to";
-        let parquet_sink = create_written_parquet_sink(file_path).await?;
+        let store = create_written_parquet_sink(file_path).await?;
 
         // assert written to proper path
-        let (path, _) = get_written(parquet_sink)?;
+        let (path, _) = store.single_written().await?;
         let path_parts = path.parts().collect::<Vec<_>>();
         assert_eq!(
             path_parts.len(),
@@ -1511,10 +1545,10 @@ mod tests {
     #[tokio::test]
     async fn parquet_sink_write_with_folder_ending() -> Result<()> {
         let file_path = "file:///path/to/";
-        let parquet_sink = create_written_parquet_sink(file_path).await?;
+        let store = create_written_parquet_sink(file_path).await?;
 
         // assert written to proper path
-        let (path, _) = get_written(parquet_sink)?;
+        let (path, _) = store.single_written().await?;
         let path_parts = path.parts().collect::<Vec<_>>();
         assert_eq!(
             path_parts.len(),
@@ -1527,7 +1561,7 @@ mod tests {
         Ok(())
     }
 
-    async fn create_written_parquet_sink(table_path: &str) -> Result<Arc<ParquetSink>> {
+    async fn create_written_parquet_sink(table_path: &str) -> Result<SinkTestStore> {
         create_written_parquet_sink_using_config(table_path, ParquetOptions::default())
             .await
     }
@@ -1537,7 +1571,7 @@ mod tests {
     async fn create_written_parquet_sink_using_config(
         table_path: &str,
         global: ParquetOptions,
-    ) -> Result<Arc<ParquetSink>> {
+    ) -> Result<SinkTestStore> {
         // schema should match the ENCODED_ARROW_SCHEMA bove
         let field_a = Field::new("a", DataType::Utf8, false);
         let field_b = Field::new("b", DataType::Utf8, false);
@@ -1556,7 +1590,7 @@ mod tests {
             file_extension: "parquet".into(),
             file_output_mode: FileOutputMode::Automatic,
         };
-        let parquet_sink = Arc::new(ParquetSink::new(
+        let parquet_sink = ParquetSink::new(
             file_sink_config,
             TableParquetOptions {
                 key_value_metadata: std::collections::HashMap::from([
@@ -1566,7 +1600,7 @@ mod tests {
                 global,
                 ..Default::default()
             },
-        ));
+        );
 
         // create data
         let col_a: ArrayRef = Arc::new(StringArray::from(vec!["foo", "bar"]));
@@ -1574,31 +1608,18 @@ mod tests {
         let batch = RecordBatch::try_from_iter(vec![("a", col_a), ("b", col_b)])?;
 
         // write stream
+        let store = SinkTestStore::new();
         FileSink::write_all(
-            parquet_sink.as_ref(),
+            &parquet_sink,
             Box::pin(RecordBatchStreamAdapter::new(
                 schema,
                 futures::stream::iter(vec![Ok(batch)]),
             )),
-            &build_ctx(object_store_url.as_ref()),
+            &store.task_context(object_store_url.as_ref()),
         )
         .await?;
 
-        Ok(parquet_sink)
-    }
-
-    fn get_written(parquet_sink: Arc<ParquetSink>) -> Result<(Path, ParquetMetaData)> {
-        let mut written = parquet_sink.written();
-        let written = written.drain();
-        assert_eq!(
-            written.len(),
-            1,
-            "expected a single parquet files to be written, instead found {}",
-            written.len()
-        );
-
-        let (path, parquet_meta_data) = written.take(1).next().unwrap();
-        Ok((path, parquet_meta_data))
+        Ok(store)
     }
 
     fn assert_file_metadata(
@@ -1659,19 +1680,19 @@ mod tests {
         let batch = RecordBatch::try_from_iter(vec![("a", col_a), ("b", col_b)])?;
 
         // write stream
+        let store = SinkTestStore::new();
         FileSink::write_all(
             parquet_sink.as_ref(),
             Box::pin(RecordBatchStreamAdapter::new(
                 schema,
                 futures::stream::iter(vec![Ok(batch)]),
             )),
-            &build_ctx(object_store_url.as_ref()),
+            &store.task_context(object_store_url.as_ref()),
         )
         .await?;
 
         // assert written
-        let mut written = parquet_sink.written();
-        let written = written.drain();
+        let written = store.written().await?;
         assert_eq!(
             written.len(),
             2,
@@ -1681,7 +1702,7 @@ mod tests {
 
         // check the file metadata includes partitions
         let mut expected_partitions = std::collections::HashSet::from(["a=foo", "a=bar"]);
-        for (path, parquet_metadata) in written.take(2) {
+        for (path, parquet_metadata) in written {
             let file_metadata = parquet_metadata.file_metadata();
             let schema = file_metadata.schema_descr();
             let num_rows = file_metadata.num_rows();
@@ -1757,7 +1778,8 @@ mod tests {
             let batch = RecordBatch::try_from_iter(vec![("a", col_a), ("b", col_b)])?;
 
             // create task context
-            let task_context = build_ctx(object_store_url.as_ref());
+            let store = SinkTestStore::new();
+            let task_context = store.task_context(object_store_url.as_ref());
             assert_eq!(
                 task_context.memory_pool().reserved(),
                 0,
