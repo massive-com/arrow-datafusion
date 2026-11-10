@@ -99,6 +99,25 @@ pub trait GroupValues: Send {
     /// assigned.
     fn intern(&mut self, cols: &[ArrayRef], groups: &mut Vec<usize>) -> Result<()>;
 
+    /// Looks up the group id for each input row of `cols` without assigning
+    /// new group ids.
+    ///
+    /// When the function returns, `groups` contains `Some(group_id)` for each
+    /// row whose value is already stored and `None` otherwise. Stored values
+    /// and group ids are unchanged.
+    fn find(
+        &mut self,
+        _cols: &[ArrayRef],
+        _groups: &mut Vec<Option<usize>>,
+    ) -> Result<()> {
+        not_impl_err!("Group lookup without insertion is not implemented")
+    }
+
+    /// Returns `true` if [`Self::find`] is implemented.
+    fn supports_find(&self) -> bool {
+        false
+    }
+
     /// Returns the number of bytes of memory used by this [`GroupValues`].
     ///
     /// May be expensive; check the implementation before calling on hot paths.

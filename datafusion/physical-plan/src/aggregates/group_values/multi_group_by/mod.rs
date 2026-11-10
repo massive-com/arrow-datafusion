@@ -1164,6 +1164,73 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         }
     }
 
+    fn find(&mut self, cols: &[ArrayRef], groups: &mut Vec<Option<usize>>) -> Result<()> {
+        let n_rows = cols[0].len();
+        let mut batch_hashes = mem::take(&mut self.hashes_buffer);
+        batch_hashes.clear();
+        batch_hashes.resize(n_rows, 0);
+        create_hashes(cols, &self.random_state, &mut batch_hashes)?;
+
+        groups.clear();
+        groups.resize(n_rows, None);
+
+        // Collect every (row, candidate group) pair whose hash matches, then
+        // compare them column by column in one vectorized pass.
+        let buffers = &mut self.vectorized_operation_buffers;
+        let mut rows = mem::take(&mut buffers.equal_to_row_indices);
+        let mut candidates = mem::take(&mut buffers.equal_to_group_indices);
+        rows.clear();
+        candidates.clear();
+        for (row, &target_hash) in batch_hashes.iter().enumerate() {
+            let Some((_, view)) = self
+                .map
+                .find(target_hash, |(exist_hash, _)| target_hash == *exist_hash)
+            else {
+                continue;
+            };
+            if view.is_non_inlined() {
+                let list = &self.group_index_lists[view.value() as usize];
+                candidates.extend_from_slice(list);
+                rows.extend(std::iter::repeat_n(row, list.len()));
+            } else {
+                rows.push(row);
+                candidates.push(view.value() as usize);
+            }
+        }
+
+        if !rows.is_empty() {
+            let mut results = mem::replace(
+                &mut self.vectorized_operation_buffers.equal_to_results,
+                BooleanBufferBuilder::new(0),
+            );
+            results.truncate(0);
+            results.append_n(rows.len(), true);
+            for (col_idx, group_col) in self.group_values.iter().enumerate() {
+                group_col.vectorized_equal_to(
+                    &candidates,
+                    &cols[col_idx],
+                    &rows,
+                    &mut results,
+                );
+            }
+            for (idx, (&row, &group)) in rows.iter().zip(&candidates).enumerate() {
+                if results.get_bit(idx) {
+                    groups[row] = Some(group);
+                }
+            }
+            self.vectorized_operation_buffers.equal_to_results = results;
+        }
+
+        self.vectorized_operation_buffers.equal_to_row_indices = rows;
+        self.vectorized_operation_buffers.equal_to_group_indices = candidates;
+        self.hashes_buffer = batch_hashes;
+        Ok(())
+    }
+
+    fn supports_find(&self) -> bool {
+        true
+    }
+
     fn size(&self) -> usize {
         let group_values_size: usize = self.group_values.iter().map(|v| v.size()).sum();
         group_values_size + self.map_size + self.hashes_buffer.allocated_size()
@@ -2052,6 +2119,54 @@ mod tests {
             expected
         );
         assert_eq!(group_values.len(), data_set.expected_batch.num_rows());
+    }
+
+    #[test]
+    fn test_find_matches_intern_without_inserting() {
+        fn check<const STREAMING: bool>(data_set: &VectorizedTestDataSet) {
+            let mut group_values =
+                GroupValuesColumn::<STREAMING>::try_new(data_set.schema()).unwrap();
+            let mut interned = vec![];
+            for batch in &data_set.test_batches {
+                group_values.intern(batch, &mut interned).unwrap();
+            }
+            let num_groups = group_values.len();
+
+            // Every stored row is found at the id `intern` assigned.
+            let mut found = vec![];
+            for batch in &data_set.test_batches {
+                group_values.intern(batch, &mut interned).unwrap();
+                group_values.find(batch, &mut found).unwrap();
+                let expected = interned.iter().copied().map(Some).collect::<Vec<_>>();
+                assert_eq!(found, expected);
+            }
+
+            // Missing rows are `None` and are not inserted.
+            let missing: Vec<ArrayRef> = data_set
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| match field.data_type() {
+                    DataType::Int64 => {
+                        Arc::new(Int64Array::from(vec![Some(i64::MAX)])) as ArrayRef
+                    }
+                    DataType::Utf8 => {
+                        Arc::new(StringArray::from(vec![Some("missing")])) as ArrayRef
+                    }
+                    DataType::Utf8View => {
+                        Arc::new(StringViewArray::from(vec![Some("missing")])) as ArrayRef
+                    }
+                    other => panic!("unexpected test type {other}"),
+                })
+                .collect();
+            group_values.find(&missing, &mut found).unwrap();
+            assert_eq!(found, vec![None]);
+            assert_eq!(group_values.len(), num_groups);
+        }
+
+        let data_set = VectorizedTestDataSet::new();
+        check::<false>(&data_set);
+        check::<true>(&data_set);
     }
 
     #[test]
