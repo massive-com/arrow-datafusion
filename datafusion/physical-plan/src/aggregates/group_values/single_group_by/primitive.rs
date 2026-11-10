@@ -199,10 +199,6 @@ where
         Ok(())
     }
 
-    fn supports_find(&self) -> bool {
-        true
-    }
-
     fn size(&self) -> usize {
         self.map.capacity() * size_of::<(usize, u64)>() + self.values.allocated_size()
     }
