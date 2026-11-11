@@ -1174,8 +1174,34 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         groups.clear();
         groups.resize(n_rows, None);
 
-        // Collect every (row, candidate group) pair whose hash matches, then
-        // compare them column by column in one vectorized pass.
+        // Streaming mode interns with `scalarized_intern`, which stores one
+        // inlined map entry per group even when hashes collide. Compare values
+        // while probing so a collision doesn't hide the matching entry.
+        if STREAMING {
+            for (row, &target_hash) in batch_hashes.iter().enumerate() {
+                groups[row] = self
+                    .map
+                    .find(target_hash, |(exist_hash, group_idx_view)| {
+                        target_hash == *exist_hash
+                            && self.group_values.iter().enumerate().all(
+                                |(i, group_val)| {
+                                    group_val.equal_to(
+                                        group_idx_view.value() as usize,
+                                        &cols[i],
+                                        row,
+                                    )
+                                },
+                            )
+                    })
+                    .map(|(_, group_idx_view)| group_idx_view.value() as usize);
+            }
+            self.hashes_buffer = batch_hashes;
+            return Ok(());
+        }
+
+        // Vectorized mode keeps one map entry per hash, with colliding groups
+        // in a list. Collect every (row, candidate group) pair whose hash
+        // matches, then compare them column by column in one vectorized pass.
         let buffers = &mut self.vectorized_operation_buffers;
         let mut rows = mem::take(&mut buffers.equal_to_row_indices);
         let mut candidates = mem::take(&mut buffers.equal_to_group_indices);
