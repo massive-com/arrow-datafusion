@@ -477,6 +477,83 @@ where
         }
     }
 
+    /// Looks up each value in `values` without inserting anything.
+    ///
+    /// `observe_payload_fn` is called once per row, in order, with
+    /// `Some(payload)` if the value is already stored and `None` otherwise. A
+    /// null row maps to the payload of the null entry if one exists, matching
+    /// [`Self::insert_if_new`].
+    pub fn find<OP>(&mut self, values: &ArrayRef, observe_payload_fn: OP)
+    where
+        OP: FnMut(Option<V>),
+    {
+        match self.output_type {
+            OutputType::Binary => {
+                assert!(matches!(
+                    values.data_type(),
+                    DataType::Binary | DataType::LargeBinary
+                ));
+                self.find_inner::<OP, GenericBinaryType<O>>(values, observe_payload_fn)
+            }
+            OutputType::Utf8 => {
+                assert!(matches!(
+                    values.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8
+                ));
+                self.find_inner::<OP, GenericStringType<O>>(values, observe_payload_fn)
+            }
+            _ => unreachable!("View types should use `ArrowBytesViewMap`"),
+        };
+    }
+
+    /// Generic version of [`Self::find`] that handles `ByteArrayType`
+    fn find_inner<OP, B>(&mut self, values: &ArrayRef, mut observe_payload_fn: OP)
+    where
+        OP: FnMut(Option<V>),
+        B: ByteArrayType,
+    {
+        let batch_hashes = &mut self.hashes_buffer;
+        batch_hashes.clear();
+        batch_hashes.resize(values.len(), 0);
+        create_hashes([values], &self.random_state, batch_hashes)
+            // hash is supported for all types and create_hashes only
+            // returns errors for unsupported types
+            .unwrap();
+
+        let values = values.as_bytes::<B>();
+        assert_eq!(values.len(), batch_hashes.len());
+
+        for (value, &hash) in values.iter().zip(batch_hashes.iter()) {
+            let Some(value) = value else {
+                observe_payload_fn(self.null.as_ref().map(|&(payload, _)| payload));
+                continue;
+            };
+
+            let value: &[u8] = value.as_ref();
+            let value_len = O::usize_as(value.len());
+
+            let entry = if value.len() <= SHORT_VALUE_LEN {
+                let inline = value.iter().fold(0usize, |acc, &x| (acc << 8) | x as usize);
+                self.map.find(hash, |header| {
+                    header.hash == hash
+                        && header.len == value_len
+                        && inline == header.offset_or_inline
+                })
+            } else {
+                self.map.find(hash, |header| {
+                    if header.hash != hash {
+                        return false;
+                    }
+                    // SAFETY: buffer is only appended to, and we correctly inserted values and offsets
+                    let existing_value =
+                        unsafe { self.buffer.get_unchecked(header.range()) };
+                    value == existing_value
+                })
+            };
+            observe_payload_fn(entry.map(|entry| entry.payload));
+        }
+    }
+
     /// Converts this set into a `StringArray`, `LargeStringArray`,
     /// `BinaryArray`, or `LargeBinaryArray` containing each distinct value
     /// that was inserted. This is done without copying the values.
