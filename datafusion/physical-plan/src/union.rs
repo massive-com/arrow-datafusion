@@ -783,9 +783,11 @@ impl ExecutionPlan for InterleaveExec {
                 ..Self::clone(&*self)
             })),
             ChildrenPropertiesMode::Recompute => {
-                // The new children may no longer be interleavable; see
-                // `try_new_unchecked` for why this is not rejected here.
-                Ok(Arc::new(InterleaveExec::try_new_unchecked(children)?))
+                if can_interleave(children.iter()) {
+                    Ok(Arc::new(InterleaveExec::try_new(children)?))
+                } else {
+                    UnionExec::try_new(children)
+                }
             }
         }
     }
@@ -1847,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn test_interleave_rebuild_defers_partitioning_invariant() -> Result<()> {
+    fn test_interleave_rebuild_falls_back_to_union() -> Result<()> {
         let schema =
             Arc::new(Schema::new(vec![Field::new("name", DataType::Int32, true)]));
         let hash = || make_hash_exec(&schema, vec!["name"], 3);
@@ -1874,28 +1876,18 @@ mod tests {
         let children = rebuilt.children().into_iter().cloned().collect();
         assert!(InterleaveExec::try_new(children).is_err());
 
-        // The rebuilt node no longer claims a hash layout, is structurally
-        // sound, but is not executable until a distribution pass repairs it.
+        assert!(rebuilt.downcast_ref::<UnionExec>().is_some());
         assert!(matches!(
             rebuilt.output_partitioning(),
-            Partitioning::UnknownPartitioning(3)
+            Partitioning::UnknownPartitioning(6)
         ));
         rebuilt.check_invariants(InvariantLevel::Always)?;
-        let err = rebuilt
-            .check_invariants(InvariantLevel::Executable)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains(
-                "Not all InterleaveExec children have a consistent hash or range partitioning"
-            ),
-            "{err}"
-        );
+        rebuilt.check_invariants(InvariantLevel::Executable)?;
         Ok(())
     }
 
     #[test]
-    fn test_interleave_rebuild_reports_widest_partition_count() -> Result<()> {
+    fn test_interleave_rebuild_preserves_all_child_partitions() -> Result<()> {
         let schema =
             Arc::new(Schema::new(vec![Field::new("name", DataType::Int32, true)]));
         let interleave: Arc<dyn ExecutionPlan> =
@@ -1913,21 +1905,12 @@ mod tests {
             ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
         )?;
 
-        // The widest child decides the reported count, so the partitions only
-        // it has are still visible to callers instead of being dropped.
+        assert!(rebuilt.downcast_ref::<UnionExec>().is_some());
         assert!(matches!(
             rebuilt.output_partitioning(),
-            Partitioning::UnknownPartitioning(5)
+            Partitioning::UnknownPartitioning(8)
         ));
-        // Executing one of them fails loudly rather than returning no rows.
-        let Err(err) = rebuilt.execute(4, Arc::new(TaskContext::default())) else {
-            panic!("executing a partition the narrow child lacks must fail");
-        };
-        let err = err.to_string();
-        assert!(
-            err.contains("Partition 4 not found in InterleaveExec"),
-            "{err}"
-        );
+        rebuilt.check_invariants(InvariantLevel::Executable)?;
         Ok(())
     }
 

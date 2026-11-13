@@ -2152,8 +2152,11 @@ mod test {
         ParquetFileReaderFactory, ParquetFileSchemaProvider, ParquetRowSelection,
         RowGroupAccess,
     };
-    use arrow::array::{Array, AsArray, RecordBatch, record_batch};
-    use arrow::buffer::BooleanBuffer;
+    use arrow::array::{
+        Array, ArrayRef, AsArray, Date32Array, Int32Array, ListArray, RecordBatch,
+        StringArray, record_batch,
+    };
+    use arrow::buffer::{BooleanBuffer, OffsetBuffer};
     use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
     use bytes::{BufMut, BytesMut};
     use datafusion_common::{
@@ -2822,7 +2825,7 @@ mod test {
             let array = batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<arrow::array::Int32Array>()
+                .downcast_ref::<Int32Array>()
                 .unwrap();
             for i in 0..array.len() {
                 if !array.is_null(i) {
@@ -2874,6 +2877,133 @@ mod test {
         .unwrap();
         store.put(&Path::from(filename), data.into()).await.unwrap();
         (data_len, statistics)
+    }
+
+    async fn read_batches_with_schema(
+        store: Arc<dyn ObjectStore>,
+        filename: &str,
+        data_size: usize,
+        schema: SchemaRef,
+    ) -> Result<Vec<RecordBatch>> {
+        let projection_indices = (0..schema.fields().len()).collect::<Vec<_>>();
+        let file =
+            PartitionedFile::new(filename.to_string(), u64::try_from(data_size).unwrap());
+        let morselizer = ParquetMorselizerBuilder::new()
+            .with_store(store)
+            .with_schema(schema)
+            .with_projection_indices(&projection_indices)
+            .build();
+        open_file(&morselizer, file).await?.try_collect().await
+    }
+
+    #[tokio::test]
+    async fn schema_adaptation_casts_utf8_to_date32() -> Result<()> {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_schema =
+            Arc::new(Schema::new(vec![Field::new("date", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            file_schema,
+            vec![Arc::new(StringArray::from(vec![
+                "2026-01-01",
+                "2026-02-01",
+            ]))],
+        )?;
+        let data_size =
+            write_parquet(Arc::clone(&store), "schema_adapt_dates.parquet", batch).await;
+
+        let logical_schema = Arc::new(Schema::new(vec![Field::new(
+            "date",
+            DataType::Date32,
+            true,
+        )]));
+        let batches = read_batches_with_schema(
+            store,
+            "schema_adapt_dates.parquet",
+            data_size,
+            logical_schema,
+        )
+        .await?;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+        let dates = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        assert_eq!(dates.values(), &[20_454, 20_485]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_adaptation_normalizes_list_fields() -> Result<()> {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let inner_field = Arc::new(Field::new("conditions", DataType::Int32, false));
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "conditions",
+            DataType::List(Arc::clone(&inner_field)),
+            true,
+        )]));
+        let values = Int32Array::from(vec![1, 2, 3, 4]);
+        let offsets = OffsetBuffer::from_lengths([2, 2]);
+        let list = ListArray::new(inner_field, offsets, Arc::new(values), None);
+        let batch = RecordBatch::try_new(file_schema, vec![Arc::new(list) as ArrayRef])?;
+        let data_size =
+            write_parquet(Arc::clone(&store), "schema_adapt_list.parquet", batch).await;
+
+        let logical_inner = Arc::new(Field::new("element", DataType::Int32, true));
+        let logical_schema = Arc::new(Schema::new(vec![Field::new(
+            "conditions",
+            DataType::List(logical_inner),
+            true,
+        )]));
+        let batches = read_batches_with_schema(
+            store,
+            "schema_adapt_list.parquet",
+            data_size,
+            Arc::clone(&logical_schema),
+        )
+        .await?;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+        assert_eq!(batches[0].schema(), logical_schema);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_adaptation_preserves_logical_nullability() -> Result<()> {
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            file_schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )?;
+        let data_size =
+            write_parquet(Arc::clone(&store), "schema_adapt_nullable.parquet", batch)
+                .await;
+
+        let logical_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let batches = read_batches_with_schema(
+            store,
+            "schema_adapt_nullable.parquet",
+            data_size,
+            logical_schema,
+        )
+        .await?;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
+        assert!(batches[0].schema().field(0).is_nullable());
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[1, 2, 3]);
+        Ok(())
     }
 
     /// Write multiple batches to a parquet file with optional writer properties
@@ -5887,7 +6017,7 @@ mod test {
             let part = batch
                 .column(1)
                 .as_any()
-                .downcast_ref::<arrow::array::Int32Array>()
+                .downcast_ref::<Int32Array>()
                 .unwrap();
             assert!(part.iter().all(|v| v == Some(5)));
 

@@ -244,6 +244,11 @@ where
     Option<VAL::Native>: HashValue,
 {
     fn set_batch(&mut self, ids: ArrayRef) {
+        assert_eq!(
+            ids.data_type(),
+            &self.value_type,
+            "Top-K hash key batch type must match the declared type"
+        );
         self.owned = ids.as_primitive().clone();
     }
 
@@ -608,6 +613,7 @@ pub fn new_hash_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Decimal128Array;
     use arrow::array::TimestampMillisecondArray;
     use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
     use arrow_schema::TimeUnit;
@@ -694,6 +700,33 @@ mod tests {
             f64::from_bits(f64::NAN.to_bits() + 1),
             -0.0,
         )
+    }
+
+    #[test]
+    #[should_panic(expected = "Top-K hash key batch type must match the declared type")]
+    fn should_reject_primitive_key_metadata_mismatch() {
+        let ids = TimestampMillisecondArray::from(vec![1000]);
+        let data_type = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+        let mut hash_table = new_hash_table(1, data_type).unwrap();
+        hash_table.set_batch(Arc::new(ids));
+    }
+
+    #[test]
+    #[should_panic(expected = "Top-K hash key batch type must match the declared type")]
+    fn should_reject_decimal_key_metadata_mismatch() {
+        let ids = Decimal128Array::from(vec![123])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let mut hash_table = new_hash_table(1, DataType::Decimal128(12, 3)).unwrap();
+        hash_table.set_batch(Arc::new(ids));
+    }
+
+    #[test]
+    #[should_panic(expected = "Unsupported data type")]
+    fn should_reject_string_key_type_mismatch() {
+        let ids = LargeStringArray::from(vec!["value"]);
+        let mut hash_table = new_hash_table(1, DataType::Utf8).unwrap();
+        hash_table.set_batch(Arc::new(ids));
     }
 
     #[test]
