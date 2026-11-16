@@ -4227,7 +4227,7 @@ fn existing_interleave_is_kept_when_children_stay_interleavable() -> Result<()> 
 }
 
 #[test]
-fn interleave_broken_by_later_rewrite_is_repaired_on_next_pass() -> Result<()> {
+fn interleave_fallback_remains_valid_across_distribution_passes() -> Result<()> {
     // The chain reported in https://github.com/apache/datafusion/issues/21826:
     // a distribution pass builds an interleave, a later rule changes one
     // child's partitioning while rebuilding the tree, and another distribution
@@ -4250,14 +4250,14 @@ fn interleave_broken_by_later_rewrite_is_repaired_on_next_pass() -> Result<()> {
         vec![Arc::clone(children[0]), coalesced],
         ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
     )?;
+    assert!(rewritten.is::<UnionExec>());
     assert!(matches!(
         rewritten.output_partitioning(),
-        Partitioning::UnknownPartitioning(10)
+        Partitioning::UnknownPartitioning(11)
     ));
-    // Without a repair, the plan is rejected rather than executed.
-    assert!(check_plan_tree_sanity(&rewritten, &config.optimizer).is_err());
+    check_plan_tree_sanity(&rewritten, &config.optimizer)?;
 
-    // The next distribution pass restores a valid interleave.
+    // The next distribution pass can recover the original interleave.
     let pass2 = EnsureRequirements::new().optimize(rewritten, &config)?;
     check_plan_tree_sanity(&pass2, &config.optimizer)?;
     assert_plan!(pass2,
@@ -4324,15 +4324,15 @@ fn issue_21826_join_selection_after_distribution_pass() -> Result<()> {
     // Rebuilding the interleave over the swapped join used to fail here with
     // "Can not create InterleaveExec: new children can not be interleaved".
     let reordered = JoinSelection::new().optimize(pass1, &config)?;
+    assert!(reordered.is::<UnionExec>());
     assert!(matches!(
         reordered.output_partitioning(),
-        Partitioning::UnknownPartitioning(10)
+        Partitioning::UnknownPartitioning(20)
     ));
-    // Without a repair, the plan is rejected rather than executed.
-    assert!(check_plan_tree_sanity(&reordered, &config.optimizer).is_err());
+    check_plan_tree_sanity(&reordered, &config.optimizer)?;
 
-    // The second distribution pass repairs it. The two joins no longer share
-    // a partitioning, so the result is a plain union.
+    // The second distribution pass keeps the union because the two joins no
+    // longer share a partitioning.
     let pass2 = EnsureRequirements::new().optimize(reordered, &config)?;
     check_plan_tree_sanity(&pass2, &config.optimizer)?;
     assert_plan!(pass2,
