@@ -1849,6 +1849,33 @@ mod tests {
     }
 
     #[test]
+    fn test_interleave_rebuild_keeps_compatible_partitioning() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+        let interleave: Arc<dyn ExecutionPlan> =
+            Arc::new(InterleaveExec::try_new(vec![
+                make_hash_exec(&schema, vec!["a"], 3)?,
+                make_hash_exec(&schema, vec!["a"], 3)?,
+            ])?);
+
+        let rebuilt = interleave.replace_children(
+            vec![
+                make_hash_exec(&schema, vec!["b"], 3)?,
+                make_hash_exec(&schema, vec!["b"], 3)?,
+            ],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
+
+        assert!(rebuilt.downcast_ref::<InterleaveExec>().is_some());
+        assert_eq!(rebuilt.output_partitioning().partition_count(), 3);
+        rebuilt.check_invariants(InvariantLevel::Always)?;
+        rebuilt.check_invariants(InvariantLevel::Executable)?;
+        Ok(())
+    }
+
+    #[test]
     fn test_interleave_rebuild_falls_back_to_union() -> Result<()> {
         let schema =
             Arc::new(Schema::new(vec![Field::new("name", DataType::Int32, true)]));

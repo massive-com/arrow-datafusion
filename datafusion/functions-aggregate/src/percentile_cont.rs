@@ -1379,6 +1379,84 @@ mod tests {
     }
 
     #[test]
+    fn groups_preserving_reads_keep_median_state() -> Result<()> {
+        let mut acc = create_percentile_groups_accumulator(
+            "median",
+            PercentileParam {
+                aggregate_fn_name: "MEDIAN".to_string(),
+                state: PercentileParamState::Resolved(0.5),
+                is_desc: false,
+            },
+            &DataType::Float64,
+        )?;
+        let values: ArrayRef =
+            Arc::new(Float64Array::from(vec![3.0, 9.0, 1.0, 12.0, 4.0, 8.0]));
+        acc.update_batch(&[values], &[0, 1, 0, 3, 3, 3], None, 4)?;
+
+        let selection = GroupSelection::try_from_indices(&[3, 0, 3, 2], 4)?;
+        let expected = Float64Array::from(vec![Some(8.0), Some(2.0), Some(8.0), None]);
+        for _ in 0..2 {
+            assert_eq!(
+                acc.evaluate_preserving(selection)?
+                    .as_primitive::<Float64Type>(),
+                &expected
+            );
+        }
+
+        let state = acc.state_preserving(selection)?;
+        assert_eq!(state.len(), 2);
+        assert_eq!(
+            state[1].as_primitive::<Float64Type>(),
+            &Float64Array::from(vec![0.5; 4])
+        );
+        let state_values = state[0]
+            .as_list::<i32>()
+            .iter()
+            .map(|values| {
+                values
+                    .unwrap()
+                    .as_primitive::<Float64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state_values,
+            vec![
+                vec![12.0, 4.0, 8.0],
+                vec![3.0, 1.0],
+                vec![12.0, 4.0, 8.0],
+                vec![],
+            ]
+        );
+
+        let empty = GroupSelection::try_from_indices(&[], 4)?;
+        let result = acc.evaluate_preserving(empty)?;
+        assert_eq!(result.data_type(), &DataType::Float64);
+        assert!(result.is_empty());
+        let state = acc.state_preserving(empty)?;
+        assert_eq!(state.len(), 2);
+        assert_eq!(
+            state[0].data_type(),
+            &DataType::List(Arc::new(Field::new_list_field(DataType::Float64, true)))
+        );
+        assert!(state[0].is_empty());
+        assert_eq!(state[1].data_type(), &DataType::Float64);
+        assert!(state[1].is_empty());
+
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![6.0, 10.0]));
+        acc.update_batch(&[values], &[2, 2], None, 4)?;
+        assert_eq!(
+            acc.evaluate_preserving(GroupSelection::all(4))?
+                .as_primitive::<Float64Type>(),
+            &Float64Array::from(vec![2.0, 9.0, 8.0, 8.0])
+        );
+        assert!(acc.supports_evaluate_preserving());
+        assert!(acc.supports_state_preserving());
+        Ok(())
+    }
+
+    #[test]
     fn preserving_reads_keep_median_decimal_metadata() -> Result<()> {
         let data_type = DataType::Decimal128(12, 2);
         let mut acc = create_percentile_groups_accumulator(
