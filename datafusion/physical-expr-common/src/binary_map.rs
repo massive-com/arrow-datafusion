@@ -427,8 +427,8 @@ where
             else {
                 // Check if the value is already present in the set
                 let entry = self.map.find_mut(hash, |header| {
-                    // compare value if hashes match
-                    if header.hash != hash {
+                    // Equal lengths ensure the stored value is also out of line.
+                    if header.hash != hash || header.len != value_len {
                         return false;
                     }
                     // Need to compare the bytes in the buffer
@@ -474,6 +474,84 @@ where
                 self.buffer.len(),
                 type_name::<O>()
             );
+        }
+    }
+
+    /// Looks up each value in `values` without inserting anything.
+    ///
+    /// `observe_payload_fn` is called once per row, in order, with
+    /// `Some(payload)` if the value is already stored and `None` otherwise. A
+    /// null row maps to the payload of the null entry if one exists, matching
+    /// [`Self::insert_if_new`].
+    pub fn find<OP>(&mut self, values: &ArrayRef, observe_payload_fn: OP)
+    where
+        OP: FnMut(Option<V>),
+    {
+        match self.output_type {
+            OutputType::Binary => {
+                assert!(matches!(
+                    values.data_type(),
+                    DataType::Binary | DataType::LargeBinary
+                ));
+                self.find_inner::<OP, GenericBinaryType<O>>(values, observe_payload_fn)
+            }
+            OutputType::Utf8 => {
+                assert!(matches!(
+                    values.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8
+                ));
+                self.find_inner::<OP, GenericStringType<O>>(values, observe_payload_fn)
+            }
+            _ => unreachable!("View types should use `ArrowBytesViewMap`"),
+        };
+    }
+
+    /// Generic version of [`Self::find`] that handles `ByteArrayType`
+    fn find_inner<OP, B>(&mut self, values: &ArrayRef, mut observe_payload_fn: OP)
+    where
+        OP: FnMut(Option<V>),
+        B: ByteArrayType,
+    {
+        let batch_hashes = &mut self.hashes_buffer;
+        batch_hashes.clear();
+        batch_hashes.resize(values.len(), 0);
+        create_hashes([values], &self.random_state, batch_hashes)
+            // hash is supported for all types and create_hashes only
+            // returns errors for unsupported types
+            .unwrap();
+
+        let values = values.as_bytes::<B>();
+        assert_eq!(values.len(), batch_hashes.len());
+
+        for (value, &hash) in values.iter().zip(batch_hashes.iter()) {
+            let Some(value) = value else {
+                observe_payload_fn(self.null.as_ref().map(|&(payload, _)| payload));
+                continue;
+            };
+
+            let value: &[u8] = value.as_ref();
+            let value_len = O::usize_as(value.len());
+
+            let entry = if value.len() <= SHORT_VALUE_LEN {
+                let inline = value.iter().fold(0usize, |acc, &x| (acc << 8) | x as usize);
+                self.map.find(hash, |header| {
+                    header.hash == hash
+                        && header.len == value_len
+                        && inline == header.offset_or_inline
+                })
+            } else {
+                self.map.find(hash, |header| {
+                    // Equal lengths ensure the stored value is also out of line.
+                    if header.hash != hash || header.len != value_len {
+                        return false;
+                    }
+                    // SAFETY: buffer is only appended to, and we correctly inserted values and offsets
+                    let existing_value =
+                        unsafe { self.buffer.get_unchecked(header.range()) };
+                    value == existing_value
+                })
+            };
+            observe_payload_fn(entry.map(|entry| entry.payload));
         }
     }
 
@@ -926,7 +1004,7 @@ mod tests {
     fn test_map() {
         let input = vec![
             // Note mix of short/long strings
-            Some("A"),
+            Some("bcde"),
             Some("bcdefghijklmnop"),
             Some("X"),
             Some("Y"),
@@ -938,8 +1016,17 @@ mod tests {
         ];
 
         let mut test_map = TestMap::new();
+        test_map.insert(&input[..1]);
+        let probe: ArrayRef = Arc::new(StringArray::from(vec![input[1]]));
+        // A colliding long probe must not interpret inline bytes as an offset.
+        test_map
+            .map
+            .find(&probe, |payload| assert_eq!(payload, None));
         test_map.insert(&input);
         test_map.insert(&input); // put it in twice
+        test_map.map.find(&probe, |payload| {
+            assert_eq!(payload, Some(TestPayload { index: 1 }));
+        });
         let expected_output: ArrayRef = Arc::new(StringArray::from(input));
         assert_eq!(&test_map.into_array(), &expected_output);
     }
@@ -1036,6 +1123,64 @@ mod tests {
             let expected: ArrayRef = Arc::new(StringArray::from(strings));
             assert_eq!(&arr, &expected);
             arr
+        }
+    }
+
+    /// A short value and a long value whose hashes collide must not be confused,
+    /// whichever of them is inserted first.
+    ///
+    /// A short value keeps its bytes inlined in the entry's `offset_or_inline`
+    /// field, while a long one keeps an offset into the value buffer there. An
+    /// entry is only examined when its hash matches, so the length has to be
+    /// compared before that field is interpreted at all. Each direction fails
+    /// differently without that check, and each case below is chosen to make it
+    /// actually fail rather than get away with it:
+    ///
+    /// * long value looked up against a short entry: `header.range()` is built
+    ///   out of the inlined bytes, so `"ab"` (0x6162) sends the read tens of
+    ///   kilobytes past the end of the buffer;
+    /// * short value looked up against a long entry: the inlined bytes are
+    ///   compared against that entry's offset, so a single NUL byte (inlined as
+    ///   0) matches the long value stored at offset 0 and the two distinct
+    ///   values collapse into one.
+    ///
+    /// `force_hash_collisions` makes every value collide, which is the only way
+    /// to reach either path deterministically.
+    #[cfg(feature = "force_hash_collisions")]
+    #[test]
+    fn short_and_long_values_with_colliding_hashes() {
+        let long = "a value too long to be inlined";
+        assert!(long.len() > SHORT_VALUE_LEN);
+
+        for [first, second] in [[long, "\0"], ["ab", long]] {
+            assert!(first.len() <= SHORT_VALUE_LEN || second.len() <= SHORT_VALUE_LEN);
+            // The second value is the one looked up against an entry of the
+            // other kind; the repeats must match their own entry.
+            let values: ArrayRef = Arc::new(StringArray::from(vec![
+                Some(first),
+                Some(second),
+                Some(first),
+                Some(second),
+            ]));
+
+            let mut map = ArrowBytesMap::<i32, usize>::new(OutputType::Utf8);
+            let mut inserted = vec![];
+            let mut payloads = 0;
+            map.insert_if_new(
+                &values,
+                |value| {
+                    inserted.push(value.expect("no nulls in this test").to_vec());
+                    payloads += 1;
+                    payloads
+                },
+                |_| {},
+            );
+
+            assert_eq!(
+                inserted,
+                vec![first.as_bytes().to_vec(), second.as_bytes().to_vec()],
+                "inserting {first:?} then {second:?}"
+            );
         }
     }
 }

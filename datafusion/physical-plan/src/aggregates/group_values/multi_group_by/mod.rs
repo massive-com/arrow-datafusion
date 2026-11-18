@@ -1164,6 +1164,95 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
         }
     }
 
+    fn find(&mut self, cols: &[ArrayRef], groups: &mut Vec<Option<usize>>) -> Result<()> {
+        let n_rows = cols[0].len();
+        let mut batch_hashes = mem::take(&mut self.hashes_buffer);
+        batch_hashes.clear();
+        batch_hashes.resize(n_rows, 0);
+        create_hashes(cols, &self.random_state, &mut batch_hashes)?;
+
+        groups.clear();
+        groups.resize(n_rows, None);
+
+        // Streaming mode interns with `scalarized_intern`, which stores one
+        // inlined map entry per group even when hashes collide. Compare values
+        // while probing so a collision doesn't hide the matching entry.
+        if STREAMING {
+            for (row, &target_hash) in batch_hashes.iter().enumerate() {
+                groups[row] = self
+                    .map
+                    .find(target_hash, |(exist_hash, group_idx_view)| {
+                        target_hash == *exist_hash
+                            && self.group_values.iter().enumerate().all(
+                                |(i, group_val)| {
+                                    group_val.equal_to(
+                                        group_idx_view.value() as usize,
+                                        &cols[i],
+                                        row,
+                                    )
+                                },
+                            )
+                    })
+                    .map(|(_, group_idx_view)| group_idx_view.value() as usize);
+            }
+            self.hashes_buffer = batch_hashes;
+            return Ok(());
+        }
+
+        // Vectorized mode keeps one map entry per hash, with colliding groups
+        // in a list. Collect every (row, candidate group) pair whose hash
+        // matches, then compare them column by column in one vectorized pass.
+        let buffers = &mut self.vectorized_operation_buffers;
+        let mut rows = mem::take(&mut buffers.equal_to_row_indices);
+        let mut candidates = mem::take(&mut buffers.equal_to_group_indices);
+        rows.clear();
+        candidates.clear();
+        for (row, &target_hash) in batch_hashes.iter().enumerate() {
+            let Some((_, view)) = self
+                .map
+                .find(target_hash, |(exist_hash, _)| target_hash == *exist_hash)
+            else {
+                continue;
+            };
+            if view.is_non_inlined() {
+                let list = &self.group_index_lists[view.value() as usize];
+                candidates.extend_from_slice(list);
+                rows.extend(std::iter::repeat_n(row, list.len()));
+            } else {
+                rows.push(row);
+                candidates.push(view.value() as usize);
+            }
+        }
+
+        if !rows.is_empty() {
+            let mut results = mem::replace(
+                &mut self.vectorized_operation_buffers.equal_to_results,
+                BooleanBufferBuilder::new(0),
+            );
+            results.truncate(0);
+            results.append_n(rows.len(), true);
+            for (col_idx, group_col) in self.group_values.iter().enumerate() {
+                group_col.vectorized_equal_to(
+                    &candidates,
+                    &cols[col_idx],
+                    &rows,
+                    &mut results,
+                );
+            }
+            for (idx, (&row, &group)) in rows.iter().zip(&candidates).enumerate() {
+                if results.get_bit(idx) {
+                    groups[row] = Some(group);
+                }
+            }
+            self.vectorized_operation_buffers.equal_to_results = results;
+        }
+
+        self.vectorized_operation_buffers.equal_to_row_indices = rows;
+        self.vectorized_operation_buffers.equal_to_group_indices = candidates;
+        self.hashes_buffer = batch_hashes;
+        Ok(())
+    }
+
     fn size(&self) -> usize {
         let group_values_size: usize = self.group_values.iter().map(|v| v.size()).sum();
         group_values_size + self.map_size + self.hashes_buffer.allocated_size()
@@ -1192,6 +1281,8 @@ impl<const STREAMING: bool> GroupValues for GroupValuesColumn<STREAMING> {
                 // a real Result rather than panicking.
                 let fresh = Self::build_group_columns(&self.schema)?;
                 let group_values = mem::replace(&mut self.group_values, fresh);
+                self.map.clear();
+                self.group_index_lists.clear();
 
                 group_values
                     .into_iter()
@@ -1359,16 +1450,16 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::array::{
-        Array, ArrayRef, DurationMicrosecondArray, FixedSizeBinaryArray, Float16Array,
-        Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
+        Array, ArrayRef, AsArray, DurationMicrosecondArray, FixedSizeBinaryArray,
+        Float16Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
         StringViewArray, UInt32Array,
     };
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
     use arrow::{
         compute::{concat_batches, take},
         util::pretty::pretty_format_batches,
     };
-    use datafusion_common::utils::proxy::HashTableAllocExt;
+    use datafusion_common::{Result, utils::proxy::HashTableAllocExt};
     use datafusion_expr::{EmitTo, GroupSelection};
 
     use crate::aggregates::group_values::{
@@ -1566,6 +1657,12 @@ mod tests {
              on float edge cases (got column={g1:?}, rows={g2:?})"
         );
         assert_eq!(column_path.len(), rows_path.len());
+
+        let mut found = vec![];
+        column_path.find(&cols, &mut found).unwrap();
+        assert_eq!(found, g1.iter().copied().map(Some).collect::<Vec<_>>());
+        rows_path.find(&cols, &mut found).unwrap();
+        assert_eq!(found, g2.iter().copied().map(Some).collect::<Vec<_>>());
     }
 
     /// Equivalence across multiple `intern` batches and `EmitTo::First(n)`.
@@ -2052,6 +2149,93 @@ mod tests {
             expected
         );
         assert_eq!(group_values.len(), data_set.expected_batch.num_rows());
+    }
+
+    #[test]
+    fn test_find_matches_intern_without_inserting() {
+        fn check<const STREAMING: bool>(data_set: &VectorizedTestDataSet) {
+            let mut group_values =
+                GroupValuesColumn::<STREAMING>::try_new(data_set.schema()).unwrap();
+            let mut interned = vec![];
+            for batch in &data_set.test_batches {
+                group_values.intern(batch, &mut interned).unwrap();
+            }
+            let num_groups = group_values.len();
+
+            // Every stored row is found at the id `intern` assigned.
+            let mut found = vec![];
+            for batch in &data_set.test_batches {
+                group_values.intern(batch, &mut interned).unwrap();
+                group_values.find(batch, &mut found).unwrap();
+                let expected = interned.iter().copied().map(Some).collect::<Vec<_>>();
+                assert_eq!(found, expected);
+            }
+
+            // Missing rows are `None` and are not inserted.
+            let missing: Vec<ArrayRef> = data_set
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| match field.data_type() {
+                    DataType::Int64 => {
+                        Arc::new(Int64Array::from(vec![Some(i64::MAX)])) as ArrayRef
+                    }
+                    DataType::Utf8 => {
+                        Arc::new(StringArray::from(vec![Some("missing")])) as ArrayRef
+                    }
+                    DataType::Utf8View => {
+                        Arc::new(StringViewArray::from(vec![Some("missing")])) as ArrayRef
+                    }
+                    other => panic!("unexpected test type {other}"),
+                })
+                .collect();
+            group_values.find(&missing, &mut found).unwrap();
+            assert_eq!(found, vec![None]);
+            assert_eq!(group_values.len(), num_groups);
+
+            group_values.emit(EmitTo::All).unwrap();
+            for batch in &data_set.test_batches {
+                group_values.find(batch, &mut found).unwrap();
+                assert_eq!(found, vec![None; batch[0].len()]);
+            }
+            assert!(group_values.is_empty());
+        }
+
+        let data_set = VectorizedTestDataSet::new();
+        check::<false>(&data_set);
+        check::<true>(&data_set);
+    }
+
+    #[test]
+    fn intern_after_emit_all_starts_new_groups() -> Result<()> {
+        fn check<const STREAMING: bool>() -> Result<()> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Utf8, false),
+            ]));
+            let mut group_values = GroupValuesColumn::<STREAMING>::try_new(schema)?;
+            let batch = |a: Vec<i32>, b: Vec<&str>| -> Vec<ArrayRef> {
+                vec![
+                    Arc::new(Int32Array::from(a)),
+                    Arc::new(StringArray::from(b)),
+                ]
+            };
+
+            let mut groups = vec![];
+            group_values
+                .intern(&batch(vec![1, 2, 3], vec!["x", "y", "z"]), &mut groups)?;
+            assert_eq!(groups, vec![0, 1, 2]);
+            group_values.emit(EmitTo::All)?;
+
+            group_values.intern(&batch(vec![3, 4], vec!["z", "w"]), &mut groups)?;
+            assert_eq!(groups, vec![0, 1]);
+            assert_eq!(group_values.len(), 2);
+            let emitted = group_values.emit(EmitTo::All)?;
+            assert_eq!(emitted[0].as_primitive::<Int32Type>().values(), &[3, 4]);
+            Ok(())
+        }
+        check::<false>()?;
+        check::<true>()
     }
 
     #[test]
