@@ -254,8 +254,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        ArrayRef, AsArray, BinaryArray, BinaryViewArray, BooleanArray, Int32Array,
-        Int64Array, LargeStringArray, ListArray, StringArray, StringViewArray,
+        ArrayRef, AsArray, BinaryArray, BinaryViewArray, BooleanArray, Float64Array,
+        Int32Array, Int64Array, LargeStringArray, ListArray, StringArray,
+        StringViewArray,
     };
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use datafusion_expr::{EmitTo, GroupSelection};
@@ -392,6 +393,20 @@ mod tests {
             vec![vec![Arc::new(BooleanArray::from(vec![Some(false)]))]],
             vec![Arc::new(BooleanArray::from(vec![Some(true), None]))],
         );
+    }
+
+    #[test]
+    fn rows_find_normalizes_negative_zero() {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
+        let mut gv = GroupValuesRows::try_new(schema).unwrap();
+        let stored: ArrayRef = Arc::new(Float64Array::from(vec![0.0, 1.0]));
+        gv.intern(&[stored], &mut vec![]).unwrap();
+
+        let probe: ArrayRef = Arc::new(Float64Array::from(vec![-0.0, 0.0, 2.0]));
+        let mut found = vec![];
+        gv.find(&[probe], &mut found).unwrap();
+        assert_eq!(found, vec![Some(0), Some(0), None]);
     }
 
     #[test]

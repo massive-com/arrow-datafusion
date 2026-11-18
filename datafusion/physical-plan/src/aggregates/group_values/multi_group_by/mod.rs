@@ -1657,6 +1657,12 @@ mod tests {
              on float edge cases (got column={g1:?}, rows={g2:?})"
         );
         assert_eq!(column_path.len(), rows_path.len());
+
+        let mut found = vec![];
+        column_path.find(&cols, &mut found).unwrap();
+        assert_eq!(found, g1.iter().copied().map(Some).collect::<Vec<_>>());
+        rows_path.find(&cols, &mut found).unwrap();
+        assert_eq!(found, g2.iter().copied().map(Some).collect::<Vec<_>>());
     }
 
     /// Equivalence across multiple `intern` batches and `EmitTo::First(n)`.
