@@ -952,7 +952,7 @@ mod tests {
     fn test_map() {
         let input = vec![
             // Note mix of short/long strings
-            Some("bcde"),
+            Some("A"),
             Some("bcdefghijklmnop1234567"),
             Some("X"),
             Some("Y"),
@@ -964,18 +964,36 @@ mod tests {
         ];
 
         let mut test_map = TestMap::new();
-        test_map.insert(&input[..1]);
-        let probe: ArrayRef = Arc::new(StringViewArray::from(vec![input[1]]));
-        // A colliding long probe must not interpret an inline view as a buffer reference.
+        test_map.insert(&input);
+        test_map.insert(&input); // put it in twice
+        let expected_output: ArrayRef = Arc::new(StringViewArray::from(input));
+        assert_eq!(&test_map.into_array(), &expected_output);
+    }
+
+    /// A long value whose hash collides with an inline value sharing its
+    /// 4-byte prefix must not read the inline bytes as a buffer reference.
+    #[cfg(feature = "force_hash_collisions")]
+    #[test]
+    fn test_long_value_colliding_with_inline_value() {
+        let mut test_map = TestMap::new();
+        test_map.insert(&[Some("bcdeXXXXYYYY")]);
+        test_map.insert(&[Some("bcdefghijklmnop1234567")]);
+        let expected_output: ArrayRef = Arc::new(StringViewArray::from(vec![
+            "bcdeXXXXYYYY",
+            "bcdefghijklmnop1234567",
+        ]));
+        assert_eq!(&test_map.into_array(), &expected_output);
+    }
+
+    #[cfg(feature = "force_hash_collisions")]
+    #[test]
+    fn test_find_long_value_colliding_with_inline_value() {
+        let mut test_map = TestMap::new();
+        test_map.insert(&[Some("bcdeXXXXYYYY")]);
+        let probe: ArrayRef =
+            Arc::new(StringViewArray::from(vec!["bcdefghijklmnop1234567"]));
         test_map
             .map
             .find(&probe, |payload| assert_eq!(payload, None));
-        test_map.insert(&input);
-        test_map.insert(&input); // put it in twice
-        test_map.map.find(&probe, |payload| {
-            assert_eq!(payload, Some(TestPayload { index: 1 }));
-        });
-        let expected_output: ArrayRef = Arc::new(StringViewArray::from(input));
-        assert_eq!(&test_map.into_array(), &expected_output);
     }
 }

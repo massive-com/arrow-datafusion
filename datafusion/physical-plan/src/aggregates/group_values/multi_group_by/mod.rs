@@ -1450,16 +1450,16 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::array::{
-        Array, ArrayRef, DurationMicrosecondArray, FixedSizeBinaryArray, Float16Array,
-        Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
+        Array, ArrayRef, AsArray, DurationMicrosecondArray, FixedSizeBinaryArray,
+        Float16Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
         StringViewArray, UInt32Array,
     };
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef};
     use arrow::{
         compute::{concat_batches, take},
         util::pretty::pretty_format_batches,
     };
-    use datafusion_common::utils::proxy::HashTableAllocExt;
+    use datafusion_common::{Result, utils::proxy::HashTableAllocExt};
     use datafusion_expr::{EmitTo, GroupSelection};
 
     use crate::aggregates::group_values::{
@@ -2198,6 +2198,38 @@ mod tests {
         let data_set = VectorizedTestDataSet::new();
         check::<false>(&data_set);
         check::<true>(&data_set);
+    }
+
+    #[test]
+    fn intern_after_emit_all_starts_new_groups() -> Result<()> {
+        fn check<const STREAMING: bool>() -> Result<()> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Utf8, false),
+            ]));
+            let mut group_values = GroupValuesColumn::<STREAMING>::try_new(schema)?;
+            let batch = |a: Vec<i32>, b: Vec<&str>| -> Vec<ArrayRef> {
+                vec![
+                    Arc::new(Int32Array::from(a)),
+                    Arc::new(StringArray::from(b)),
+                ]
+            };
+
+            let mut groups = vec![];
+            group_values
+                .intern(&batch(vec![1, 2, 3], vec!["x", "y", "z"]), &mut groups)?;
+            assert_eq!(groups, vec![0, 1, 2]);
+            group_values.emit(EmitTo::All)?;
+
+            group_values.intern(&batch(vec![3, 4], vec!["z", "w"]), &mut groups)?;
+            assert_eq!(groups, vec![0, 1]);
+            assert_eq!(group_values.len(), 2);
+            let emitted = group_values.emit(EmitTo::All)?;
+            assert_eq!(emitted[0].as_primitive::<Int32Type>().values(), &[3, 4]);
+            Ok(())
+        }
+        check::<false>()?;
+        check::<true>()
     }
 
     #[test]
